@@ -530,7 +530,6 @@ const subscriptionTiers = [
 const gradientButtonBaseClass =
   'inline-flex items-center justify-center rounded-[999px] bg-gradient-to-br from-slate-950 to-slate-700 text-slate-50 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60'
 const gradientButtonMediumClass = `${gradientButtonBaseClass} min-h-12 px-5 text-sm font-medium`
-const gradientButtonLargeClass = `${gradientButtonBaseClass} min-h-14 px-7 text-base font-medium`
 const gradientButtonCompactClass = `${gradientButtonBaseClass} min-h-11 px-5 text-sm font-medium`
 const secondaryButtonMediumClass =
   'inline-flex min-h-12 items-center justify-center rounded-[999px] bg-slate-900/10 px-5 text-sm font-medium text-slate-900 transition hover:bg-slate-900/15'
@@ -1969,11 +1968,20 @@ function RoomPage({ roomId }) {
   const hasWorkflowStarted = Boolean(room?.workflowStartedAt)
   const currentActivityIndex = currentStep?.activityIndex ?? 0
   const isRoundRobinStep = currentStep?.activityType === 'roundrobin'
+  const currentStepDurationSeconds = (currentStep?.durationMinutes ?? 0) * 60
   const roundRobinMembers = roundRobinOrder
     .map((memberId) => members.find((member) => member.id === memberId))
     .filter(Boolean)
+  const roundRobinSpeakerCount = roundRobinMembers.length
   const activeRoundRobinMember =
     roundRobinMembers.find((member) => !completedRoundRobinSpeakerIds.includes(member.id)) ?? null
+  const currentRoundRobinSpeakerIndex = activeRoundRobinMember
+    ? Math.min(completedRoundRobinSpeakerIds.length + 1, roundRobinSpeakerCount)
+    : 0
+  const roundRobinProgressDots =
+    isRoundRobinStep && roundRobinSpeakerCount > 1
+      ? Array.from({ length: roundRobinSpeakerCount - 1 }, (_, index) => ((index + 1) / roundRobinSpeakerCount) * 100)
+      : []
   const isWorkflowComplete =
     workflowSequence.length > 0 &&
     safeCurrentStepIndex === workflowSequence.length - 1 &&
@@ -1981,7 +1989,6 @@ function RoomPage({ roomId }) {
   const firstStepDurationSeconds = (workflowSequence[0]?.durationMinutes ?? 0) * 60
   const nextStepDurationSeconds =
     (workflowSequence[safeCurrentStepIndex + 1]?.durationMinutes ?? 0) * 60
-  const currentStepDurationSeconds = (currentStep?.durationMinutes ?? 0) * 60
   const currentStepProgressPercent =
     currentStepDurationSeconds > 0
       ? Math.min(
@@ -2052,21 +2059,28 @@ function RoomPage({ roomId }) {
 
   useEffect(() => {
     if (hasWorkflowStarted) {
-      return
+      return undefined
     }
 
-    setCurrentStepIndex(0)
-    setRemainingSeconds(0)
-    setIsPaused(true)
-    setRoundRobinOrder([])
-    setCompletedRoundRobinSpeakerIds([])
+    const timeoutId = window.setTimeout(() => {
+      setCurrentStepIndex(0)
+      setRemainingSeconds(0)
+      setIsPaused(true)
+      setRoundRobinOrder([])
+      setCompletedRoundRobinSpeakerIds([])
+    }, 0)
+
+    return () => window.clearTimeout(timeoutId)
   }, [hasWorkflowStarted])
 
   useEffect(() => {
     if (!isRoundRobinStep) {
-      setRoundRobinOrder([])
-      setCompletedRoundRobinSpeakerIds([])
-      return
+      const timeoutId = window.setTimeout(() => {
+        setRoundRobinOrder([])
+        setCompletedRoundRobinSpeakerIds([])
+      }, 0)
+
+      return () => window.clearTimeout(timeoutId)
     }
 
     const randomizedMemberIds = shuffleArray(
@@ -2075,12 +2089,60 @@ function RoomPage({ roomId }) {
         .filter(Boolean),
     )
 
-    setRoundRobinOrder(randomizedMemberIds)
-    setCompletedRoundRobinSpeakerIds([])
+    const timeoutId = window.setTimeout(() => {
+      setRoundRobinOrder(randomizedMemberIds)
+      setCompletedRoundRobinSpeakerIds([])
+    }, 0)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [currentStep?.sequenceIndex, isRoundRobinStep, members])
+
+  useEffect(() => {
+    if (
+      !hasWorkflowStarted ||
+      !isRoundRobinStep ||
+      isPaused ||
+      currentStepDurationSeconds <= 0 ||
+      roundRobinSpeakerCount === 0
+    ) {
+      return
+    }
+
+    const elapsedSeconds = Math.min(
+      currentStepDurationSeconds,
+      Math.max(0, currentStepDurationSeconds - remainingSeconds),
+    )
+    const expectedCompletedSpeakerCount =
+      remainingSeconds === 0
+        ? roundRobinSpeakerCount
+        : Math.min(
+            roundRobinSpeakerCount - 1,
+            Math.floor((elapsedSeconds * roundRobinSpeakerCount) / currentStepDurationSeconds),
+          )
+
+    if (expectedCompletedSpeakerCount <= completedRoundRobinSpeakerIds.length) {
+      return undefined
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setCompletedRoundRobinSpeakerIds(
+        roundRobinMembers
+          .slice(0, expectedCompletedSpeakerCount)
+          .map((member) => member.id)
+          .filter(Boolean),
+      )
+    }, 0)
+
+    return () => window.clearTimeout(timeoutId)
   }, [
-    currentStep?.sequenceIndex,
+    completedRoundRobinSpeakerIds.length,
+    currentStepDurationSeconds,
+    hasWorkflowStarted,
+    isPaused,
     isRoundRobinStep,
-    members,
+    remainingSeconds,
+    roundRobinMembers,
+    roundRobinSpeakerCount,
   ])
 
   useEffect(() => {
@@ -2448,6 +2510,12 @@ function RoomPage({ roomId }) {
                               : 'No duration recorded'}
                       </p>
                     </div>
+                    {isRoundRobinStep && roundRobinSpeakerCount > 0 ? (
+                      <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-100/70">
+                        Speaker {currentRoundRobinSpeakerIndex || roundRobinSpeakerCount} of{' '}
+                        {roundRobinSpeakerCount}
+                      </p>
+                    ) : null}
                   </div>
                   <div className="flex items-center gap-2">
                     <button
@@ -2498,11 +2566,19 @@ function RoomPage({ roomId }) {
                     </button>
                   </div>
                 </div>
-                <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
+                <div className="relative mt-3 h-2 overflow-hidden rounded-full bg-white/10">
                   <div
                     className="h-full rounded-full bg-yellow-400 transition-[width] duration-700 ease-out"
                     style={{ width: `${currentStepProgressPercent}%` }}
                   />
+                  {roundRobinProgressDots.map((offset) => (
+                    <span
+                      key={offset}
+                      className="absolute top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-slate-950/40 bg-slate-50/90"
+                      style={{ left: `${offset}%` }}
+                      aria-hidden="true"
+                    />
+                  ))}
                 </div>
                 <div className="mt-2 flex items-center justify-between text-[11px] text-slate-100/70">
                   <span>{Math.round(currentStepProgressPercent)}% complete</span>
