@@ -414,10 +414,11 @@ function createEditorId(prefix) {
 }
 
 function serializeWorkflowDefinition(template) {
-  const workflow = template?.workflow ?? {
+  const synchronizedTemplate = synchronizeWorkflowDefinition(template)
+  const workflow = synchronizedTemplate?.workflow ?? {
     title: 'Untitled workflow',
     description: '',
-    state: {},
+    state: [],
     totalMinutes: 0,
     activities: [],
     steps: [],
@@ -437,7 +438,7 @@ function createEmptyWorkflowDefinition(workflowId) {
     workflow: {
       title: 'Untitled workflow',
       description: '',
-      state: {},
+      state: [],
       totalMinutes: 0,
       activities: [
         {
@@ -489,6 +490,265 @@ function createWorkflowStep(activityType) {
     data: createStepDataFromDefinition(definition),
     statePaths: [],
   }
+}
+
+function collectPersistedStatePaths(source, prefix = '') {
+  if (Array.isArray(source)) {
+    return source
+      .flatMap((value) => collectPersistedStatePaths(value, prefix))
+      .filter(Boolean)
+  }
+
+  if (typeof source === 'string') {
+    const trimmedValue = source.trim()
+    return trimmedValue ? [trimmedValue] : []
+  }
+
+  if (!source || typeof source !== 'object') {
+    return prefix ? [prefix] : []
+  }
+
+  return Object.entries(source).flatMap(([key, value]) => {
+    const nextPrefix = prefix ? `${prefix}.${key}` : key
+    return collectPersistedStatePaths(value, nextPrefix)
+  })
+}
+
+function normalizePersistedStatePaths(source) {
+  const uniquePaths = new Set()
+
+  collectPersistedStatePaths(source).forEach((path) => {
+    if (typeof path !== 'string') {
+      return
+    }
+
+    const normalizedPath = path.trim()
+
+    if (!normalizedPath) {
+      return
+    }
+
+    uniquePaths.add(normalizedPath)
+  })
+
+  return [...uniquePaths]
+}
+
+function getWorkflowStepStateKey(step, index = 0) {
+  return step?.id || `step-${index + 1}`
+}
+
+function getDefaultStepStatePaths(step, index = 0) {
+  const stepKey = getWorkflowStepStateKey(step, index)
+  const statePaths = [
+    `steps.${stepKey}.startTime`,
+    `steps.${stepKey}.pauseTime`,
+  ]
+
+  switch (step?.activityType) {
+    case 'individual stickies':
+      statePaths.push(`steps.${stepKey}.cards`)
+      break
+    case 'group stickies':
+      statePaths.push(`steps.${stepKey}.cards`, `steps.${stepKey}.groups`)
+      break
+    case 'voting':
+      statePaths.push(`steps.${stepKey}.cards`, `steps.${stepKey}.groups`, `steps.${stepKey}.votes`)
+      break
+    case 'group fill in the blank':
+      statePaths.push(`steps.${stepKey}.fillInTheBlank`)
+      break
+    default:
+      break
+  }
+
+  return statePaths
+}
+
+function getWorkflowStateValueForPath(path) {
+  if (path === 'currentStepIndex') {
+    return 0
+  }
+
+  if (
+    path.endsWith('.cards') ||
+    path.endsWith('.groups') ||
+    path.endsWith('.votes')
+  ) {
+    return []
+  }
+
+  if (path.endsWith('.fillInTheBlank')) {
+    return ''
+  }
+
+  return null
+}
+
+function createWorkflowStateShape(paths) {
+  const nextState = {}
+
+  paths.forEach((path) => {
+    const segments = path.split('.').filter(Boolean)
+
+    if (segments.length === 0) {
+      return
+    }
+
+    let cursor = nextState
+
+    segments.forEach((segment, index) => {
+      const isLeaf = index === segments.length - 1
+
+      if (isLeaf) {
+        cursor[segment] = getWorkflowStateValueForPath(path)
+        return
+      }
+
+      if (!cursor[segment] || typeof cursor[segment] !== 'object' || Array.isArray(cursor[segment])) {
+        cursor[segment] = {}
+      }
+
+      cursor = cursor[segment]
+    })
+  })
+
+  return nextState
+}
+
+function deriveWorkflowState(steps, workflowStateSource) {
+  const uniquePaths = new Set(['currentStepIndex'])
+
+  steps.forEach((step, index) => {
+    getDefaultStepStatePaths(step, index).forEach((path) => {
+      uniquePaths.add(path)
+    })
+
+    normalizePersistedStatePaths(step?.statePaths ?? []).forEach((path) => {
+      uniquePaths.add(path)
+    })
+  })
+
+  normalizePersistedStatePaths(workflowStateSource).forEach((path) => {
+    uniquePaths.add(path)
+  })
+
+  return createWorkflowStateShape([...uniquePaths])
+}
+
+function synchronizeWorkflowDefinition(template) {
+  if (!template) {
+    return template
+  }
+
+  const workflow = template.workflow ?? {}
+  const activities = Array.isArray(workflow.activities) ? workflow.activities : []
+  const steps =
+    activities.length > 0
+      ? activities.flatMap((activity) => activity.steps ?? [])
+      : Array.isArray(workflow.steps)
+        ? workflow.steps
+        : []
+
+  const synchronizedWorkflow = {
+    ...workflow,
+    activities,
+    activityCount: activities.length,
+    stepCount: steps.length,
+    steps,
+    state: deriveWorkflowState(steps, workflow.state),
+  }
+
+  return {
+    ...template,
+    workflow: synchronizedWorkflow,
+    pipeline: synchronizedWorkflow,
+  }
+}
+
+function normalizeWorkflowRuntime(runtime, steps) {
+  const normalizedSteps = steps.reduce((accumulator, step, index) => {
+    const stepKey = getWorkflowStepStateKey(step, index)
+    const persistedStepState = runtime?.steps?.[stepKey]
+
+    accumulator[stepKey] = {
+      startTime:
+        typeof persistedStepState?.startTime === 'string' ? persistedStepState.startTime : null,
+      pauseTime:
+        typeof persistedStepState?.pauseTime === 'string' ? persistedStepState.pauseTime : null,
+    }
+
+    return accumulator
+  }, {})
+
+  return {
+    currentStepIndex: toNumber(runtime?.currentStepIndex) ?? 0,
+    steps: normalizedSteps,
+  }
+}
+
+function createWorkflowRuntimeForStep(steps, stepIndex, runtime, timestamp = new Date()) {
+  const normalizedRuntime = normalizeWorkflowRuntime(runtime, steps)
+  const boundedStepIndex =
+    steps.length > 0 ? Math.max(0, Math.min(stepIndex, steps.length - 1)) : 0
+  const stepKey = getWorkflowStepStateKey(steps[boundedStepIndex], boundedStepIndex)
+
+  return {
+    ...normalizedRuntime,
+    currentStepIndex: boundedStepIndex,
+    steps: {
+      ...normalizedRuntime.steps,
+      ...(stepKey
+        ? {
+            [stepKey]: {
+              ...(normalizedRuntime.steps[stepKey] ?? {}),
+              startTime: timestamp.toISOString(),
+              pauseTime: null,
+            },
+          }
+        : {}),
+    },
+  }
+}
+
+function completeWorkflowStepRuntime(steps, stepIndex, runtime, durationSeconds, timestamp = new Date()) {
+  const normalizedRuntime = normalizeWorkflowRuntime(runtime, steps)
+  const stepKey = getWorkflowStepStateKey(steps[stepIndex], stepIndex)
+
+  if (!stepKey) {
+    return normalizedRuntime
+  }
+
+  return {
+    ...normalizedRuntime,
+    currentStepIndex: stepIndex,
+    steps: {
+      ...normalizedRuntime.steps,
+      [stepKey]: {
+        ...(normalizedRuntime.steps[stepKey] ?? {}),
+        startTime: new Date(timestamp.getTime() - Math.max(0, durationSeconds) * 1000).toISOString(),
+        pauseTime: null,
+      },
+    },
+  }
+}
+
+function getStepRemainingSeconds(durationSeconds, stepRuntime, now = new Date()) {
+  if (durationSeconds <= 0) {
+    return 0
+  }
+
+  const startTimeMs = Date.parse(stepRuntime?.startTime ?? '')
+
+  if (!Number.isFinite(startTimeMs)) {
+    return durationSeconds
+  }
+
+  const pauseTimeMs = Date.parse(stepRuntime?.pauseTime ?? '')
+  const effectiveEndTimeMs = Number.isFinite(pauseTimeMs) ? pauseTimeMs : now.getTime()
+  const elapsedSeconds = Math.max(0, Math.floor((effectiveEndTimeMs - startTimeMs) / 1000))
+
+  return Math.max(0, durationSeconds - elapsedSeconds)
 }
 
 const normalizedFallbackRoomTemplates = fallbackRoomTemplates.map((template) =>
@@ -666,10 +926,7 @@ function normalizeRoomTemplate(id, template) {
       template?.workflowDescription ||
       template?.pipelineDescription ||
       '',
-    state:
-      workflowSource.state && typeof workflowSource.state === 'object'
-        ? workflowSource.state
-        : {},
+    state: workflowSource.state ?? [],
     totalMinutes,
     activities,
     activityCount: activities.length,
@@ -677,7 +934,7 @@ function normalizeRoomTemplate(id, template) {
     steps,
   }
 
-  return {
+  return synchronizeWorkflowDefinition({
     id,
     name:
       workflow.title || template?.name || template?.title || 'Untitled workflow',
@@ -686,7 +943,7 @@ function normalizeRoomTemplate(id, template) {
     sortOrder: toNumber(template?.sortOrder) ?? Number.MAX_SAFE_INTEGER,
     workflow,
     pipeline: workflow,
-  }
+  })
 }
 
 const EMAIL_STORAGE_KEY = 'innovationery:email-link-email'
@@ -2091,9 +2348,6 @@ function WorkflowEditorPage({ workflowId }) {
   const [editorStatus, setEditorStatus] = useState('loading')
   const [saveStatus, setSaveStatus] = useState('idle')
   const [selectedNode, setSelectedNode] = useState({ type: 'activity', activityIndex: 0, stepIndex: null })
-  const [dragState, setDragState] = useState(null)
-  const [workflowStateDraft, setWorkflowStateDraft] = useState('{}')
-  const [workflowStateError, setWorkflowStateError] = useState('')
   const persistedKeyRef = useRef('')
 
   useEffect(() => {
@@ -2112,12 +2366,12 @@ function WorkflowEditorPage({ workflowId }) {
             return current
           }
 
-          return nextWorkflow
+          return synchronizeWorkflowDefinition(nextWorkflow)
         })
         setEditorStatus('ready')
       },
       () => {
-        setWorkflowDefinition(getDefaultWorkflowDefinition(workflowId))
+        setWorkflowDefinition(synchronizeWorkflowDefinition(getDefaultWorkflowDefinition(workflowId)))
         setEditorStatus('error')
       },
     )
@@ -2164,15 +2418,6 @@ function WorkflowEditorPage({ workflowId }) {
       return
     }
 
-    setWorkflowStateDraft(JSON.stringify(workflowDefinition.workflow?.state ?? {}, null, 2))
-    setWorkflowStateError('')
-  }, [workflowDefinition?.workflow?.state])
-
-  useEffect(() => {
-    if (!workflowDefinition) {
-      return
-    }
-
     const selectedActivity = workflowDefinition.workflow?.activities?.[selectedNode.activityIndex]
 
     if (!selectedActivity) {
@@ -2188,6 +2433,20 @@ function WorkflowEditorPage({ workflowId }) {
       }
     }
   }, [selectedNode, workflowDefinition])
+
+  useEffect(() => {
+    if (!workflowDefinition) {
+      return
+    }
+
+    const synchronizedDefinition = synchronizeWorkflowDefinition(workflowDefinition)
+
+    if (getWorkflowPersistenceKey(synchronizedDefinition) === getWorkflowPersistenceKey(workflowDefinition)) {
+      return
+    }
+
+    setWorkflowDefinition(synchronizedDefinition)
+  }, [workflowDefinition])
 
   const updateWorkflowField = (field, value) => {
     setWorkflowDefinition((current) =>
@@ -2409,6 +2668,20 @@ function WorkflowEditorPage({ workflowId }) {
     })
   }
 
+  const moveActivityByOffset = (activityIndex, offset) => {
+    const targetIndex = activityIndex + offset
+
+    if (
+      !workflowDefinition ||
+      targetIndex < 0 ||
+      targetIndex >= workflowDefinition.workflow.activities.length
+    ) {
+      return
+    }
+
+    moveActivity(activityIndex, targetIndex)
+  }
+
   const moveStep = (sourceActivityIndex, sourceStepIndex, targetActivityIndex, targetStepIndex) => {
     setWorkflowDefinition((current) => {
       if (!current) {
@@ -2457,6 +2730,45 @@ function WorkflowEditorPage({ workflowId }) {
     })
   }
 
+  const moveStepByOffset = (activityIndex, stepIndex, offset) => {
+    const activity = workflowDefinition?.workflow?.activities?.[activityIndex]
+
+    if (!activity) {
+      return
+    }
+
+    if (offset < 0) {
+      if (stepIndex > 0) {
+        moveStep(activityIndex, stepIndex, activityIndex, stepIndex - 1)
+        return
+      }
+
+      const previousActivity = workflowDefinition?.workflow?.activities?.[activityIndex - 1]
+
+      if (!previousActivity) {
+        return
+      }
+
+      moveStep(activityIndex, stepIndex, activityIndex - 1, previousActivity.steps.length)
+      return
+    }
+
+    if (offset > 0) {
+      if (stepIndex < activity.steps.length - 1) {
+        moveStep(activityIndex, stepIndex, activityIndex, stepIndex + 2)
+        return
+      }
+
+      const nextActivity = workflowDefinition?.workflow?.activities?.[activityIndex + 1]
+
+      if (!nextActivity) {
+        return
+      }
+
+      moveStep(activityIndex, stepIndex, activityIndex + 1, 0)
+    }
+  }
+
   const selectedActivity = workflowDefinition?.workflow?.activities?.[selectedNode.activityIndex] ?? null
   const selectedStep =
     selectedNode.type === 'step' && selectedActivity
@@ -2465,6 +2777,14 @@ function WorkflowEditorPage({ workflowId }) {
   const selectedStepTypeDefinition = selectedStep
     ? getStepTypeDefinition(selectedStep.activityType)
     : null
+  const workflowStatePreview = JSON.stringify(
+    deriveWorkflowState(
+      workflowDefinition?.workflow?.steps ?? [],
+      workflowDefinition?.workflow?.state ?? {},
+    ),
+    null,
+    2,
+  )
 
   if (editorStatus === 'loading' || !workflowDefinition) {
     return (
@@ -2526,28 +2846,13 @@ function WorkflowEditorPage({ workflowId }) {
             <label className="grid gap-2 text-sm font-medium text-slate-800">
               Workflow State
               <textarea
-                value={workflowStateDraft}
-                onChange={(event) => {
-                  const nextValue = event.target.value
-                  setWorkflowStateDraft(nextValue)
-
-                  try {
-                    const parsed = JSON.parse(nextValue || '{}')
-                    setWorkflowStateError('')
-                    updateWorkflowMeta('state', parsed)
-                  } catch {
-                    setWorkflowStateError('Enter valid JSON to save workflow state.')
-                  }
-                }}
-                className="min-h-36 rounded-2xl border border-slate-300 bg-white px-4 py-3 font-mono text-sm text-slate-900 outline-none transition focus:border-slate-500"
+                value={workflowStatePreview}
+                readOnly
+                className="min-h-36 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 font-mono text-sm text-slate-900 outline-none"
               />
-              {workflowStateError ? (
-                <p className="text-sm font-medium text-rose-700">{workflowStateError}</p>
-              ) : (
-                <p className="text-xs text-slate-500">
-                  Define the global state shape that rooms will persist for this workflow.
-                </p>
-              )}
+              <p className="text-xs text-slate-500">
+                Auto-derived list of workflow state keys that will be persisted to Firebase for this workflow.
+              </p>
             </label>
           </div>
         </section>
@@ -2568,39 +2873,13 @@ function WorkflowEditorPage({ workflowId }) {
               {workflowDefinition.workflow.activities.map((activity, activityIndex) => {
                 const isSelectedActivity =
                   selectedNode.type === 'activity' && selectedNode.activityIndex === activityIndex
+                const canMoveActivityUp = activityIndex > 0
+                const canMoveActivityDown =
+                  activityIndex < workflowDefinition.workflow.activities.length - 1
 
                 return (
                   <section
                     key={activity.id || `activity-${activityIndex + 1}`}
-                    draggable
-                    onDragStart={() =>
-                      setDragState({ type: 'activity', activityIndex })
-                    }
-                    onDragEnd={() => setDragState(null)}
-                    onDragOver={(event) => {
-                      if (dragState?.type === 'activity') {
-                        event.preventDefault()
-                      }
-                    }}
-                    onDrop={(event) => {
-                      event.preventDefault()
-                      event.stopPropagation()
-
-                      if (dragState?.type === 'activity') {
-                        moveActivity(dragState.activityIndex, activityIndex)
-                        setDragState(null)
-                      }
-
-                      if (dragState?.type === 'step') {
-                        moveStep(
-                          dragState.activityIndex,
-                          dragState.stepIndex,
-                          activityIndex,
-                          activity.steps.length,
-                        )
-                        setDragState(null)
-                      }
-                    }}
                     onClick={() =>
                       setSelectedNode({ type: 'activity', activityIndex, stepIndex: null })
                     }
@@ -2624,6 +2903,36 @@ function WorkflowEditorPage({ workflowId }) {
                         </h3>
                       </div>
                       <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={!canMoveActivityUp}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            moveActivityByOffset(activityIndex, -1)
+                          }}
+                          className={`rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                            isSelectedActivity
+                              ? 'border border-white/20 text-white hover:bg-white/10 disabled:border-white/10 disabled:text-slate-500 disabled:hover:bg-transparent'
+                              : 'border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:border-slate-200 disabled:text-slate-300 disabled:hover:bg-transparent'
+                          }`}
+                        >
+                          ^
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!canMoveActivityDown}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            moveActivityByOffset(activityIndex, 1)
+                          }}
+                          className={`rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                            isSelectedActivity
+                              ? 'border border-white/20 text-white hover:bg-white/10 disabled:border-white/10 disabled:text-slate-500 disabled:hover:bg-transparent'
+                              : 'border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:border-slate-200 disabled:text-slate-300 disabled:hover:bg-transparent'
+                          }`}
+                        >
+                          v
+                        </button>
                         <button
                           type="button"
                           onClick={(event) => {
@@ -2655,64 +2964,21 @@ function WorkflowEditorPage({ workflowId }) {
                       </div>
                     </div>
 
-                    <div
-                      className="mt-4 space-y-2"
-                      onDragOver={(event) => {
-                        if (dragState?.type === 'step') {
-                          event.preventDefault()
-                        }
-                      }}
-                      onDrop={(event) => {
-                        event.preventDefault()
-                        event.stopPropagation()
-
-                        if (dragState?.type === 'step') {
-                          moveStep(
-                            dragState.activityIndex,
-                            dragState.stepIndex,
-                            activityIndex,
-                            activity.steps.length,
-                          )
-                          setDragState(null)
-                        }
-                      }}
-                    >
+                    <div className="mt-4 space-y-2">
                       {activity.steps.length > 0 ? (
                         activity.steps.map((step, stepIndex) => {
                           const isSelectedStep =
                             selectedNode.type === 'step' &&
                             selectedNode.activityIndex === activityIndex &&
                             selectedNode.stepIndex === stepIndex
+                          const canMoveStepUp = stepIndex > 0 || activityIndex > 0
+                          const canMoveStepDown =
+                            stepIndex < activity.steps.length - 1 ||
+                            activityIndex < workflowDefinition.workflow.activities.length - 1
 
                           return (
                             <div
                               key={step.id || `${activityIndex}-${stepIndex}`}
-                              draggable
-                              onDragStart={(event) => {
-                                event.stopPropagation()
-                                setDragState({ type: 'step', activityIndex, stepIndex })
-                              }}
-                              onDragEnd={() => setDragState(null)}
-                              onDragOver={(event) => {
-                                if (dragState?.type === 'step') {
-                                  event.preventDefault()
-                                  event.stopPropagation()
-                                }
-                              }}
-                              onDrop={(event) => {
-                                event.preventDefault()
-                                event.stopPropagation()
-
-                                if (dragState?.type === 'step') {
-                                  moveStep(
-                                    dragState.activityIndex,
-                                    dragState.stepIndex,
-                                    activityIndex,
-                                    stepIndex,
-                                  )
-                                  setDragState(null)
-                                }
-                              }}
                               onClick={(event) => {
                                 event.stopPropagation()
                                 setSelectedNode({ type: 'step', activityIndex, stepIndex })
@@ -2730,20 +2996,52 @@ function WorkflowEditorPage({ workflowId }) {
                                     {step.activityType || 'Step'}
                                   </p>
                                 </div>
-                                <button
-                                  type="button"
-                                  onClick={(event) => {
-                                    event.stopPropagation()
-                                    removeStep(activityIndex, stepIndex)
-                                  }}
-                                  className={`rounded-full px-2.5 py-1 text-xs font-medium transition ${
-                                    isSelectedStep
-                                      ? 'border border-white/20 text-white hover:bg-white/10'
-                                      : 'border border-rose-200 text-rose-700 hover:bg-rose-50'
-                                  }`}
-                                >
-                                  Remove
-                                </button>
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    disabled={!canMoveStepUp}
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      moveStepByOffset(activityIndex, stepIndex, -1)
+                                    }}
+                                    className={`rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                                      isSelectedStep
+                                        ? 'border border-white/20 text-white hover:bg-white/10 disabled:border-white/10 disabled:text-slate-500 disabled:hover:bg-transparent'
+                                        : 'border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:border-slate-200 disabled:text-slate-300 disabled:hover:bg-transparent'
+                                    }`}
+                                  >
+                                    ^
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={!canMoveStepDown}
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      moveStepByOffset(activityIndex, stepIndex, 1)
+                                    }}
+                                    className={`rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                                      isSelectedStep
+                                        ? 'border border-white/20 text-white hover:bg-white/10 disabled:border-white/10 disabled:text-slate-500 disabled:hover:bg-transparent'
+                                        : 'border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:border-slate-200 disabled:text-slate-300 disabled:hover:bg-transparent'
+                                    }`}
+                                  >
+                                    v
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      removeStep(activityIndex, stepIndex)
+                                    }}
+                                    className={`rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                                      isSelectedStep
+                                        ? 'border border-white/20 text-white hover:bg-white/10'
+                                        : 'border border-rose-200 text-rose-700 hover:bg-rose-50'
+                                    }`}
+                                  >
+                                    Remove
+                                  </button>
+                                </div>
                               </div>
                             </div>
                           )
@@ -2779,53 +3077,10 @@ function WorkflowEditorPage({ workflowId }) {
                           className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
                         />
                       </label>
-                      <label className="grid gap-2 text-sm font-medium text-slate-800">
-                        Activity Description
-                        <textarea
-                          value={selectedActivity.description || ''}
-                          onChange={(event) =>
-                            updateActivity(selectedNode.activityIndex, 'description', event.target.value)
-                          }
-                          className="min-h-24 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
-                        />
-                      </label>
                     </div>
                   ) : selectedStep ? (
                     <div className="mt-4 grid gap-4 lg:grid-cols-2">
                       <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
-                        State Paths
-                        <textarea
-                          value={(selectedStep.statePaths ?? []).join('\n')}
-                          onChange={(event) =>
-                            updateStep(
-                              selectedNode.activityIndex,
-                              selectedNode.stepIndex,
-                              'statePaths',
-                              event.target.value
-                                .split('\n')
-                                .map((path) => path.trim())
-                                .filter(Boolean),
-                            )
-                          }
-                          placeholder={'problem.cards\nproblem.topChoice\nsolution.statement'}
-                          className="min-h-24 rounded-2xl border border-slate-300 bg-white px-4 py-3 font-mono text-sm text-slate-900 outline-none transition focus:border-slate-500"
-                        />
-                        <p className="text-xs text-slate-500">
-                          One state path per line. These are the workflow state values this step reads.
-                        </p>
-                      </label>
-                      <label className="grid gap-2 text-sm font-medium text-slate-800">
-                        Step Title
-                        <input
-                          type="text"
-                          value={selectedStep.title || ''}
-                          onChange={(event) =>
-                            updateStep(selectedNode.activityIndex, selectedNode.stepIndex, 'title', event.target.value)
-                          }
-                          className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
-                        />
-                      </label>
-                      <label className="grid gap-2 text-sm font-medium text-slate-800">
                         Step Type
                         <select
                           value={selectedStep.activityType || ''}
@@ -2846,79 +3101,15 @@ function WorkflowEditorPage({ workflowId }) {
                           ))}
                         </select>
                       </label>
-                      {selectedStepTypeDefinition ? (
-                        <div className="grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 lg:col-span-2">
-                          <div>
-                            <p className="text-sm font-medium text-slate-900">Type Instructions</p>
-                            <p className="mt-1 text-sm leading-6 text-slate-600">
-                              {selectedStepTypeDefinition.instructions}
-                            </p>
-                          </div>
-                          <div className="grid gap-3 sm:grid-cols-2">
-                            <div>
-                              <p className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500">
-                                Input Types
-                              </p>
-                              <div className="mt-2 flex flex-wrap gap-2">
-                                {selectedStepTypeDefinition.input.length ? (
-                                  selectedStepTypeDefinition.input.map((inputType) => (
-                                    <span
-                                      key={inputType}
-                                      className="rounded-full bg-white px-2.5 py-1 text-xs font-medium text-slate-700"
-                                    >
-                                      {inputType}
-                                    </span>
-                                  ))
-                                ) : (
-                                  <span className="text-sm text-slate-500">None</span>
-                                )}
-                              </div>
-                            </div>
-                            <div>
-                              <p className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500">
-                                Output Types
-                              </p>
-                              <div className="mt-2 flex flex-wrap gap-2">
-                                {selectedStepTypeDefinition.outputs.length ? (
-                                  selectedStepTypeDefinition.outputs.map((outputType) => (
-                                    <span
-                                      key={outputType}
-                                      className="rounded-full bg-white px-2.5 py-1 text-xs font-medium text-slate-700"
-                                    >
-                                      {outputType}
-                                    </span>
-                                  ))
-                                ) : (
-                                  <span className="text-sm text-slate-500">None</span>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      ) : null}
-                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
-                        Prompt
-                        <textarea
-                          value={selectedStep.prompt || ''}
+                      <label className="grid gap-2 text-sm font-medium text-slate-800">
+                        Step Title
+                        <input
+                          type="text"
+                          value={selectedStep.title || ''}
                           onChange={(event) =>
-                            updateStep(selectedNode.activityIndex, selectedNode.stepIndex, 'prompt', event.target.value)
+                            updateStep(selectedNode.activityIndex, selectedNode.stepIndex, 'title', event.target.value)
                           }
-                          className="min-h-20 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
-                        />
-                      </label>
-                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
-                        Description
-                        <textarea
-                          value={selectedStep.description || ''}
-                          onChange={(event) =>
-                            updateStep(
-                              selectedNode.activityIndex,
-                              selectedNode.stepIndex,
-                              'description',
-                              event.target.value,
-                            )
-                          }
-                          className="min-h-20 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                          className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
                         />
                       </label>
                       <label className="grid gap-2 text-sm font-medium text-slate-800">
@@ -2936,6 +3127,32 @@ function WorkflowEditorPage({ workflowId }) {
                             )
                           }
                           className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
+                        Prompt
+                        <input
+                          type="text"
+                          value={selectedStep.prompt || ''}
+                          onChange={(event) =>
+                            updateStep(selectedNode.activityIndex, selectedNode.stepIndex, 'prompt', event.target.value)
+                          }
+                          className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
+                        Description
+                        <textarea
+                          value={selectedStep.description || ''}
+                          onChange={(event) =>
+                            updateStep(
+                              selectedNode.activityIndex,
+                              selectedNode.stepIndex,
+                              'description',
+                              event.target.value,
+                            )
+                          }
+                          className="min-h-20 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
                         />
                       </label>
                       {selectedStepTypeDefinition && Object.keys(selectedStepTypeDefinition.data).length > 0 ? (
@@ -3027,9 +3244,7 @@ function RoomPage({ roomId }) {
   const [roomIdentityLoading, setRoomIdentityLoading] = useState(false)
   const [status, setStatus] = useState('loading')
   const [banner, setBanner] = useState(() => readRoomBanner(roomId))
-  const [currentStepIndex, setCurrentStepIndex] = useState(0)
-  const [remainingSeconds, setRemainingSeconds] = useState(0)
-  const [isPaused, setIsPaused] = useState(false)
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const [roundRobinOrder, setRoundRobinOrder] = useState([])
   const [completedRoundRobinSpeakerIds, setCompletedRoundRobinSpeakerIds] = useState([])
   const currentMember = JSON.parse(
@@ -3057,6 +3272,14 @@ function RoomPage({ roomId }) {
 
     return unsubscribe
   }, [roomId])
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      setNowMs(Date.now())
+    }, 1000)
+
+    return () => window.clearInterval(intervalId)
+  }, [])
 
   useEffect(() => {
     if (!room?.workflowId) {
@@ -3179,15 +3402,25 @@ function RoomPage({ roomId }) {
       }
     }),
   )
+  const workflowRuntime = normalizeWorkflowRuntime(room?.workflowRuntime, workflowSequence)
   const safeCurrentStepIndex =
-    workflowSequence.length > 0 ? Math.min(currentStepIndex, workflowSequence.length - 1) : 0
+    workflowSequence.length > 0
+      ? Math.min(workflowRuntime.currentStepIndex, workflowSequence.length - 1)
+      : 0
   const currentStep = workflowSequence[safeCurrentStepIndex] ?? null
+  const currentStepRuntime = currentStep
+    ? workflowRuntime.steps[getWorkflowStepStateKey(currentStep, safeCurrentStepIndex)] ?? null
+    : null
   const hasWorkflowStarted = Boolean(room?.workflowStartedAt)
   const currentActivityIndex = currentStep?.activityIndex ?? 0
   const isRoundRobinStep = currentStep?.activityType === 'roundrobin'
   const isIndividualBrainstormStep = currentStep?.activityType === 'individual stickies'
   const isGroupBrainstormStep = currentStep?.activityType === 'group stickies'
   const currentStepDurationSeconds = (currentStep?.durationMinutes ?? 0) * 60
+  const remainingSeconds = hasWorkflowStarted
+    ? getStepRemainingSeconds(currentStepDurationSeconds, currentStepRuntime, new Date(nowMs))
+    : 0
+  const isPaused = Boolean(currentStepRuntime?.pauseTime)
   const roundRobinMembers = roundRobinOrder
     .map((memberId) => members.find((member) => member.id === memberId))
     .filter(Boolean)
@@ -3205,9 +3438,6 @@ function RoomPage({ roomId }) {
     workflowSequence.length > 0 &&
     safeCurrentStepIndex === workflowSequence.length - 1 &&
     remainingSeconds === 0
-  const firstStepDurationSeconds = (workflowSequence[0]?.durationMinutes ?? 0) * 60
-  const nextStepDurationSeconds =
-    (workflowSequence[safeCurrentStepIndex + 1]?.durationMinutes ?? 0) * 60
   const currentStepProgressPercent =
     currentStepDurationSeconds > 0
       ? Math.min(
@@ -3258,37 +3488,109 @@ function RoomPage({ roomId }) {
     (card) => shouldRevealAllBrainstormCards || card.authorId === currentMember?.id,
   ).length
   const hiddenBrainstormCardCount = currentActivityCards.length - visibleBrainstormCardCount
-  const moveToStep = (stepIndex) => {
-    const nextIndex = Math.max(0, Math.min(stepIndex, workflowSequence.length - 1))
-    const nextStep = workflowSequence[nextIndex]
-
-    setCurrentStepIndex(nextIndex)
-    setRemainingSeconds((nextStep?.durationMinutes ?? 0) * 60)
-    setIsPaused(false)
-  }
-  const startWorkflow = async () => {
+  const persistWorkflowRuntime = async (nextRuntime) => {
     await setDoc(
       doc(db, 'rooms', roomId),
       {
-        workflowStartedAt: serverTimestamp(),
+        workflowRuntime: nextRuntime,
         updatedAt: serverTimestamp(),
       },
       { merge: true },
     )
   }
-  const completeCurrentStep = () => {
+
+  const startWorkflow = async () => {
+    const nextRuntime = createWorkflowRuntimeForStep(workflowSequence, 0, room?.workflowRuntime)
+
+    await setDoc(
+      doc(db, 'rooms', roomId),
+      {
+        workflowStartedAt: serverTimestamp(),
+        workflowRuntime: nextRuntime,
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true },
+    )
+  }
+
+  const togglePauseState = async () => {
     if (!currentStep) {
       return
     }
 
-    if (safeCurrentStepIndex < workflowSequence.length - 1) {
-      setRemainingSeconds(0)
-      setIsPaused(false)
+    const stepKey = getWorkflowStepStateKey(currentStep, safeCurrentStepIndex)
+    const timestamp = new Date()
+    const currentStepState = workflowRuntime.steps[stepKey] ?? {
+      startTime: timestamp.toISOString(),
+      pauseTime: null,
+    }
+
+    if (isPaused) {
+      const startTimeMs = Date.parse(currentStepState.startTime ?? '')
+      const pauseTimeMs = Date.parse(currentStepState.pauseTime ?? '')
+
+      if (!Number.isFinite(startTimeMs) || !Number.isFinite(pauseTimeMs)) {
+        return
+      }
+
+      const resumedStartTime = new Date(
+        startTimeMs + (timestamp.getTime() - pauseTimeMs),
+      ).toISOString()
+
+      await persistWorkflowRuntime({
+        ...workflowRuntime,
+        steps: {
+          ...workflowRuntime.steps,
+          [stepKey]: {
+            ...currentStepState,
+            startTime: resumedStartTime,
+            pauseTime: null,
+          },
+        },
+      })
       return
     }
 
-    setRemainingSeconds(0)
-    setIsPaused(false)
+    await persistWorkflowRuntime({
+      ...workflowRuntime,
+      steps: {
+        ...workflowRuntime.steps,
+        [stepKey]: {
+          ...currentStepState,
+          pauseTime: timestamp.toISOString(),
+        },
+      },
+    })
+  }
+
+  const completeCurrentStep = async () => {
+    if (!currentStep) {
+      return
+    }
+
+    const timestamp = new Date()
+
+    if (safeCurrentStepIndex < workflowSequence.length - 1) {
+      await persistWorkflowRuntime(
+        createWorkflowRuntimeForStep(
+          workflowSequence,
+          safeCurrentStepIndex + 1,
+          workflowRuntime,
+          timestamp,
+        ),
+      )
+      return
+    }
+
+    await persistWorkflowRuntime(
+      completeWorkflowStepRuntime(
+        workflowSequence,
+        safeCurrentStepIndex,
+        workflowRuntime,
+        currentStepDurationSeconds,
+        timestamp,
+      ),
+    )
   }
 
   useEffect(() => {
@@ -3464,14 +3766,29 @@ function RoomPage({ roomId }) {
       return undefined
     }
 
+    const stepKey = getWorkflowStepStateKey(workflowSequence[safeCurrentStepIndex], safeCurrentStepIndex)
+
+    if (workflowRuntime.steps[stepKey]?.startTime) {
+      return undefined
+    }
+
     const timeoutId = window.setTimeout(() => {
-      setCurrentStepIndex(0)
-      setRemainingSeconds(firstStepDurationSeconds)
-      setIsPaused(false)
+      void persistWorkflowRuntime(
+        createWorkflowRuntimeForStep(
+          workflowSequence,
+          safeCurrentStepIndex,
+          room?.workflowRuntime,
+        ),
+      )
     }, 0)
 
     return () => window.clearTimeout(timeoutId)
-  }, [firstStepDurationSeconds, hasWorkflowStarted, roomId, workflowSequence.length])
+  }, [
+    hasWorkflowStarted,
+    room?.workflowRuntime,
+    safeCurrentStepIndex,
+    workflowSequence.length,
+  ])
 
   useEffect(() => {
     if (hasWorkflowStarted) {
@@ -3479,9 +3796,6 @@ function RoomPage({ roomId }) {
     }
 
     const timeoutId = window.setTimeout(() => {
-      setCurrentStepIndex(0)
-      setRemainingSeconds(0)
-      setIsPaused(true)
       setRoundRobinOrder([])
       setCompletedRoundRobinSpeakerIds([])
     }, 0)
@@ -3570,21 +3884,15 @@ function RoomPage({ roomId }) {
       return undefined
     }
 
-    if (remainingSeconds > 0) {
-      const intervalId = window.setInterval(() => {
-        setRemainingSeconds((seconds) => Math.max(0, seconds - 1))
-      }, 1000)
-
-      return () => window.clearInterval(intervalId)
-    }
-
-    if (safeCurrentStepIndex < workflowSequence.length - 1) {
+    if (remainingSeconds === 0 && safeCurrentStepIndex < workflowSequence.length - 1) {
       const timeoutId = window.setTimeout(() => {
-        const nextIndex = safeCurrentStepIndex + 1
-
-        setCurrentStepIndex(nextIndex)
-        setRemainingSeconds(nextStepDurationSeconds)
-        setIsPaused(false)
+        void persistWorkflowRuntime(
+          createWorkflowRuntimeForStep(
+            workflowSequence,
+            safeCurrentStepIndex + 1,
+            workflowRuntime,
+          ),
+        )
       }, 1200)
 
       return () => window.clearTimeout(timeoutId)
@@ -3595,7 +3903,6 @@ function RoomPage({ roomId }) {
     currentStep,
     hasWorkflowStarted,
     isPaused,
-    nextStepDurationSeconds,
     remainingSeconds,
     safeCurrentStepIndex,
     workflowSequence.length,
@@ -4017,7 +4324,9 @@ function RoomPage({ roomId }) {
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => setIsPaused((paused) => !paused)}
+                      onClick={() => {
+                        void togglePauseState()
+                      }}
                       disabled={!currentStep || isWorkflowComplete}
                       className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-white/15 bg-white/10 text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50"
                       aria-label={isPaused ? 'Resume timer' : 'Pause timer'}
