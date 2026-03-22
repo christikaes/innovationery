@@ -1,4 +1,49 @@
+import { useState } from 'react'
+
+const roomTypes = [
+  {
+    id: 'ideation',
+    name: 'Ideation Sprint',
+    description: 'Fast-moving room for collecting and shaping early product ideas.',
+  },
+  {
+    id: 'roadmap',
+    name: 'Roadmap Planning',
+    description: 'Structure initiatives, timelines, and ownership into a clear plan.',
+  },
+  {
+    id: 'design',
+    name: 'Design Critique',
+    description: 'Review flows, surfaces, and interaction decisions with focused feedback.',
+  },
+  {
+    id: 'launch',
+    name: 'Launch Readiness',
+    description: 'Align product, marketing, and operations before release.',
+  },
+  {
+    id: 'retro',
+    name: 'Team Retro',
+    description: 'Reflect on wins, friction points, and next improvements together.',
+  },
+  {
+    id: 'research',
+    name: 'Research Review',
+    description: 'Collect learnings, evidence, and decision signals from discovery work.',
+  },
+]
+
+const pipelineSteps = [
+  'Choose the room template',
+  'Invite the right participants',
+  'Capture ideas and signals',
+  'Sort priorities into lanes',
+  'Turn outcomes into action',
+]
+
 function App() {
+  const [activeTab, setActiveTab] = useState('join')
+
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(242,127,90,0.16),_transparent_28%),linear-gradient(180deg,_#fff8ef_0%,_#f5efe6_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
       <div className="mx-auto grid min-h-[calc(100vh-3rem)] max-w-6xl content-center gap-6">
@@ -25,6 +70,144 @@ function App() {
               Vite + React + Firebase ready
             </span>
           </div>
+        </section>
+
+        <section className="rounded-[2rem] border border-slate-900/10 bg-white/75 p-4 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur sm:p-5 md:p-6">
+          <div className="grid gap-3 md:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setActiveTab('join')}
+              className={`flex min-h-24 items-center justify-center rounded-[1.5rem] border px-6 py-5 text-left text-xl font-semibold transition sm:text-2xl ${
+                activeTab === 'join'
+                  ? 'border-slate-900 bg-slate-900 text-orange-50 shadow-[0_20px_40px_rgba(15,23,42,0.18)]'
+                  : 'border-slate-900/10 bg-white text-slate-900 hover:border-slate-900/30 hover:bg-slate-50'
+              }`}
+            >
+              Join Room
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('create')}
+              className={`flex min-h-24 items-center justify-center rounded-[1.5rem] border px-6 py-5 text-left text-xl font-semibold transition sm:text-2xl ${
+                activeTab === 'create'
+                  ? 'border-slate-900 bg-slate-900 text-orange-50 shadow-[0_20px_40px_rgba(15,23,42,0.18)]'
+                  : 'border-slate-900/10 bg-white text-slate-900 hover:border-slate-900/30 hover:bg-slate-50'
+              }`}
+            >
+              Create Room
+            </button>
+          </div>
+
+          {activeTab === 'join' ? (
+            <div className="mt-4 rounded-[1.75rem] border border-slate-900/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.95),rgba(248,250,252,0.92))] p-6 sm:p-8">
+              <div className="max-w-3xl">
+                <p className="text-sm uppercase tracking-[0.24em] text-amber-800">
+                  Join an active room
+                </p>
+                <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900">
+                  Enter the room details and jump in.
+                </h2>
+              </div>
+
+              <form className="mt-8 grid gap-4 md:grid-cols-2">
+                <label className="grid gap-2 text-sm font-medium text-slate-700">
+                  Room Number
+                  <input
+                    type="text"
+                    placeholder="Enter room number"
+                    className="min-h-14 rounded-2xl border border-slate-900/10 bg-white px-4 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-700 focus:ring-2 focus:ring-sky-700/15"
+                  />
+                </label>
+                <label className="grid gap-2 text-sm font-medium text-slate-700">
+                  Your Name
+                  <input
+                    type="text"
+                    placeholder="Enter your name"
+                    className="min-h-14 rounded-2xl border border-slate-900/10 bg-white px-4 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-700 focus:ring-2 focus:ring-sky-700/15"
+                  />
+                </label>
+                <label className="grid gap-2 text-sm font-medium text-slate-700 md:col-span-2">
+                  Email
+                  <input
+                    type="email"
+                    placeholder="Enter your email"
+                    className="min-h-14 rounded-2xl border border-slate-900/10 bg-white px-4 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-700 focus:ring-2 focus:ring-sky-700/15"
+                  />
+                </label>
+                <div className="md:col-span-2">
+                  <button
+                    type="submit"
+                    className="inline-flex min-h-14 items-center justify-center rounded-full bg-gradient-to-br from-slate-900 to-sky-700 px-7 text-base font-medium text-orange-50 transition hover:brightness-110"
+                  >
+                    Join Now
+                  </button>
+                </div>
+              </form>
+            </div>
+          ) : (
+            <div className="mt-4 rounded-[1.75rem] border border-slate-900/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.95),rgba(248,250,252,0.92))] p-6 sm:p-8">
+              <div className="grid gap-6 lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+                <div className="rounded-[1.5rem] border border-slate-900/10 bg-white p-4">
+                  <div className="mb-4 flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm uppercase tracking-[0.2em] text-amber-800">
+                        Room Types
+                      </p>
+                      <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                        Pick a starting format
+                      </h2>
+                    </div>
+                    <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                      Scroll
+                    </span>
+                  </div>
+
+                  <div className="max-h-[24rem] space-y-3 overflow-y-auto pr-1">
+                    {roomTypes.map((roomType) => (
+                      <button
+                        key={roomType.id}
+                        type="button"
+                        className="w-full rounded-[1.25rem] border border-slate-900/10 bg-slate-50 px-4 py-4 text-left transition hover:border-sky-700/40 hover:bg-sky-50"
+                      >
+                        <span className="block text-lg font-semibold text-slate-900">
+                          {roomType.name}
+                        </span>
+                        <span className="mt-2 block text-sm leading-6 text-slate-600">
+                          {roomType.description}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="rounded-[1.5rem] border border-slate-900/10 bg-slate-950 p-5 text-orange-50 sm:p-6">
+                  <p className="text-sm uppercase tracking-[0.2em] text-orange-200/80">
+                    Room Pipeline
+                  </p>
+                  <h2 className="mt-2 text-2xl font-semibold tracking-tight">
+                    How the room flows from kickoff to action
+                  </h2>
+
+                  <div className="mt-6 space-y-4">
+                    {pipelineSteps.map((step, index) => (
+                      <div
+                        key={step}
+                        className="relative rounded-[1.25rem] border border-white/10 bg-white/5 p-4 pl-16"
+                      >
+                        {index < pipelineSteps.length - 1 ? (
+                          <div className="absolute bottom-[-1rem] left-6 top-[3.5rem] w-px bg-white/15" />
+                        ) : null}
+                        <span className="absolute left-4 top-4 flex h-8 w-8 items-center justify-center rounded-full bg-orange-200 text-sm font-semibold text-slate-950">
+                          {index + 1}
+                        </span>
+                        <p className="text-base font-medium leading-7">{step}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </section>
 
         <section
