@@ -2429,6 +2429,88 @@ function RoomPage({ roomId }) {
           </aside>
 
           <div className="space-y-5">
+            {hasWorkflowStarted ? (
+              <div className="rounded-[1.5rem] border border-slate-900/20 bg-slate-950 px-4 py-4 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-[11px] uppercase tracking-[0.18em] text-slate-200/75">Timer</p>
+                    <div className="mt-1 flex flex-wrap items-end gap-x-3 gap-y-1">
+                      <p className="text-2xl font-semibold tabular-nums">
+                        {formatCountdown(remainingSeconds)}
+                      </p>
+                      <p className="text-sm text-slate-100/70">
+                        {isWorkflowComplete
+                          ? 'Workflow complete'
+                          : isPaused
+                            ? 'Paused'
+                            : currentStep?.durationMinutes
+                              ? `${currentStep.durationMinutes} minute step`
+                              : 'No duration recorded'}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsPaused((paused) => !paused)}
+                      disabled={!currentStep || isWorkflowComplete}
+                      className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-white/15 bg-white/10 text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label={isPaused ? 'Resume timer' : 'Pause timer'}
+                      title={isPaused ? 'Resume timer' : 'Pause timer'}
+                    >
+                      {isPaused ? (
+                        <svg
+                          viewBox="0 0 20 20"
+                          fill="currentColor"
+                          className="h-4 w-4"
+                          aria-hidden="true"
+                        >
+                          <path d="M6 4.5a1 1 0 0 1 1.53-.848l7 4.5a1 1 0 0 1 0 1.696l-7 4.5A1 1 0 0 1 6 13.5v-9Z" />
+                        </svg>
+                      ) : (
+                        <svg
+                          viewBox="0 0 20 20"
+                          fill="currentColor"
+                          className="h-4 w-4"
+                          aria-hidden="true"
+                        >
+                          <path d="M5.75 4A1.75 1.75 0 0 0 4 5.75v8.5C4 15.216 4.784 16 5.75 16h.5C7.216 16 8 15.216 8 14.25v-8.5A1.75 1.75 0 0 0 6.25 4h-.5ZM13.75 4A1.75 1.75 0 0 0 12 5.75v8.5c0 .966.784 1.75 1.75 1.75h.5c.966 0 1.75-.784 1.75-1.75v-8.5A1.75 1.75 0 0 0 14.25 4h-.5Z" />
+                        </svg>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={completeCurrentStep}
+                      disabled={
+                        !currentStep ||
+                        isWorkflowComplete ||
+                        (isRoundRobinStep && roundRobinMembers.length === 0)
+                      }
+                      className={gradientButtonCompactClass}
+                    >
+                      {isRoundRobinStep
+                        ? activeRoundRobinMember
+                          ? completedRoundRobinSpeakerIds.length === roundRobinMembers.length - 1
+                            ? 'Complete round robin'
+                            : 'Next speaker'
+                          : 'Round robin complete'
+                        : 'Finish step'}
+                    </button>
+                  </div>
+                </div>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className="h-full rounded-full bg-yellow-400 transition-[width] duration-700 ease-out"
+                    style={{ width: `${currentStepProgressPercent}%` }}
+                  />
+                </div>
+                <div className="mt-2 flex items-center justify-between text-[11px] text-slate-100/70">
+                  <span>{Math.round(currentStepProgressPercent)}% complete</span>
+                  <span>{formatCountdown(remainingSeconds)} remaining</span>
+                </div>
+              </div>
+            ) : null}
+
             <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-6 shadow-[var(--theme-shadow-soft)] backdrop-blur">
               <div className="flex flex-col gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-start sm:justify-between">
                 <div>
@@ -2495,65 +2577,7 @@ function RoomPage({ roomId }) {
                     })}
                   </div>
                 </div>
-              ) : (
-                <div className="mt-5 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 px-5 py-5 text-white">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <p className="text-xs uppercase tracking-[0.18em] text-slate-200/75">Timer</p>
-                      <p className="mt-2 text-2xl font-semibold tabular-nums">
-                        {formatCountdown(remainingSeconds)}
-                      </p>
-                    </div>
-                    <p className="text-sm text-slate-100/70">
-                      {isWorkflowComplete
-                        ? 'Workflow complete'
-                        : isPaused
-                          ? 'Paused'
-                          : currentStep?.durationMinutes
-                            ? `${currentStep.durationMinutes} minute step`
-                            : 'No duration recorded'}
-                    </p>
-                  </div>
-                  <div className="mt-4 flex flex-wrap gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setIsPaused((paused) => !paused)}
-                    disabled={!currentStep || isWorkflowComplete}
-                    className={gradientButtonCompactClass}
-                  >
-                    {isPaused ? 'Resume timer' : 'Pause timer'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={completeCurrentStep}
-                    disabled={
-                      !currentStep ||
-                      isWorkflowComplete ||
-                      (isRoundRobinStep && roundRobinMembers.length === 0)
-                    }
-                    className={gradientButtonCompactClass}
-                  >
-                    {isRoundRobinStep
-                      ? activeRoundRobinMember
-                        ? completedRoundRobinSpeakerIds.length === roundRobinMembers.length - 1
-                          ? 'Complete round robin'
-                          : 'Next speaker'
-                        : 'Round robin complete'
-                      : 'Finish step'}
-                  </button>
-                  </div>
-                  <div className="mt-4 h-3 overflow-hidden rounded-full bg-white/10">
-                    <div
-                      className="h-full rounded-full bg-yellow-400 transition-[width] duration-700 ease-out"
-                      style={{ width: `${currentStepProgressPercent}%` }}
-                    />
-                  </div>
-                  <div className="mt-3 flex items-center justify-between text-xs text-slate-100/70">
-                    <span>{Math.round(currentStepProgressPercent)}% complete</span>
-                    <span>{formatCountdown(remainingSeconds)} remaining</span>
-                  </div>
-                </div>
-              )}
+              ) : null}
 
               {currentStep?.description ? (
                 <p className="mt-5 max-w-3xl text-lg leading-8 text-slate-600">
