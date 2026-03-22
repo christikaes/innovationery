@@ -3,14 +3,13 @@ import {
   EmailAuthProvider,
   isSignInWithEmailLink,
   linkWithCredential,
+  onAuthStateChanged,
   sendSignInLinkToEmail,
   signInAnonymously,
   signInWithEmailLink,
 } from 'firebase/auth'
 import {
-  addDoc,
   collection,
-  collectionGroup,
   doc,
   getDoc,
   onSnapshot,
@@ -413,6 +412,27 @@ function createEditorId(prefix) {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+function serializeWorkflowStep(step) {
+  return {
+    id: step?.id || createEditorId('step'),
+    title: step?.title || 'Untitled step',
+    description: step?.description || '',
+    type: step?.activityType || step?.type || '',
+    durationMinutes: toNumber(step?.durationMinutes) ?? 0,
+    prompt: step?.prompt || '',
+    data: step?.data && typeof step.data === 'object' ? step.data : {},
+  }
+}
+
+function serializeWorkflowActivity(activity) {
+  return {
+    id: activity?.id || createEditorId('activity'),
+    title: activity?.title || 'Untitled activity',
+    description: activity?.description || '',
+    steps: Array.isArray(activity?.steps) ? activity.steps.map(serializeWorkflowStep) : [],
+  }
+}
+
 function serializeWorkflowDefinition(template) {
   const synchronizedTemplate = synchronizeWorkflowDefinition(template)
   const workflow = synchronizedTemplate?.workflow ?? {
@@ -427,8 +447,11 @@ function serializeWorkflowDefinition(template) {
   }
 
   return {
-    sortOrder: template?.sortOrder,
-    workflow,
+    name: workflow.title || template?.name || 'Untitled workflow',
+    description: workflow.description || template?.description || '',
+    activities: Array.isArray(workflow.activities)
+      ? workflow.activities.map(serializeWorkflowActivity)
+      : [],
   }
 }
 
@@ -488,7 +511,6 @@ function createWorkflowStep(activityType) {
     activityType: definition.type,
     durationMinutes: 0,
     data: createStepDataFromDefinition(definition),
-    statePaths: [],
   }
 }
 
@@ -624,9 +646,6 @@ function deriveWorkflowState(steps, workflowStateSource) {
       uniquePaths.add(path)
     })
 
-    normalizePersistedStatePaths(step?.statePaths ?? []).forEach((path) => {
-      uniquePaths.add(path)
-    })
   })
 
   normalizePersistedStatePaths(workflowStateSource).forEach((path) => {
@@ -811,7 +830,6 @@ function normalizePipelineStep(step, index) {
       durationMinutes: null,
       prompt: '',
       data: {},
-      statePaths: [],
     }
   }
 
@@ -824,7 +842,6 @@ function normalizePipelineStep(step, index) {
       durationMinutes: null,
       prompt: '',
       data: {},
-      statePaths: [],
     }
   }
 
@@ -846,9 +863,6 @@ function normalizePipelineStep(step, index) {
     ),
     prompt: step.prompt || '',
     data: normalizedData,
-    statePaths: Array.isArray(step.statePaths)
-      ? step.statePaths.filter((path) => typeof path === 'string')
-      : [],
   }
 }
 
@@ -858,7 +872,6 @@ function normalizePipelineSegment(segment, index) {
       id: `segment-${index + 1}`,
       title: segment,
       description: '',
-      totalMinutes: null,
       steps: [],
     }
   }
@@ -868,7 +881,6 @@ function normalizePipelineSegment(segment, index) {
       id: `segment-${index + 1}`,
       title: `Segment ${index + 1}`,
       description: '',
-      totalMinutes: null,
       steps: [],
     }
   }
@@ -877,24 +889,26 @@ function normalizePipelineSegment(segment, index) {
   const steps = stepsSource.map((step, stepIndex) =>
     normalizePipelineStep(step, stepIndex),
   )
-  const summedMinutes = steps.reduce(
-    (total, step) => total + (step.durationMinutes ?? 0),
-    0,
-  )
-
   return {
     id: segment.id || `segment-${index + 1}`,
     title: segment.title || segment.name || segment.label || `Segment ${index + 1}`,
     description: segment.description || segment.summary || '',
-    totalMinutes:
-      toNumber(segment.totalMinutes ?? segment.minutes ?? segment.duration) ??
-      (summedMinutes > 0 ? summedMinutes : null),
     steps,
   }
 }
 
 function normalizeRoomTemplate(id, template) {
-  const workflowSource = template?.workflow ?? template?.pipeline ?? {}
+  const hasFlatWorkflowShape =
+    typeof template?.name === 'string' ||
+    typeof template?.description === 'string' ||
+    Array.isArray(template?.activities)
+  const workflowSource = hasFlatWorkflowShape
+    ? {
+        title: template?.name,
+        description: template?.description,
+        activities: template?.activities,
+      }
+    : template?.workflow ?? template?.pipeline ?? {}
   const activitiesSource =
     template?.workflowActivities ??
     template?.pipelineSegments ??
@@ -1118,34 +1132,97 @@ function normalizeMembers(room, persistedMembers) {
     .map(([, value]) => value)
 }
 
-function getMemberDisplayName(member) {
-  return member?.name?.trim() || member?.email?.trim() || 'Guest'
+function normalizeRoomWorkflowState(workflowStateSource, steps) {
+  const runtime = normalizeWorkflowRuntime(workflowStateSource, steps)
+  const sectionsSource =
+    workflowStateSource?.sections && typeof workflowStateSource.sections === 'object'
+      ? workflowStateSource.sections
+      : {}
+
+  const sections = Object.entries(sectionsSource).reduce((accumulator, [sectionId, section]) => {
+    if (!section || typeof section !== 'object') {
+      return accumulator
+    }
+
+    accumulator[sectionId] = {
+      id: sectionId,
+      activityId:
+        typeof section.activityId === 'string' && section.activityId.trim()
+          ? section.activityId
+          : sectionId,
+      activityTitle: typeof section.activityTitle === 'string' ? section.activityTitle : '',
+      activityDescription:
+        typeof section.activityDescription === 'string' ? section.activityDescription : '',
+      activityIndex: toNumber(section.activityIndex) ?? 0,
+      cards: Array.isArray(section.cards) ? section.cards.filter(Boolean) : [],
+    }
+
+    return accumulator
+  }, {})
+
+  return {
+    currentStepIndex: runtime.currentStepIndex,
+    startedAt:
+      typeof workflowStateSource?.startedAt === 'string' ? workflowStateSource.startedAt : null,
+    steps: runtime.steps,
+    sections,
+  }
 }
 
-function formatRoomTimestamp(value) {
-  if (!value) {
-    return 'No activity yet'
+function normalizeRoomDocument(room) {
+  const normalizedMembersSource =
+    room?.members && typeof room.members === 'object' && !Array.isArray(room.members)
+      ? room.members
+      : {}
+
+  return {
+    workflowId: typeof room?.workflowId === 'string' ? room.workflowId : null,
+    workflowState:
+      room?.workflowState && typeof room.workflowState === 'object' ? room.workflowState : {},
+    members: Object.entries(normalizedMembersSource).reduce((accumulator, [memberId, member]) => {
+      if (!member || typeof member !== 'object') {
+        return accumulator
+      }
+
+      accumulator[memberId] = {
+        ...member,
+        id: member.id || memberId,
+      }
+      return accumulator
+    }, {}),
+  }
+}
+
+function hasStrictRoomSchema(room) {
+  if (!room || typeof room !== 'object' || Array.isArray(room)) {
+    return false
   }
 
-  const resolvedDate =
-    typeof value?.toDate === 'function'
-      ? value.toDate()
-      : value instanceof Date
-        ? value
-        : typeof value === 'string' || typeof value === 'number'
-          ? new Date(value)
-          : null
+  const keys = Object.keys(room)
 
-  if (!resolvedDate || Number.isNaN(resolvedDate.getTime())) {
-    return 'No activity yet'
+  return keys.every((key) => ['workflowId', 'workflowState', 'members'].includes(key))
+}
+
+function hasStrictWorkflowSchema(workflow) {
+  if (!workflow || typeof workflow !== 'object' || Array.isArray(workflow)) {
+    return false
   }
 
-  return new Intl.DateTimeFormat('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  }).format(resolvedDate)
+  const keys = Object.keys(workflow)
+
+  return keys.every((key) => ['name', 'description', 'activities', 'steps'].includes(key))
+}
+
+async function updateRoomDocument(roomId, updater) {
+  const roomRef = doc(db, 'rooms', roomId)
+  const snapshot = await getDoc(roomRef)
+  const currentRoom = normalizeRoomDocument(snapshot.exists() ? snapshot.data() : null)
+  const nextRoom = normalizeRoomDocument(updater(currentRoom) ?? currentRoom)
+  await setDoc(roomRef, nextRoom)
+}
+
+function getMemberDisplayName(member) {
+  return member?.name?.trim() || member?.email?.trim() || 'Guest'
 }
 
 function resolveStageLabel(stageValue) {
@@ -1172,6 +1249,12 @@ function resolveStageLabel(stageValue) {
 }
 
 function getRoomCurrentStage(room) {
+  const currentStepIndex = toNumber(room?.workflowState?.currentStepIndex)
+
+  if (currentStepIndex !== null) {
+    return currentStepIndex > 0 ? `Step ${currentStepIndex + 1}` : 'Ready to start'
+  }
+
   const directStage =
     resolveStageLabel(room?.currentActivity) ||
     resolveStageLabel(room?.currentStage) ||
@@ -1184,9 +1267,7 @@ function getRoomCurrentStage(room) {
     return directStage
   }
 
-  const activeStage = room?.workflowFirstActivityTitle || room?.workflowFirstStepTitle || null
-
-  return activeStage ? `Ready for ${activeStage}` : 'Waiting for workflow'
+  return room?.workflowId ? 'Waiting for workflow' : 'No workflow assigned'
 }
 
 function readPendingAuthContext() {
@@ -1207,26 +1288,6 @@ function clearPendingAuthContext() {
   window.localStorage.removeItem(EMAIL_STORAGE_KEY)
 }
 
-function getRoomBannerKey(roomId) {
-  return `innovationery:room-banner:${roomId}`
-}
-
-function writeRoomBanner(roomId, banner) {
-  window.localStorage.setItem(getRoomBannerKey(roomId), JSON.stringify(banner))
-}
-
-function readRoomBanner(roomId) {
-  try {
-    return JSON.parse(window.localStorage.getItem(getRoomBannerKey(roomId)) || 'null')
-  } catch {
-    return null
-  }
-}
-
-function clearRoomBanner(roomId) {
-  window.localStorage.removeItem(getRoomBannerKey(roomId))
-}
-
 function getActionCodeSettings(roomId) {
   return {
     url: `${window.location.origin}/room/${encodeURIComponent(roomId)}`,
@@ -1245,8 +1306,7 @@ async function ensureActiveUser() {
 
 async function upsertRoomMembership({
   roomId,
-  roomTypeId,
-  roomTemplate,
+  workflowId,
   name,
   email,
   authUser,
@@ -1266,8 +1326,6 @@ async function upsertRoomMembership({
     isVerified,
     joinedAt: new Date().toISOString(),
   }
-  const roomRef = doc(db, 'rooms', roomId)
-  const memberRef = doc(db, 'rooms', roomId, 'members', memberKey)
   const userRef = doc(db, 'users', memberKey)
 
   await setDoc(
@@ -1287,40 +1345,25 @@ async function upsertRoomMembership({
     { merge: true },
   )
 
-  await setDoc(
-    roomRef,
-    {
-      roomId,
-      roomTypeId,
-      workflowId: roomTemplate?.id ?? roomTypeId ?? null,
-      workflowTitle: roomTemplate?.workflow?.title ?? 'Untitled workflow',
-      workflowDescription: roomTemplate?.workflow?.description ?? '',
-      workflowFirstActivityTitle: roomTemplate?.workflow?.activities?.[0]?.title ?? null,
-      workflowFirstStepTitle: roomTemplate?.workflow?.steps?.[0]?.title ?? null,
-      updatedAt: serverTimestamp(),
-      ...(created
-        ? {
-            createdAt: serverTimestamp(),
-            createdBy: member,
-          }
-        : {}),
-    },
-    { merge: true },
-  )
-  await setDoc(
-    memberRef,
-    {
-      ...member,
-      lastSeenAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    },
-    { merge: true },
-  )
+  await updateRoomDocument(roomId, (currentRoom) => {
+    const resolvedWorkflowId =
+      workflowId ?? currentRoom.workflowId ?? null
 
-  window.localStorage.setItem(
-    `innovationery:room-member:${roomId}`,
-    JSON.stringify(member),
-  )
+    return {
+      workflowId: resolvedWorkflowId,
+      workflowState: currentRoom.workflowState ?? {},
+      members: {
+        ...currentRoom.members,
+        [memberKey]: {
+          ...member,
+          lastSeenAt: new Date().toISOString(),
+          createdAt:
+            currentRoom.members?.[memberKey]?.createdAt ??
+            (created ? new Date().toISOString() : null),
+        },
+      },
+    }
+  })
 
   return member
 }
@@ -1360,9 +1403,19 @@ function HomePage() {
         }
 
         const templates = snapshot.docs
-          .map((templateDoc) =>
-            normalizeRoomTemplate(templateDoc.id, templateDoc.data()),
-          )
+          .map((templateDoc) => {
+            const templateData = templateDoc.data()
+            const normalizedTemplate = normalizeRoomTemplate(templateDoc.id, templateData)
+
+            if (!hasStrictWorkflowSchema(templateData)) {
+              void setDoc(
+                doc(db, 'workflows', templateDoc.id),
+                serializeWorkflowDefinition(normalizedTemplate),
+              )
+            }
+
+            return normalizedTemplate
+          })
           .sort((left, right) => {
             if (left.sortOrder !== right.sortOrder) {
               return left.sortOrder - right.sortOrder
@@ -1415,7 +1468,7 @@ function HomePage() {
       const activeUser = await ensureActiveUser()
       const flow = {
         roomId,
-        roomTypeId: 'custom',
+        workflowId: null,
         name,
         email,
         created: false,
@@ -1425,21 +1478,13 @@ function HomePage() {
 
       try {
         await sendSignInLinkToEmail(auth, email, getActionCodeSettings(roomId))
-        writeRoomBanner(roomId, {
-          tone: 'sky',
-          text: `A one-time verification link was sent to ${email}. Verify your email whenever you are ready to recover this brainstorm later.`,
-        })
       } catch {
         clearPendingAuthContext()
-        writeRoomBanner(roomId, {
-          tone: 'slate',
-          text: 'We could not send the verification email right now, but you have still entered anonymously and can keep working.',
-        })
       }
 
       await upsertRoomMembership({
         roomId,
-        roomTypeId: 'custom',
+        workflowId: null,
         name,
         email,
         authUser: activeUser,
@@ -1476,8 +1521,7 @@ function HomePage() {
       const activeUser = await ensureActiveUser()
       const flow = {
         roomId,
-        roomTypeId: selectedTemplate.id,
-        roomTemplate: selectedTemplate,
+        workflowId: selectedTemplate.id,
         name,
         email,
         created: true,
@@ -1487,22 +1531,13 @@ function HomePage() {
 
       try {
         await sendSignInLinkToEmail(auth, email, getActionCodeSettings(roomId))
-        writeRoomBanner(roomId, {
-          tone: 'sky',
-          text: `A one-time verification link was sent to ${email}. Verify your email whenever you are ready to recover this brainstorm later.`,
-        })
       } catch {
         clearPendingAuthContext()
-        writeRoomBanner(roomId, {
-          tone: 'slate',
-          text: 'We could not send the verification email right now, but your room was still created and you entered anonymously.',
-        })
       }
 
       await upsertRoomMembership({
         roomId,
-        roomTypeId: selectedTemplate.id,
-        roomTemplate: selectedTemplate,
+        workflowId: selectedTemplate.id,
         name,
         email,
         authUser: activeUser,
@@ -1870,8 +1905,8 @@ function HomePage() {
                     </div>
 
                     <div className="mt-6 space-y-4">
-                      {(selectedTemplate?.workflow?.activities?.length
-                        ? selectedTemplate.workflow?.activities
+                      {((selectedTemplate?.workflow?.activities?.length ?? 0) > 0
+                        ? selectedTemplate?.workflow?.activities ?? []
                         : [
                             {
                               id: 'default-activity',
@@ -2090,9 +2125,11 @@ function HomePage() {
 function AdminPage() {
   const [rooms, setRooms] = useState([])
   const [roomStatus, setRoomStatus] = useState('loading')
-  const [memberCounts, setMemberCounts] = useState({})
-  const [memberStatus, setMemberStatus] = useState('loading')
   const [workflowSeedStatus, setWorkflowSeedStatus] = useState('loading')
+  const memberCounts = rooms.reduce((counts, room) => {
+    counts[room.id] = normalizeMembers(room, []).length
+    return counts
+  }, {})
 
   useEffect(() => {
     let cancelled = false
@@ -2139,15 +2176,15 @@ function AdminPage() {
       (snapshot) => {
         const nextRooms = snapshot.docs.map((roomDoc) => ({
           id: roomDoc.id,
-          ...roomDoc.data(),
+          ...normalizeRoomDocument(roomDoc.data()),
         }))
 
         nextRooms.sort((left, right) => {
-          const leftUpdated = left.updatedAt?.seconds ?? 0
-          const rightUpdated = right.updatedAt?.seconds ?? 0
+          const leftMemberCount = Object.keys(left.members ?? {}).length
+          const rightMemberCount = Object.keys(right.members ?? {}).length
 
-          if (leftUpdated !== rightUpdated) {
-            return rightUpdated - leftUpdated
+          if (leftMemberCount !== rightMemberCount) {
+            return rightMemberCount - leftMemberCount
           }
 
           return left.id.localeCompare(right.id)
@@ -2159,34 +2196,6 @@ function AdminPage() {
       () => {
         setRooms([])
         setRoomStatus('error')
-      },
-    )
-
-    return unsubscribe
-  }, [])
-
-  useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collectionGroup(db, 'members'),
-      (snapshot) => {
-        const counts = {}
-
-        snapshot.docs.forEach((memberDoc) => {
-          const roomId = memberDoc.ref.parent.parent?.id
-
-          if (!roomId) {
-            return
-          }
-
-          counts[roomId] = (counts[roomId] ?? 0) + 1
-        })
-
-        setMemberCounts(counts)
-        setMemberStatus('ready')
-      },
-      () => {
-        setMemberCounts({})
-        setMemberStatus('error')
       },
     )
 
@@ -2241,7 +2250,7 @@ function AdminPage() {
           <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[var(--theme-shadow-soft)]">
             <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Sync</p>
             <p className="mt-3 text-2xl font-semibold text-slate-900">
-              {roomStatus === 'ready' && memberStatus === 'ready' && workflowSeedStatus === 'ready'
+              {roomStatus === 'ready' && workflowSeedStatus === 'ready'
                 ? 'Live'
                 : workflowSeedStatus === 'error'
                   ? 'Issue'
@@ -2268,10 +2277,10 @@ function AdminPage() {
             </span>
           </div>
 
-          {roomStatus === 'loading' || memberStatus === 'loading' ? (
+          {roomStatus === 'loading' ? (
             <p className="px-6 py-10 text-base text-slate-600">Loading rooms...</p>
           ) : null}
-          {roomStatus === 'error' || memberStatus === 'error' ? (
+          {roomStatus === 'error' ? (
             <p className="px-6 py-10 text-base text-rose-700">
               Unable to load the admin room list from Firestore.
             </p>
@@ -2282,7 +2291,7 @@ function AdminPage() {
             </p>
           ) : null}
 
-          {roomStatus === 'ready' && memberStatus === 'ready' && rooms.length > 0 ? (
+          {roomStatus === 'ready' && rooms.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="min-w-full border-collapse">
                 <thead>
@@ -2318,7 +2327,7 @@ function AdminPage() {
                         </div>
                       </td>
                       <td className="px-6 py-5 text-sm text-slate-600">
-                        {room.workflowTitle || 'Untitled workflow'}
+                        {room.workflowId || 'No workflow'}
                       </td>
                       <td className="px-6 py-5 text-sm text-slate-600">
                         {getRoomCurrentStage(room)}
@@ -2329,7 +2338,7 @@ function AdminPage() {
                         </span>
                       </td>
                       <td className="px-6 py-5 text-sm text-slate-500">
-                        {formatRoomTimestamp(room.updatedAt || room.createdAt)}
+                        {memberCounts[room.id] > 0 ? 'Active members' : 'No activity yet'}
                       </td>
                     </tr>
                   ))}
@@ -2395,11 +2404,7 @@ function WorkflowEditorPage({ workflowId }) {
     const timeoutId = window.setTimeout(() => {
       void setDoc(
         doc(db, 'workflows', workflowId),
-        {
-          ...serializeWorkflowDefinition(workflowDefinition),
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true },
+        serializeWorkflowDefinition(workflowDefinition),
       )
         .then(() => {
           persistedKeyRef.current = nextKey
@@ -3231,9 +3236,9 @@ function WorkflowEditorPage({ workflowId }) {
 
 function RoomPage({ roomId }) {
   const [room, setRoom] = useState(null)
+  const [authUser, setAuthUser] = useState(() => auth.currentUser)
   const [workflowDefinition, setWorkflowDefinition] = useState(null)
-  const [persistedMembers, setPersistedMembers] = useState([])
-  const [brainstormCards, setBrainstormCards] = useState([])
+  const [workflowStatus, setWorkflowStatus] = useState('loading')
   const [brainstormDraft, setBrainstormDraft] = useState('')
   const [isSubmittingBrainstormCard, setIsSubmittingBrainstormCard] = useState(false)
   const [roomIdentityForm, setRoomIdentityForm] = useState(() => ({
@@ -3243,13 +3248,14 @@ function RoomPage({ roomId }) {
   const [roomIdentityError, setRoomIdentityError] = useState('')
   const [roomIdentityLoading, setRoomIdentityLoading] = useState(false)
   const [status, setStatus] = useState('loading')
-  const [banner, setBanner] = useState(() => readRoomBanner(roomId))
   const [nowMs, setNowMs] = useState(() => Date.now())
   const [roundRobinOrder, setRoundRobinOrder] = useState([])
   const [completedRoundRobinSpeakerIds, setCompletedRoundRobinSpeakerIds] = useState([])
-  const currentMember = JSON.parse(
-    window.localStorage.getItem(`innovationery:room-member:${roomId}`) || 'null',
-  )
+  const isDemoRoom = roomId.trim().toLowerCase() === 'demo-room'
+  const demoTemplate =
+    normalizedFallbackRoomTemplates.find((template) => template.id === 'hackathon') ?? null
+
+  useEffect(() => onAuthStateChanged(auth, setAuthUser), [])
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
@@ -3261,7 +3267,7 @@ function RoomPage({ roomId }) {
           return
         }
 
-        setRoom(snapshot.data())
+        setRoom(normalizeRoomDocument(snapshot.data()))
         setStatus('ready')
       },
       () => {
@@ -3282,59 +3288,83 @@ function RoomPage({ roomId }) {
   }, [])
 
   useEffect(() => {
-    if (!room?.workflowId) {
-      setWorkflowDefinition(null)
+    if (!room || isDemoRoom || hasStrictRoomSchema(room)) {
       return undefined
     }
+
+    const timeoutId = window.setTimeout(() => {
+      void updateRoomDocument(roomId, (currentRoom) => currentRoom)
+    }, 0)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [isDemoRoom, room, roomId])
+
+  useEffect(() => {
+    if (!room?.workflowId) {
+      setWorkflowDefinition(null)
+      setWorkflowStatus('unassigned')
+      return undefined
+    }
+
+    setWorkflowStatus('loading')
 
     const unsubscribe = onSnapshot(
       doc(db, 'workflows', room.workflowId),
       (snapshot) => {
         if (!snapshot.exists()) {
           setWorkflowDefinition(null)
+          setWorkflowStatus('missing')
           return
         }
 
-        setWorkflowDefinition(normalizeRoomTemplate(snapshot.id, snapshot.data()))
+        const nextWorkflowDefinition = normalizeRoomTemplate(snapshot.id, snapshot.data())
+        const hasWorkflowContent =
+          (nextWorkflowDefinition.workflow?.activities?.length ?? 0) > 0 ||
+          (nextWorkflowDefinition.workflow?.steps?.length ?? 0) > 0
+
+        setWorkflowDefinition(nextWorkflowDefinition)
+        setWorkflowStatus(hasWorkflowContent ? 'ready' : 'empty')
       },
       () => {
         setWorkflowDefinition(null)
+        setWorkflowStatus('error')
       },
     )
 
     return unsubscribe
   }, [room?.workflowId])
 
-  useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(db, 'rooms', roomId, 'members'),
-      (snapshot) => {
-        setPersistedMembers(snapshot.docs.map((memberDoc) => memberDoc.data()))
-      },
-      () => {
-        setPersistedMembers([])
-      },
+  const members = normalizeMembers(room, [])
+    .sort((left, right) =>
+      getMemberDisplayName(left).localeCompare(getMemberDisplayName(right)),
     )
-
-    return unsubscribe
-  }, [roomId])
+  const currentMember =
+    authUser
+      ? members.find(
+          (member) =>
+            member.authUid === authUser.uid ||
+            (authUser.email && member.email === authUser.email),
+        ) ?? null
+      : null
 
   useEffect(() => {
     if (!currentMember?.id) {
       return undefined
     }
 
-    const memberRef = doc(db, 'rooms', roomId, 'members', currentMember.id)
-
     const setPresence = (isOnline) =>
-      setDoc(
-        memberRef,
-        {
-          isOnline,
-          lastSeenAt: serverTimestamp(),
+      updateRoomDocument(roomId, (currentRoom) => ({
+        workflowId: currentRoom.workflowId,
+        workflowState: currentRoom.workflowState,
+        members: {
+          ...currentRoom.members,
+          [currentMember.id]: {
+            ...(currentRoom.members?.[currentMember.id] ?? currentMember),
+            isOnline,
+            lastSeenAt: new Date().toISOString(),
+          },
         },
-        { merge: true },
-      )
+      }))
 
     void setPresence(true)
 
@@ -3355,22 +3385,12 @@ function RoomPage({ roomId }) {
       void setPresence(false)
     }
   }, [currentMember?.id, roomId])
-  const isDemoRoom = roomId.trim().toLowerCase() === 'demo-room'
-  const demoTemplate =
-    normalizedFallbackRoomTemplates.find((template) => template.id === 'hackathon') ?? null
   const roomWorkflow =
     workflowDefinition?.workflow ??
-    room?.roomTemplate?.workflow ??
     (isDemoRoom ? demoTemplate?.workflow : null)
   const workflowTitle =
-    room?.workflowTitle ??
     workflowDefinition?.workflow?.title ??
-    room?.roomTemplate?.workflow?.title ??
     (isDemoRoom ? demoTemplate?.workflow?.title : null)
-  const members = normalizeMembers(room, persistedMembers)
-    .sort((left, right) =>
-      getMemberDisplayName(left).localeCompare(getMemberDisplayName(right)),
-    )
   const workflowActivities =
     roomWorkflow?.activities?.length
       ? roomWorkflow.activities
@@ -3385,6 +3405,18 @@ function RoomPage({ roomId }) {
             },
           ]
         : []
+  const emptyWorkflowMessage =
+    workflowStatus === 'loading'
+      ? 'Loading workflow definition...'
+      : workflowStatus === 'unassigned'
+        ? 'This room does not have a workflowId yet.'
+        : workflowStatus === 'missing'
+          ? `Workflow "${room?.workflowId}" was not found in Firestore.`
+          : workflowStatus === 'error'
+            ? `Workflow "${room?.workflowId}" could not be loaded from Firestore. Check Firestore rules and network access.`
+            : workflowStatus === 'empty'
+              ? `Workflow "${room?.workflowId}" loaded, but it has no activities or steps.`
+              : 'No workflow has been recorded for this room yet.'
   const workflowSequence = workflowActivities.flatMap((activity, activityIndex) =>
     activity.steps.map((step, stepIndex) => {
       const stepsBeforeActivity = workflowActivities
@@ -3402,7 +3434,8 @@ function RoomPage({ roomId }) {
       }
     }),
   )
-  const workflowRuntime = normalizeWorkflowRuntime(room?.workflowRuntime, workflowSequence)
+  const roomWorkflowState = normalizeRoomWorkflowState(room?.workflowState, workflowSequence)
+  const workflowRuntime = normalizeWorkflowRuntime(roomWorkflowState, workflowSequence)
   const safeCurrentStepIndex =
     workflowSequence.length > 0
       ? Math.min(workflowRuntime.currentStepIndex, workflowSequence.length - 1)
@@ -3411,7 +3444,7 @@ function RoomPage({ roomId }) {
   const currentStepRuntime = currentStep
     ? workflowRuntime.steps[getWorkflowStepStateKey(currentStep, safeCurrentStepIndex)] ?? null
     : null
-  const hasWorkflowStarted = Boolean(room?.workflowStartedAt)
+  const hasWorkflowStarted = Boolean(roomWorkflowState.startedAt)
   const currentActivityIndex = currentStep?.activityIndex ?? 0
   const isRoundRobinStep = currentStep?.activityType === 'roundrobin'
   const isIndividualBrainstormStep = currentStep?.activityType === 'individual stickies'
@@ -3464,7 +3497,7 @@ function RoomPage({ roomId }) {
   const displayedElapsedMinutes =
     elapsedWorkflowSeconds > 0 ? Math.min(Math.ceil(elapsedWorkflowSeconds / 60), roomWorkflow?.totalMinutes ?? 0) : 0
   const displayedTotalMinutes = roomWorkflow?.totalMinutes ?? Math.round(totalWorkflowSeconds / 60)
-  const roomCode = room?.roomId ?? roomId
+  const roomCode = roomId
   const timerProgressPercent =
     displayedTotalMinutes > 0
       ? Math.min(100, Math.max(0, (displayedElapsedMinutes / displayedTotalMinutes) * 100))
@@ -3479,38 +3512,35 @@ function RoomPage({ roomId }) {
     workflowSequence.length > 0 ? (displayedCompletedSteps / workflowSequence.length) * 100 : 0
   const compactRadialCircumference = 2 * Math.PI * 18
   const currentSectionId = currentStep?.activityId ?? null
-  const currentActivityCards = brainstormCards.filter(
-    (card) => card.activityId === currentStep?.activityId,
-  )
+  const currentActivityCards = currentSectionId
+    ? roomWorkflowState.sections?.[currentSectionId]?.cards ?? []
+    : []
   const shouldRevealAllBrainstormCards = isGroupBrainstormStep
   const shouldPromptForRoomIdentity = !currentMember?.id && (status === 'ready' || isDemoRoom)
   const visibleBrainstormCardCount = currentActivityCards.filter(
     (card) => shouldRevealAllBrainstormCards || card.authorId === currentMember?.id,
   ).length
   const hiddenBrainstormCardCount = currentActivityCards.length - visibleBrainstormCardCount
-  const persistWorkflowRuntime = async (nextRuntime) => {
-    await setDoc(
-      doc(db, 'rooms', roomId),
-      {
-        workflowRuntime: nextRuntime,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    )
+  const persistWorkflowState = async (updater) => {
+    await updateRoomDocument(roomId, (currentRoom) => {
+      const currentWorkflowState = normalizeRoomWorkflowState(currentRoom.workflowState, workflowSequence)
+      const nextWorkflowState =
+        typeof updater === 'function' ? updater(currentWorkflowState) : updater
+
+      return {
+        workflowId: currentRoom.workflowId ?? room?.workflowId ?? demoTemplate?.id ?? null,
+        workflowState: nextWorkflowState,
+        members: currentRoom.members,
+      }
+    })
   }
 
   const startWorkflow = async () => {
-    const nextRuntime = createWorkflowRuntimeForStep(workflowSequence, 0, room?.workflowRuntime)
-
-    await setDoc(
-      doc(db, 'rooms', roomId),
-      {
-        workflowStartedAt: serverTimestamp(),
-        workflowRuntime: nextRuntime,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    )
+    await persistWorkflowState((currentWorkflowState) => ({
+      ...currentWorkflowState,
+      startedAt: new Date().toISOString(),
+      ...createWorkflowRuntimeForStep(workflowSequence, 0, currentWorkflowState),
+    }))
   }
 
   const togglePauseState = async () => {
@@ -3537,30 +3567,30 @@ function RoomPage({ roomId }) {
         startTimeMs + (timestamp.getTime() - pauseTimeMs),
       ).toISOString()
 
-      await persistWorkflowRuntime({
-        ...workflowRuntime,
+      await persistWorkflowState((currentWorkflowState) => ({
+        ...currentWorkflowState,
         steps: {
-          ...workflowRuntime.steps,
+          ...currentWorkflowState.steps,
           [stepKey]: {
             ...currentStepState,
             startTime: resumedStartTime,
             pauseTime: null,
           },
         },
-      })
+      }))
       return
     }
 
-    await persistWorkflowRuntime({
-      ...workflowRuntime,
+    await persistWorkflowState((currentWorkflowState) => ({
+      ...currentWorkflowState,
       steps: {
-        ...workflowRuntime.steps,
+        ...currentWorkflowState.steps,
         [stepKey]: {
           ...currentStepState,
           pauseTime: timestamp.toISOString(),
         },
       },
-    })
+    }))
   }
 
   const completeCurrentStep = async () => {
@@ -3571,97 +3601,27 @@ function RoomPage({ roomId }) {
     const timestamp = new Date()
 
     if (safeCurrentStepIndex < workflowSequence.length - 1) {
-      await persistWorkflowRuntime(
+      await persistWorkflowState((currentWorkflowState) =>
         createWorkflowRuntimeForStep(
           workflowSequence,
           safeCurrentStepIndex + 1,
-          workflowRuntime,
+          currentWorkflowState,
           timestamp,
         ),
       )
       return
     }
 
-    await persistWorkflowRuntime(
+    await persistWorkflowState((currentWorkflowState) =>
       completeWorkflowStepRuntime(
         workflowSequence,
         safeCurrentStepIndex,
-        workflowRuntime,
+        currentWorkflowState,
         currentStepDurationSeconds,
         timestamp,
       ),
     )
   }
-
-  useEffect(() => {
-    if (!currentSectionId || !currentStep) {
-      return undefined
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      void setDoc(
-        doc(db, 'rooms', roomId, 'sections', currentSectionId),
-        {
-          id: currentSectionId,
-          activityId: currentStep.activityId,
-          activityTitle: currentStep.activityTitle ?? '',
-          activityDescription: currentStep.activityDescription ?? '',
-          activityIndex: currentStep.activityIndex ?? 0,
-          workflowId: room?.workflowId ?? demoTemplate?.id ?? null,
-          workflowTitle: workflowTitle ?? '',
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true },
-      )
-    }, 0)
-
-    return () => window.clearTimeout(timeoutId)
-  }, [
-    currentSectionId,
-    currentStep?.activityDescription,
-    currentStep?.activityId,
-    currentStep?.activityIndex,
-    currentStep?.activityTitle,
-    demoTemplate?.id,
-    room?.workflowId,
-    roomId,
-    workflowTitle,
-  ])
-
-  useEffect(() => {
-    if (!currentSectionId) {
-      setBrainstormCards([])
-      return undefined
-    }
-
-    const unsubscribe = onSnapshot(
-      collection(db, 'rooms', roomId, 'sections', currentSectionId, 'cards'),
-      (snapshot) => {
-        const nextCards = snapshot.docs
-          .map((cardDoc) => ({
-            id: cardDoc.id,
-            ...cardDoc.data(),
-          }))
-          .sort((left, right) => {
-            const leftSeconds = left.createdAt?.seconds ?? 0
-            const rightSeconds = right.createdAt?.seconds ?? 0
-
-            if (leftSeconds !== rightSeconds) {
-              return leftSeconds - rightSeconds
-            }
-
-            return left.id.localeCompare(right.id)
-          })
-
-        setBrainstormCards(nextCards)
-      },
-      () => {
-        setBrainstormCards([])
-      },
-    )
-
-    return unsubscribe
-  }, [currentSectionId, roomId])
   const submitBrainstormCard = async (event) => {
     event.preventDefault()
 
@@ -3674,30 +3634,39 @@ function RoomPage({ roomId }) {
     setIsSubmittingBrainstormCard(true)
 
     try {
-      await setDoc(
-        doc(db, 'rooms', roomId, 'sections', currentSectionId),
-        {
+      await persistWorkflowState((currentWorkflowState) => {
+        const currentSection = currentWorkflowState.sections?.[currentSectionId] ?? {
           id: currentSectionId,
           activityId: currentStep.activityId,
           activityTitle: currentStep.activityTitle ?? '',
           activityDescription: currentStep.activityDescription ?? '',
           activityIndex: currentStep.activityIndex ?? 0,
-          workflowId: room?.workflowId ?? demoTemplate?.id ?? null,
-          workflowTitle: workflowTitle ?? '',
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true },
-      )
+          cards: [],
+        }
 
-      await addDoc(collection(db, 'rooms', roomId, 'sections', currentSectionId, 'cards'), {
-        activityId: currentStep.activityId,
-        activityTitle: currentStep.activityTitle ?? '',
-        activityIndex: currentStep.activityIndex ?? 0,
-        sectionId: currentSectionId,
-        authorId: currentMember.id,
-        authorName: getMemberDisplayName(currentMember),
-        text: trimmedDraft,
-        createdAt: serverTimestamp(),
+        return {
+          ...currentWorkflowState,
+          sections: {
+            ...currentWorkflowState.sections,
+            [currentSectionId]: {
+              ...currentSection,
+              cards: [
+                ...currentSection.cards,
+                {
+                  id: createEditorId('card'),
+                  activityId: currentStep.activityId,
+                  activityTitle: currentStep.activityTitle ?? '',
+                  activityIndex: currentStep.activityIndex ?? 0,
+                  sectionId: currentSectionId,
+                  authorId: currentMember.id,
+                  authorName: getMemberDisplayName(currentMember),
+                  text: trimmedDraft,
+                  createdAt: new Date().toISOString(),
+                },
+              ],
+            },
+          },
+        }
       })
       setBrainstormDraft('')
     } finally {
@@ -3720,11 +3689,9 @@ function RoomPage({ roomId }) {
 
     try {
       const activeUser = await ensureActiveUser()
-      const roomTypeId = room?.roomTypeId ?? (isDemoRoom ? demoTemplate?.id ?? 'hackathon' : 'custom')
-      const roomTemplate = workflowDefinition ?? (isDemoRoom ? demoTemplate : null)
       const flow = {
         roomId,
-        roomTypeId,
+        workflowId: room?.workflowId ?? (isDemoRoom ? demoTemplate?.id ?? null : null),
         name,
         email,
         created: false,
@@ -3734,22 +3701,13 @@ function RoomPage({ roomId }) {
 
       try {
         await sendSignInLinkToEmail(auth, email, getActionCodeSettings(roomId))
-        writeRoomBanner(roomId, {
-          tone: 'sky',
-          text: `A one-time verification link was sent to ${email}. Verify your email whenever you are ready to recover this brainstorm later.`,
-        })
       } catch {
         clearPendingAuthContext()
-        writeRoomBanner(roomId, {
-          tone: 'slate',
-          text: 'We could not send the verification email right now, but you have still entered anonymously and can keep working.',
-        })
       }
 
       await upsertRoomMembership({
         roomId,
-        roomTypeId,
-        roomTemplate,
+        workflowId: room?.workflowId ?? (isDemoRoom ? demoTemplate?.id ?? null : null),
         name,
         email,
         authUser: activeUser,
@@ -3773,11 +3731,11 @@ function RoomPage({ roomId }) {
     }
 
     const timeoutId = window.setTimeout(() => {
-      void persistWorkflowRuntime(
+      void persistWorkflowState((currentWorkflowState) =>
         createWorkflowRuntimeForStep(
           workflowSequence,
           safeCurrentStepIndex,
-          room?.workflowRuntime,
+          currentWorkflowState,
         ),
       )
     }, 0)
@@ -3785,7 +3743,6 @@ function RoomPage({ roomId }) {
     return () => window.clearTimeout(timeoutId)
   }, [
     hasWorkflowStarted,
-    room?.workflowRuntime,
     safeCurrentStepIndex,
     workflowSequence.length,
   ])
@@ -3886,11 +3843,11 @@ function RoomPage({ roomId }) {
 
     if (remainingSeconds === 0 && safeCurrentStepIndex < workflowSequence.length - 1) {
       const timeoutId = window.setTimeout(() => {
-        void persistWorkflowRuntime(
+        void persistWorkflowState((currentWorkflowState) =>
           createWorkflowRuntimeForStep(
             workflowSequence,
             safeCurrentStepIndex + 1,
-            workflowRuntime,
+            currentWorkflowState,
           ),
         )
       }, 1200)
@@ -4126,30 +4083,6 @@ function RoomPage({ roomId }) {
           </div>
         </section>
 
-        {banner ? (
-          <section
-            className={`rounded-[1.5rem] border px-5 py-4 text-sm leading-6 shadow-[var(--theme-shadow-soft)] ${
-              banner.tone === 'sky'
-                ? 'border-slate-200 bg-slate-50 text-slate-900'
-                : 'border-slate-200 bg-slate-50 text-slate-700'
-            }`}
-          >
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <p>{banner.text}</p>
-              <button
-                type="button"
-                onClick={() => {
-                  clearRoomBanner(roomId)
-                  setBanner(null)
-                }}
-                className={gradientButtonCompactClass}
-              >
-                Dismiss
-              </button>
-            </div>
-          </section>
-        ) : null}
-
         <section className="grid gap-5 xl:grid-cols-[20rem_minmax(0,1fr)]">
           <aside className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 text-slate-900 shadow-[var(--theme-shadow-soft)] backdrop-blur">
             {workflowActivities.length > 0 ? (
@@ -4289,7 +4222,7 @@ function RoomPage({ roomId }) {
               </div>
             ) : (
               <p className="text-sm text-slate-500">
-                No workflow has been recorded for this room yet.
+                {emptyWorkflowMessage}
               </p>
             )}
           </aside>
@@ -4698,13 +4631,6 @@ function App() {
       const email = storedEmail || pendingContext?.email
 
       if (!email) {
-        if (pendingContext?.roomId) {
-          writeRoomBanner(pendingContext.roomId, {
-            tone: 'slate',
-            text: 'We could not finish email verification on this device because the original email address was not available.',
-          })
-        }
-
         if (!cancelled) {
           setAuthReady(true)
         }
@@ -4722,17 +4648,11 @@ function App() {
         if (pendingContext && auth.currentUser) {
           await upsertRoomMembership({
             roomId: pendingContext.roomId,
-            roomTypeId: pendingContext.roomTypeId,
-            roomTemplate: pendingContext.roomTemplate,
+            workflowId: pendingContext.workflowId,
             name: pendingContext.name,
             email: pendingContext.email,
             authUser: auth.currentUser,
             created: false,
-          })
-
-          writeRoomBanner(pendingContext.roomId, {
-            tone: 'sky',
-            text: 'Email verified. This brainstorm is now linked to your verified sign-in.',
           })
         }
 
@@ -4744,12 +4664,6 @@ function App() {
           window.history.replaceState({}, '', '/')
         }
       } catch {
-        if (pendingContext?.roomId) {
-          writeRoomBanner(pendingContext.roomId, {
-            tone: 'slate',
-            text: 'We could not complete email verification. You can keep working anonymously and try again later.',
-          })
-        }
       } finally {
         if (!cancelled) {
           setAuthReady(true)
