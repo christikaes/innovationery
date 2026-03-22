@@ -1,0 +1,71 @@
+:root {
+  --theme-primary: #334155;
+  --theme-secondary: #64748b;
+  --theme-surface: #fffef7;
+  --theme-surface-alt: #fef3c7;
+  --theme-text: #0f172a;
+  --theme-success: #059669;
+  --theme-danger: #be123c;
+  --theme-danger-soft: #fda4af;
+  --theme-white: #ffffff;
+
+  --theme-bg-home: radial-gradient(
+      circle at top,
+      color-mix(in srgb, #facc15 18%, transparent),
+      transparent 28%
+    ),
+    linear-gradient(180deg, var(--theme-surface) 0%, var(--theme-surface-alt) 100%);
+  --theme-bg-admin: radial-gradient(
+      circle at top,
+      color-mix(in srgb, #facc15 16%, transparent),
+      transparent 26%
+    ),
+    linear-gradient(180deg, var(--theme-surface) 0%, var(--theme-surface-alt) 100%);
+  --theme-bg-room: radial-gradient(
+      circle at top,
+      color-mix(in srgb, #facc15 18%, transparent),
+      transparent 30%
+    ),
+    linear-gradient(180deg, var(--theme-surface) 0%, var(--theme-surface-alt) 100%);
+  --theme-bg-auth: linear-gradient(180deg, var(--theme-surface) 0%, var(--theme-surface-alt) 100%);
+
+  --theme-orb-home: radial-gradient(
+    circle,
+    color-mix(in srgb, #f59e0b 20%, transparent),
+    transparent 68%
+  );
+  --theme-orb-admin: radial-gradient(
+    circle,
+    color-mix(in srgb, #f59e0b 18%, transparent),
+    transparent 70%
+  );
+  --theme-orb-room: radial-gradient(
+    circle,
+    color-mix(in srgb, #f59e0b 18%, transparent),
+    transparent 70%
+  );
+  --theme-orb-featured: radial-gradient(
+    circle,
+    color-mix(in srgb, #facc15 24%, transparent),
+    transparent 68%
+  );
+  --theme-orb-standard: radial-gradient(
+    circle,
+    color-mix(in srgb, #f59e0b 20%, transparent),
+    transparent 68%
+  );
+
+  --theme-panel-gradient: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--theme-white) 98%, transparent),
+    color-mix(in srgb, var(--theme-surface) 92%, transparent)
+  );
+  --theme-timer-gradient: linear-gradient(90deg, var(--theme-secondary) 0%, var(--theme-primary) 100%);
+
+  --theme-shadow-soft: 0 24px 80px color-mix(in srgb, var(--theme-text) 8%, transparent);
+  --theme-shadow-strong: 0 20px 40px color-mix(in srgb, var(--theme-text) 22%, transparent);
+  --theme-shadow-highlight: 0 18px 30px color-mix(in srgb, var(--theme-primary) 18%, transparent);
+  --theme-shadow-footer: 0 24px 80px color-mix(in srgb, var(--theme-text) 18%, transparent);
+  --theme-shadow-dark-panel: 0 24px 80px color-mix(in srgb, var(--theme-text) 20%, transparent);
+  --theme-shadow-modal: 0 24px 80px color-mix(in srgb, black 25%, transparent);
+}

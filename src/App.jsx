@@ -506,12 +506,24 @@ const subscriptionTiers = [
     featured: false,
     features: [
       'Everything in Team',
-      'Multiple facilitators per room',
+      'Admin dashboard',
       'Advanced reporting',
       'Dedicated onboarding support',
     ],
   },
 ]
+
+const gradientButtonBaseClass =
+  'inline-flex items-center justify-center rounded-[999px] bg-gradient-to-br from-slate-950 to-slate-700 text-slate-50 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60'
+const gradientButtonMediumClass = `${gradientButtonBaseClass} min-h-12 px-5 text-sm font-medium`
+const gradientButtonLargeClass = `${gradientButtonBaseClass} min-h-14 px-7 text-base font-medium`
+const gradientButtonCompactClass = `${gradientButtonBaseClass} min-h-11 px-5 text-sm font-medium`
+const secondaryButtonMediumClass =
+  'inline-flex min-h-12 items-center justify-center rounded-[999px] bg-slate-900/10 px-5 text-sm font-medium text-slate-900 transition hover:bg-slate-900/15'
+const sectionTabActiveClass =
+  'border-slate-900/15 border-b-white bg-white text-slate-950 shadow-[var(--theme-shadow-soft)]'
+const sectionTabInactiveClass =
+  'border-transparent bg-transparent text-slate-500 hover:bg-white/70 hover:text-slate-900'
 
 function createRoomId() {
   return Math.random().toString(36).slice(2, 8).toUpperCase()
@@ -526,6 +538,80 @@ function createAvatarUrl(email, name) {
   const seedSource = email ?? name ?? 'guest'
   const seed = String(seedSource).trim().toLowerCase() || 'guest'
   return `https://robohash.org/${encodeURIComponent(seed)}?set=set3`
+}
+
+function downloadFacilitationGuide() {
+  const guideLines = [
+    'Brainstorm Facilitation Guide',
+    '',
+    'Open strong',
+    'Set the challenge, success criteria, and timebox before ideas start flowing.',
+    '',
+    'Keep the room moving',
+    'Move from solo idea capture into sharing, clustering, and quick voting without losing pace.',
+    '',
+    'End with action',
+    'Close every brainstorm with a decision, owners, and the next experiment to run.',
+  ]
+
+  const escapedLines = guideLines.map((line) =>
+    line.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)'),
+  )
+
+  const contentStream = [
+    'BT',
+    '/F1 22 Tf',
+    '50 770 Td',
+    `(${escapedLines[0]}) Tj`,
+    '0 -34 Td',
+    '/F1 12 Tf',
+    `(${escapedLines[2]}) Tj`,
+    '0 -18 Td',
+    `(${escapedLines[3]}) Tj`,
+    '0 -34 Td',
+    `(${escapedLines[5]}) Tj`,
+    '0 -18 Td',
+    `(${escapedLines[6]}) Tj`,
+    '0 -34 Td',
+    `(${escapedLines[8]}) Tj`,
+    '0 -18 Td',
+    `(${escapedLines[9]}) Tj`,
+    'ET',
+  ].join('\n')
+
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n',
+    '4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+    `5 0 obj\n<< /Length ${contentStream.length} >>\nstream\n${contentStream}\nendstream\nendobj\n`,
+  ]
+
+  let pdf = '%PDF-1.4\n'
+  const offsets = [0]
+
+  for (const object of objects) {
+    offsets.push(pdf.length)
+    pdf += object
+  }
+
+  const xrefOffset = pdf.length
+  pdf += `xref\n0 ${objects.length + 1}\n`
+  pdf += '0000000000 65535 f \n'
+
+  for (let index = 1; index <= objects.length; index += 1) {
+    pdf += `${String(offsets[index]).padStart(10, '0')} 00000 n \n`
+  }
+
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`
+
+  const blob = new Blob([pdf], { type: 'application/pdf' })
+  const url = window.URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'innovationery-brainstorm-facilitation-guide.pdf'
+  link.click()
+  window.URL.revokeObjectURL(url)
 }
 
 function navigateToRoom(roomId) {
@@ -790,6 +876,7 @@ function HomePage() {
     name: '',
     email: '',
   })
+  const [createRoomIdPreview, setCreateRoomIdPreview] = useState(() => createRoomId())
   const [joinError, setJoinError] = useState('')
   const [createError, setCreateError] = useState('')
   const [joinLoading, setJoinLoading] = useState(false)
@@ -904,11 +991,12 @@ function HomePage() {
     event.preventDefault()
     setCreateError('')
 
+    const roomId = createRoomIdPreview.trim().toUpperCase()
     const name = createForm.name.trim()
     const email = createForm.email.trim().toLowerCase()
 
-    if (!name || !email) {
-      setCreateError('Enter your name and email to create a room.')
+    if (!roomId || !name || !email) {
+      setCreateError('Enter a room id, name, and email to create a room.')
       return
     }
 
@@ -917,7 +1005,6 @@ function HomePage() {
       return
     }
 
-    const roomId = createRoomId()
     setCreateLoading(true)
 
     try {
@@ -965,51 +1052,76 @@ function HomePage() {
   }
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(242,127,90,0.16),_transparent_28%),linear-gradient(180deg,_#fff8ef_0%,_#f5efe6_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
+    <main className="min-h-screen bg-[image:var(--theme-bg-home)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
       <div className="mx-auto grid min-h-[calc(100vh-3rem)] max-w-6xl content-center gap-6">
-        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/80 px-6 py-10 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:px-10 md:py-14">
-          <div className="absolute -bottom-16 -right-10 h-48 w-48 rounded-full bg-[radial-gradient(circle,_rgba(242,127,90,0.18),_transparent_68%)]" />
-          <p className="relative mb-4 text-xs uppercase tracking-[0.24em] text-amber-800">
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/80 px-6 py-10 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-10 md:py-14">
+          <div className="absolute -bottom-16 -right-10 h-48 w-48 rounded-full bg-[image:var(--theme-orb-home)]" />
+          <p className="relative mb-4 text-xs uppercase tracking-[0.24em] text-slate-800">
             Innovation starts here
           </p>
           <h1 className="relative font-serif text-6xl leading-none tracking-tight text-slate-900 sm:text-7xl lg:text-[6.5rem]">
-            Innovationery
+            in·no·va·tion·er·y
           </h1>
-          <p className="relative mt-6 max-w-2xl text-lg leading-8 text-slate-600">
-            A clean starting point for building products, experiments, and ideas
-            that deserve a real launch.
+          <p className="relative mt-4 text-sm font-medium tracking-[0.08em] text-slate-500 sm:text-base">
+            /ˌinəˈvāSHəˌnerē/
+          </p>
+          <p className="relative mt-6 max-w-3xl text-lg leading-8 text-slate-600">
+            <span className="font-semibold text-slate-700">noun</span>
+            {' '}
+            the tools, rituals, and shared momentum teams use to turn bold ideas
+            into breakthrough products, experiments, and real forward motion.
           </p>
           <div className="relative mt-8 flex flex-wrap items-center gap-4">
             <a
-              href="#about"
-              className="inline-flex min-h-12 items-center rounded-full bg-gradient-to-br from-slate-900 to-sky-700 px-5 text-sm font-medium text-orange-50 transition hover:brightness-110"
-            >
-              Explore the vision
-            </a>
-            <a
-              href="/admin"
-              className="inline-flex min-h-12 items-center rounded-full bg-slate-900/10 px-5 text-sm font-medium text-slate-900 transition hover:bg-slate-900/15"
-            >
-              Open admin
-            </a>
-            <a
               href="/room/demo-room"
-              className="inline-flex min-h-12 items-center rounded-full bg-sky-900/10 px-5 text-sm font-medium text-sky-900 transition hover:bg-sky-900/15"
+              className={gradientButtonMediumClass}
             >
-              Open demo room
+              Demo
+            </a>
+            <a
+              href="#brainstorming-rooms"
+              className={secondaryButtonMediumClass}
+            >
+              Brainstorm
+            </a>
+            <a
+              href="#facilitation"
+              className={secondaryButtonMediumClass}
+            >
+              Facilitation
+            </a>
+            <a
+              href="#plans"
+              className={secondaryButtonMediumClass}
+            >
+              Plans
             </a>
           </div>
         </section>
 
-        <section className="rounded-[2rem] border border-slate-900/10 bg-white/75 p-4 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur sm:p-5 md:p-6">
-          <div className="grid gap-3 md:grid-cols-2">
+        <section
+          id="brainstorming-rooms"
+          className="rounded-[2rem] border border-slate-900/10 bg-white/75 p-4 shadow-[var(--theme-shadow-soft)] backdrop-blur sm:p-5 md:p-6"
+        >
+          <div className="px-2 pb-4 pt-1 sm:px-3">
+            <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+              Start fast, join live, keep momentum.
+            </p>
+            <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900 sm:text-4xl">
+              Brainstorming Rooms
+            </h2>
+            <p className="mt-4 max-w-3xl text-base leading-7 text-slate-600 sm:text-lg">
+              Launch a new facilitated room in minutes or jump into an active session with the room code.
+            </p>
+          </div>
+          <div className="flex gap-2 border-b border-slate-900/10 px-2 pt-2">
             <button
               type="button"
               onClick={() => setActiveTab('join')}
-              className={`flex min-h-24 items-center justify-center rounded-[1.5rem] border px-6 py-5 text-left text-xl font-semibold transition sm:text-2xl ${
+              className={`inline-flex min-h-12 items-center justify-center rounded-t-[1.5rem] border border-b-0 px-5 py-3 text-sm font-semibold uppercase tracking-[0.18em] transition sm:text-base ${
                 activeTab === 'join'
-                  ? 'border-slate-900 bg-slate-900 text-orange-50 shadow-[0_20px_40px_rgba(15,23,42,0.18)]'
-                  : 'border-slate-900/10 bg-white text-slate-900 hover:border-slate-900/30 hover:bg-slate-50'
+                  ? sectionTabActiveClass
+                  : sectionTabInactiveClass
               }`}
             >
               Join Room
@@ -1017,10 +1129,10 @@ function HomePage() {
             <button
               type="button"
               onClick={() => setActiveTab('create')}
-              className={`flex min-h-24 items-center justify-center rounded-[1.5rem] border px-6 py-5 text-left text-xl font-semibold transition sm:text-2xl ${
+              className={`inline-flex min-h-12 items-center justify-center rounded-t-[1.5rem] border border-b-0 px-5 py-3 text-sm font-semibold uppercase tracking-[0.18em] transition sm:text-base ${
                 activeTab === 'create'
-                  ? 'border-slate-900 bg-slate-900 text-orange-50 shadow-[0_20px_40px_rgba(15,23,42,0.18)]'
-                  : 'border-slate-900/10 bg-white text-slate-900 hover:border-slate-900/30 hover:bg-slate-50'
+                  ? sectionTabActiveClass
+                  : sectionTabInactiveClass
               }`}
             >
               Create Room
@@ -1028,308 +1140,379 @@ function HomePage() {
           </div>
 
           {activeTab === 'join' ? (
-            <div className="mt-4 rounded-[1.75rem] border border-slate-900/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.95),rgba(248,250,252,0.92))] p-6 sm:p-8">
-              <div className="max-w-3xl">
-                <p className="text-sm uppercase tracking-[0.24em] text-amber-800">
-                  Join an active room
-                </p>
-                <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900">
-                  Enter the room details and jump in.
-                </h2>
-              </div>
-
+            <div className="mt-4 rounded-[1.75rem] border border-slate-900/10 bg-[image:var(--theme-panel-gradient)] p-6 sm:p-8">
               <form
                 onSubmit={handleJoinSubmit}
-                className="mt-8 grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]"
+                className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]"
               >
-                <label className="grid gap-3 text-sm font-medium text-slate-700">
-                  Room Number
-                  <input
-                    type="text"
-                    value={joinForm.roomId}
-                    onChange={(event) =>
-                      setJoinForm((current) => ({
-                        ...current,
-                        roomId: event.target.value.toUpperCase(),
-                      }))
-                    }
-                    placeholder="ABCD12"
-                    className="min-h-28 rounded-[1.75rem] border border-slate-900/10 bg-white px-5 text-3xl font-semibold uppercase tracking-[0.24em] text-slate-900 outline-none transition placeholder:text-slate-300 focus:border-sky-700 focus:ring-2 focus:ring-sky-700/15 sm:min-h-32 sm:text-4xl"
-                  />
-                </label>
-                <div className="grid gap-4 self-end">
-                  <label className="grid gap-2 text-sm font-medium text-slate-700">
-                    Your Name
-                    <input
-                      type="text"
-                      value={joinForm.name}
-                      onChange={(event) =>
-                        setJoinForm((current) => ({
-                          ...current,
-                          name: event.target.value,
-                        }))
-                      }
-                      placeholder="Enter your name"
-                      className="min-h-14 rounded-2xl border border-slate-900/10 bg-white px-4 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-700 focus:ring-2 focus:ring-sky-700/15"
-                    />
-                  </label>
-                  <label className="grid gap-2 text-sm font-medium text-slate-700">
-                    Email
-                    <input
-                      type="email"
-                      value={joinForm.email}
-                      onChange={(event) =>
-                        setJoinForm((current) => ({
-                          ...current,
-                          email: event.target.value,
-                        }))
-                      }
-                      placeholder="Enter your email"
-                      className="min-h-14 rounded-2xl border border-slate-900/10 bg-white px-4 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-700 focus:ring-2 focus:ring-sky-700/15"
-                    />
-                  </label>
-                </div>
-                {joinError ? (
-                  <p className="lg:col-span-2 text-sm font-medium text-rose-700">
-                    {joinError}
-                  </p>
-                ) : null}
-                <div className="lg:col-span-2">
+                <div className="lg:col-span-2 flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+                  <div className="max-w-3xl">
+                    <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+                      Join an active room
+                    </p>
+                    <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900">
+                      Enter the room details and jump in.
+                    </h2>
+                  </div>
                   <button
                     type="submit"
                     disabled={joinLoading}
-                    className="inline-flex min-h-14 items-center justify-center rounded-full bg-gradient-to-br from-slate-900 to-sky-700 px-7 text-base font-medium text-orange-50 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+                    className={`${gradientButtonMediumClass} shrink-0`}
                   >
-                    {joinLoading ? 'Joining...' : 'Join Now'}
+                    {joinLoading ? 'Joining...' : 'Join Room'}
                   </button>
+                </div>
+                <div className="lg:col-span-2 grid gap-4 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+                  <label className="grid gap-2 text-sm font-medium text-slate-50">
+                    Room Number
+                    <input
+                      type="text"
+                      value={joinForm.roomId}
+                      onChange={(event) =>
+                        setJoinForm((current) => ({
+                          ...current,
+                          roomId: event.target.value.toUpperCase(),
+                        }))
+                      }
+                      placeholder="ABCD12"
+                      className="min-h-28 rounded-[1.75rem] border border-white/10 bg-white/10 px-5 text-3xl font-semibold uppercase tracking-[0.24em] text-white outline-none transition placeholder:text-slate-50/35 focus:border-slate-200 focus:ring-2 focus:ring-slate-100/20 sm:min-h-32 sm:text-4xl"
+                    />
+                  </label>
+                  <div className="grid gap-4 self-end">
+                    <label className="grid gap-2 text-sm font-medium text-slate-50">
+                      Your Name
+                      <input
+                        type="text"
+                        value={joinForm.name}
+                        onChange={(event) =>
+                          setJoinForm((current) => ({
+                            ...current,
+                            name: event.target.value,
+                          }))
+                        }
+                        placeholder="Enter your name"
+                        className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-slate-50/45 focus:border-slate-200 focus:ring-2 focus:ring-slate-100/20"
+                      />
+                    </label>
+                    <label className="grid gap-2 text-sm font-medium text-slate-50">
+                      Email
+                      <input
+                        type="email"
+                        value={joinForm.email}
+                        onChange={(event) =>
+                          setJoinForm((current) => ({
+                            ...current,
+                            email: event.target.value,
+                          }))
+                        }
+                        placeholder="Enter your email"
+                        className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-slate-50/45 focus:border-slate-200 focus:ring-2 focus:ring-slate-100/20"
+                      />
+                    </label>
+                  </div>
+                  {joinError ? (
+                    <p className="lg:col-span-2 text-sm font-medium text-rose-300">
+                      {joinError}
+                    </p>
+                  ) : null}
                 </div>
               </form>
             </div>
           ) : (
-            <div className="mt-4 rounded-[1.75rem] border border-slate-900/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.95),rgba(248,250,252,0.92))] p-6 sm:p-8">
-              <div className="grid gap-6 lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
-                <div className="rounded-[1.5rem] border border-slate-900/10 bg-white p-4">
-                  <div className="mb-4 flex items-center justify-between gap-4">
-                    <div>
-                      <p className="text-sm uppercase tracking-[0.2em] text-amber-800">
-                        Room Types
+            <div className="mt-4 rounded-[1.75rem] border border-slate-900/10 bg-[image:var(--theme-panel-gradient)] p-6 sm:p-8">
+              <form onSubmit={handleCreateSubmit} className="space-y-6">
+                <div className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+                  <div className="lg:col-span-2 flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+                    <div className="max-w-3xl">
+                      <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+                        Create New Room
                       </p>
-                      <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
-                        Pick a starting format
+                      <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900">
+                        Start a {selectedTemplate?.name ?? 'new'} room
                       </h2>
                     </div>
-                    <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
-                      {roomTemplates.length} templates
-                    </span>
-                  </div>
-
-                  <div
-                    role="radiogroup"
-                    aria-label="Room types"
-                    className="max-h-[24rem] space-y-3 overflow-y-auto pr-1"
-                  >
-                    {roomTemplates.map((roomType) => (
-                      <button
-                        key={roomType.id}
-                        type="button"
-                        onClick={() => setSelectedRoomType(roomType.id)}
-                        role="radio"
-                        aria-checked={selectedRoomType === roomType.id}
-                        className={`w-full rounded-[1.25rem] border px-4 py-4 text-left transition ${
-                          selectedRoomType === roomType.id
-                            ? 'border-sky-700 bg-sky-50 shadow-[0_18px_30px_rgba(14,165,233,0.12)]'
-                            : 'border-slate-900/10 bg-slate-50 hover:border-sky-700/40 hover:bg-sky-50'
-                        }`}
-                      >
-                        <span className="block min-w-0">
-                          <span className="block text-lg font-semibold text-slate-900">
-                            {roomType.name}
-                          </span>
-                          <span className="mt-2 block text-sm leading-6 text-slate-600">
-                            {roomType.description}
-                          </span>
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-
-                  {templatesStatus === 'ready' ? (
-                    <p className="mt-4 text-sm text-slate-500">
-                      Room templates are loading live from the Firestore `roomTemplates` collection.
-                    </p>
-                  ) : null}
-                  {templatesStatus === 'empty' ? (
-                    <p className="mt-4 text-sm text-amber-700">
-                      The Firestore `roomTemplates` collection is empty, so fallback template data is being shown.
-                    </p>
-                  ) : null}
-                  {templatesStatus === 'error' ? (
-                    <p className="mt-4 text-sm text-rose-700">
-                      Firestore templates could not be loaded, so fallback template data is being shown.
-                    </p>
-                  ) : null}
-                </div>
-
-                <div className="relative rounded-[1.5rem] border border-slate-900/10 bg-slate-950 p-5 text-orange-50 sm:p-6">
-                  <div
-                    aria-hidden="true"
-                    className="absolute left-[-14px] top-16 hidden h-7 w-7 rotate-45 border-b border-l border-slate-900/10 bg-slate-950 lg:block"
-                  />
-                  <p className="text-sm uppercase tracking-[0.2em] text-orange-200/80">
-                    {selectedTemplate?.name ? `${selectedTemplate.name} Workflow` : 'Room Workflow'}
-                  </p>
-                  <h2 className="mt-2 text-2xl font-semibold tracking-tight">
-                    {selectedTemplate?.workflow.title ?? 'No workflow available'}
-                  </h2>
-                  {selectedTemplate?.workflow.description ? (
-                    <p className="mt-3 max-w-xl text-sm leading-6 text-orange-100/80">
-                      {selectedTemplate.workflow.description}
-                    </p>
-                  ) : null}
-
-                  <div className="mt-5 grid gap-3 sm:grid-cols-2">
-                    <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
-                      <p className="text-sm text-orange-100/70">Activities / steps</p>
-                      <p className="mt-2 text-3xl font-semibold">
-                        {selectedTemplate
-                          ? `${selectedTemplate.workflow.activities.length || 1} / ${selectedTemplate.workflow.steps.length}`
-                          : '0 / 0'}
-                      </p>
-                    </div>
-                    <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
-                      <p className="text-sm text-orange-100/70">Total time</p>
-                      <p className="mt-2 text-3xl font-semibold">
-                        {selectedTemplate?.workflow.totalMinutes
-                          ? `${selectedTemplate.workflow.totalMinutes} min`
-                          : 'Custom'}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="mt-6 space-y-4">
-                    {(selectedTemplate?.workflow.activities.length
-                      ? selectedTemplate.workflow.activities
-                      : [
-                          {
-                            id: 'default-activity',
-                            title: 'Workflow',
-                            description: '',
-                            totalMinutes: selectedTemplate?.workflow.totalMinutes ?? null,
-                            steps: selectedTemplate?.workflow.steps ?? [],
-                          },
-                        ]
-                    ).map((activity, activityIndex) => (
-                      <section
-                        key={activity.id}
-                        className="rounded-[1.5rem] border border-white/10 bg-white/5 p-4"
-                      >
-                        <div className="flex flex-wrap items-center gap-3">
-                          <p className="text-sm uppercase tracking-[0.18em] text-orange-200/75">
-                            Activity {activityIndex + 1}
-                          </p>
-                          <h3 className="text-lg font-semibold text-white">{activity.title}</h3>
-                          {activity.totalMinutes ? (
-                            <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs font-medium text-orange-100/80">
-                              {activity.totalMinutes} min
-                            </span>
-                          ) : null}
-                        </div>
-                        {activity.description ? (
-                          <p className="mt-2 text-sm leading-6 text-orange-100/75">
-                            {activity.description}
-                          </p>
-                        ) : null}
-                        <div className="mt-4 flex flex-wrap items-center gap-3 text-sm text-orange-100/75">
-                          <span className="rounded-full bg-slate-950/30 px-3 py-1">
-                            {activity.steps.length} steps
-                          </span>
-                          <span>Open the room to view step details.</span>
-                        </div>
-                      </section>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-6 rounded-[1.5rem] border border-slate-900/10 bg-slate-950 p-5 text-orange-50 sm:p-6">
-                <div className="flex flex-wrap items-start justify-between gap-4">
-                  <div>
-                    <p className="text-sm uppercase tracking-[0.2em] text-orange-200/80">
-                      Create New Room
-                    </p>
-                    <h3 className="mt-2 text-2xl font-semibold tracking-tight">
-                      Start this workflow in a fresh room
-                    </h3>
-                  </div>
-                  {selectedTemplate?.name ? (
-                    <span className="rounded-full bg-white/10 px-4 py-2 text-sm font-medium text-orange-50">
-                      {selectedTemplate.name}
-                    </span>
-                  ) : null}
-                </div>
-
-                <form onSubmit={handleCreateSubmit} className="mt-6 grid gap-4 md:grid-cols-2">
-                  <label className="grid gap-2 text-sm font-medium text-orange-50">
-                    Your Name
-                    <input
-                      type="text"
-                      value={createForm.name}
-                      onChange={(event) =>
-                        setCreateForm((current) => ({
-                          ...current,
-                          name: event.target.value,
-                        }))
-                      }
-                      placeholder="Enter your name"
-                      className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-orange-50/45 focus:border-orange-200 focus:ring-2 focus:ring-orange-100/20"
-                    />
-                  </label>
-                  <label className="grid gap-2 text-sm font-medium text-orange-50">
-                    Email
-                    <input
-                      type="email"
-                      value={createForm.email}
-                      onChange={(event) =>
-                        setCreateForm((current) => ({
-                          ...current,
-                          email: event.target.value,
-                        }))
-                      }
-                      placeholder="Enter your email"
-                      className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-orange-50/45 focus:border-orange-200 focus:ring-2 focus:ring-orange-100/20"
-                    />
-                  </label>
-                  <div className="rounded-[1.25rem] border border-white/10 bg-white/5 px-4 py-3 text-sm text-orange-100/80 md:col-span-2">
-                    Creating a room stores the room id in Firestore, enters you anonymously right away, and sends a one-time verification link in parallel.
-                  </div>
-                  {createError ? (
-                    <p className="text-sm font-medium text-rose-300 md:col-span-2">{createError}</p>
-                  ) : null}
-                  <div className="md:col-span-2">
                     <button
                       type="submit"
                       disabled={createLoading || !selectedTemplate}
-                      className="inline-flex min-h-14 items-center justify-center rounded-full bg-orange-100 px-7 text-base font-medium text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
+                      className={`${gradientButtonMediumClass} shrink-0`}
                     >
                       {createLoading ? 'Preparing...' : 'Create Room'}
                     </button>
                   </div>
-                </form>
-              </div>
+                  <div className="lg:col-span-2 grid gap-4 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+                    <label className="grid gap-2 text-sm font-medium text-slate-50">
+                      Room Number
+                    <input
+                      type="text"
+                      value={createRoomIdPreview}
+                      onChange={(event) => setCreateRoomIdPreview(event.target.value.toUpperCase())}
+                      placeholder="ABCD12"
+                      className="min-h-28 rounded-[1.75rem] border border-white/10 bg-white/10 px-5 text-3xl font-semibold uppercase tracking-[0.24em] text-white outline-none sm:min-h-32 sm:text-4xl"
+                    />
+                    </label>
+                    <div className="grid gap-4 self-end">
+                      <label className="grid gap-2 text-sm font-medium text-slate-50">
+                        Your Name
+                        <input
+                          type="text"
+                          value={createForm.name}
+                          onChange={(event) =>
+                            setCreateForm((current) => ({
+                              ...current,
+                              name: event.target.value,
+                            }))
+                          }
+                          placeholder="Enter your name"
+                          className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-slate-50/45 focus:border-slate-200 focus:ring-2 focus:ring-slate-100/20"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-50">
+                        Email
+                        <input
+                          type="email"
+                          value={createForm.email}
+                          onChange={(event) =>
+                            setCreateForm((current) => ({
+                              ...current,
+                              email: event.target.value,
+                            }))
+                          }
+                          placeholder="Enter your email"
+                          className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-slate-50/45 focus:border-slate-200 focus:ring-2 focus:ring-slate-100/20"
+                        />
+                      </label>
+                    </div>
+                    {createError ? (
+                      <p className="lg:col-span-2 text-sm font-medium text-rose-300">{createError}</p>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div className="mt-2 grid gap-6 lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+                  <div className="rounded-[1.5rem] border border-slate-900/10 bg-white p-4">
+                    <div className="mb-4 flex items-center justify-between gap-4">
+                      <div>
+                        <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+                          Room Types
+                        </p>
+                        <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                          Pick a brainstorm format
+                        </h2>
+                      </div>
+                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                        {roomTemplates.length} templates
+                      </span>
+                    </div>
+
+                    <div
+                      role="radiogroup"
+                      aria-label="Room types"
+                      className="max-h-[24rem] space-y-3 overflow-y-auto pr-1"
+                    >
+                      {roomTemplates.map((roomType) => {
+                        const isEnabled = roomType.id === 'hackathon' || roomType.id === 'ideation'
+                        const isSelected = selectedRoomType === roomType.id
+
+                        return (
+                          <button
+                            key={roomType.id}
+                            type="button"
+                            onClick={() => {
+                              if (isEnabled) {
+                                setSelectedRoomType(roomType.id)
+                              }
+                            }}
+                            disabled={!isEnabled}
+                            role="radio"
+                            aria-checked={isSelected}
+                            aria-disabled={!isEnabled}
+                            className={`w-full rounded-[1.25rem] border px-4 py-4 text-left transition ${
+                              isSelected
+                                ? 'border-slate-950 bg-slate-950 text-slate-50 shadow-[var(--theme-shadow-strong)]'
+                                : isEnabled
+                                  ? 'border-slate-900/10 bg-slate-50/60 hover:border-slate-700/40 hover:bg-slate-50'
+                                  : 'cursor-not-allowed border-slate-900/10 bg-slate-100/70 opacity-55'
+                            }`}
+                          >
+                            <span className="block min-w-0">
+                              <span className="flex items-center justify-between gap-3">
+                                <span className={`block text-lg font-semibold ${isSelected ? 'text-white' : 'text-slate-900'}`}>
+                                  {roomType.name}
+                                </span>
+                                {roomType.id === 'hackathon' || roomType.id === 'ideation' ? (
+                                  <span className={`rounded-full px-2.5 py-1 text-xs font-medium uppercase tracking-[0.18em] ${
+                                    isSelected ? 'bg-white/10 text-slate-50' : 'bg-slate-900 text-white'
+                                  }`}>
+                                    Free
+                                  </span>
+                                ) : null}
+                              </span>
+                              <span className={`mt-2 block text-sm leading-6 ${isSelected ? 'text-slate-200' : 'text-slate-600'}`}>
+                                {roomType.description}
+                              </span>
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+
+                    {templatesStatus === 'ready' ? (
+                      <p className="mt-4 text-sm text-slate-500">
+                        Room templates are loading live from the Firestore `roomTemplates` collection.
+                      </p>
+                    ) : null}
+                    {templatesStatus === 'error' ? (
+                      <p className="mt-4 text-sm text-rose-700">
+                        Firestore templates could not be loaded, so fallback template data is being shown.
+                      </p>
+                    ) : null}
+                  </div>
+
+                  <div className="relative rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6">
+                    <div
+                      aria-hidden="true"
+                      className="absolute left-[-14px] top-16 hidden h-7 w-7 rotate-45 border-b border-l border-slate-900/20 bg-slate-950 lg:block"
+                    />
+                    <p className="text-xs uppercase tracking-[0.24em] text-slate-200/80">
+                      {selectedTemplate?.name ? `${selectedTemplate.name} Workflow` : 'Room Workflow'}
+                    </p>
+                    <h2 className="mt-2 text-2xl font-semibold tracking-tight">
+                      {selectedTemplate?.workflow.title ?? 'No workflow available'}
+                    </h2>
+                    {selectedTemplate?.workflow.description ? (
+                      <p className="mt-3 max-w-xl text-sm leading-6 text-slate-100/80">
+                        {selectedTemplate.workflow.description}
+                      </p>
+                    ) : null}
+
+                    <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                      <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
+                        <p className="text-sm text-slate-100/70">Activities / steps</p>
+                        <p className="mt-2 text-3xl font-semibold">
+                          {selectedTemplate
+                            ? `${selectedTemplate.workflow.activities.length || 1} / ${selectedTemplate.workflow.steps.length}`
+                            : '0 / 0'}
+                        </p>
+                      </div>
+                      <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
+                        <p className="text-sm text-slate-100/70">Total time</p>
+                        <p className="mt-2 text-3xl font-semibold">
+                          {selectedTemplate?.workflow.totalMinutes
+                            ? `${selectedTemplate.workflow.totalMinutes} min`
+                            : 'Custom'}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="mt-6 space-y-4">
+                      {(selectedTemplate?.workflow.activities.length
+                        ? selectedTemplate.workflow.activities
+                        : [
+                            {
+                              id: 'default-activity',
+                              title: 'Workflow',
+                              description: '',
+                              totalMinutes: selectedTemplate?.workflow.totalMinutes ?? null,
+                              steps: selectedTemplate?.workflow.steps ?? [],
+                            },
+                          ]
+                      ).map((activity, activityIndex) => (
+                        <section
+                          key={activity.id}
+                          className="rounded-[1.5rem] border border-white/10 bg-white/5 p-4"
+                        >
+                          <div className="flex flex-wrap items-center gap-3">
+                            <p className="text-sm uppercase tracking-[0.18em] text-slate-200/75">
+                              Activity {activityIndex + 1}
+                            </p>
+                            <h3 className="text-lg font-semibold text-white">{activity.title}</h3>
+                            {activity.totalMinutes ? (
+                              <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs font-medium text-slate-100/80">
+                                {activity.totalMinutes} min
+                              </span>
+                            ) : null}
+                          </div>
+                          {activity.description ? (
+                            <p className="mt-2 text-sm leading-6 text-slate-100/75">
+                              {activity.description}
+                            </p>
+                          ) : null}
+                          <div className="mt-4 flex flex-wrap items-center gap-3 text-sm text-slate-100/75">
+                            <span className="rounded-full bg-slate-950/40 px-3 py-1">
+                              {activity.steps.length} steps
+                            </span>
+                            <span>Open the room to view step details.</span>
+                          </div>
+                        </section>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </form>
             </div>
           )}
         </section>
 
         <section
-          id="about"
-          className="rounded-[2rem] border border-slate-900/10 bg-white/75 p-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur sm:p-7 md:p-8"
+          id="facilitation"
+          className="rounded-[2rem] border border-slate-900/10 bg-white/75 p-6 shadow-[var(--theme-shadow-soft)] backdrop-blur sm:p-7 md:p-8"
+        >
+          <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+            <div className="max-w-3xl">
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+                Download the facilitator playbook.
+              </p>
+              <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900 sm:text-4xl">
+                Facilitation Toolkit
+              </h2>
+              <p className="mt-4 text-base leading-7 text-slate-600 sm:text-lg">
+                Grab a concise guide with the prompts, timeboxes, and closing moves that help brainstorms stay focused and productive.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={downloadFacilitationGuide}
+              className={`${gradientButtonMediumClass} shrink-0`}
+            >
+              Download PDF
+            </button>
+          </div>
+
+          <div className="mt-8 grid gap-5 lg:grid-cols-3">
+            <article className="rounded-[1.75rem] border border-slate-900/10 bg-slate-50/70 p-6">
+              <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Before the room</p>
+              <h3 className="mt-3 text-2xl font-semibold text-slate-900">Frame the challenge</h3>
+              <p className="mt-3 text-base leading-7 text-slate-600">
+                Use the guide to define a sharper prompt, set a realistic timebox, and explain what a strong outcome looks like.
+              </p>
+            </article>
+            <article className="rounded-[1.75rem] border border-slate-900/10 bg-slate-50/70 p-6">
+              <p className="text-sm uppercase tracking-[0.18em] text-slate-700">During the session</p>
+              <h3 className="mt-3 text-2xl font-semibold text-slate-900">Keep energy moving</h3>
+              <p className="mt-3 text-base leading-7 text-slate-600">
+                Follow a simple flow for silent idea generation, fast sharing, clustering, and lightweight voting without losing momentum.
+              </p>
+            </article>
+            <article className="rounded-[1.75rem] border border-slate-900/10 bg-slate-50/70 p-6">
+              <p className="text-sm uppercase tracking-[0.18em] text-slate-700">After the session</p>
+              <h3 className="mt-3 text-2xl font-semibold text-slate-900">Turn ideas into action</h3>
+              <p className="mt-3 text-base leading-7 text-slate-600">
+                Wrap with decision prompts, owners, and next steps so the brainstorm ends with traction instead of a loose pile of notes.
+              </p>
+            </article>
+          </div>
+        </section>
+
+        <section
+          id="plans"
+          className="rounded-[2rem] border border-slate-900/10 bg-white/75 p-6 shadow-[var(--theme-shadow-soft)] backdrop-blur sm:p-7 md:p-8"
         >
           <div className="max-w-3xl">
-            <p className="text-sm uppercase tracking-[0.24em] text-amber-800">
-              Pricing
+            <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+              Plans that fit one room or a whole program
             </p>
             <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900 sm:text-4xl">
-              Plans that fit one room or a whole program
+              Plans
             </h2>
             <p className="mt-4 text-base leading-7 text-slate-600 sm:text-lg">
               Start free for small workshops, then upgrade when you need larger rooms, facilitator controls, and reporting.
@@ -1340,33 +1523,29 @@ function HomePage() {
             {subscriptionTiers.map((tier) => (
               <article
                 key={tier.name}
-                className={`relative overflow-hidden rounded-[1.75rem] border p-7 shadow-[0_24px_80px_rgba(10,34,51,0.08)] ${
+                className={`relative overflow-hidden rounded-[1.75rem] border p-7 shadow-[var(--theme-shadow-soft)] ${
                   tier.featured
-                    ? 'border-slate-900 bg-slate-950 text-orange-50'
+                    ? 'border-slate-900 bg-white/95 text-slate-900'
                     : 'border-slate-900/10 bg-white/85 text-slate-900'
                 }`}
               >
                 <div
                   className={`absolute -bottom-14 -right-8 h-40 w-40 rounded-full ${
                     tier.featured
-                      ? 'bg-[radial-gradient(circle,_rgba(56,189,248,0.22),_transparent_68%)]'
-                      : 'bg-[radial-gradient(circle,_rgba(242,127,90,0.18),_transparent_68%)]'
+                      ? 'bg-[image:var(--theme-orb-featured)]'
+                      : 'bg-[image:var(--theme-orb-standard)]'
                   }`}
                 />
                 <div className="relative">
                   <div className="flex items-center justify-between gap-3">
                     <h3 className="text-2xl font-semibold">{tier.name}</h3>
                     {tier.featured ? (
-                      <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-orange-100">
+                      <span className="rounded-full bg-slate-900 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-white">
                         Most Popular
                       </span>
                     ) : null}
                   </div>
-                  <p
-                    className={`mt-3 text-sm leading-6 ${
-                      tier.featured ? 'text-orange-100/80' : 'text-slate-600'
-                    }`}
-                  >
+                  <p className="mt-3 text-sm leading-6 text-slate-600">
                     {tier.summary}
                   </p>
                   <div className="mt-6 flex items-end gap-1">
@@ -1374,11 +1553,7 @@ function HomePage() {
                       {tier.price}
                     </span>
                     {tier.cadence ? (
-                      <span
-                        className={`pb-1 text-sm ${
-                          tier.featured ? 'text-orange-100/75' : 'text-slate-500'
-                        }`}
-                      >
+                      <span className="pb-1 text-sm text-slate-500">
                         {tier.cadence}
                       </span>
                     ) : null}
@@ -1386,28 +1561,20 @@ function HomePage() {
                   <p
                     className={`mt-3 rounded-full px-4 py-2 text-sm font-medium ${
                       tier.featured
-                        ? 'bg-white/10 text-orange-50'
+                        ? 'bg-slate-900 text-white'
                         : 'bg-slate-100 text-slate-700'
                     }`}
                   >
                     {tier.details}
                   </p>
-                  <ul
-                    className={`mt-6 space-y-3 text-sm leading-6 ${
-                      tier.featured ? 'text-orange-100/85' : 'text-slate-600'
-                    }`}
-                  >
+                  <ul className="mt-6 space-y-3 text-sm leading-6 text-slate-600">
                     {tier.features.map((feature) => (
                       <li key={feature}>{feature}</li>
                     ))}
                   </ul>
                   <a
-                    href={tier.name === 'Business' ? '#footer-contact' : '#'}
-                    className={`mt-8 inline-flex min-h-12 items-center rounded-full px-5 text-sm font-medium transition ${
-                      tier.featured
-                        ? 'bg-orange-100 text-slate-950 hover:bg-white'
-                        : 'bg-slate-900 text-orange-50 hover:brightness-110'
-                    }`}
+                    href={tier.cta === 'Talk to sales' ? 'mailto:hello@innovationery.app' : '#'}
+                    className={`${gradientButtonMediumClass} mt-8`}
                   >
                     {tier.cta}
                   </a>
@@ -1419,33 +1586,34 @@ function HomePage() {
 
         <footer
           id="footer-contact"
-          className="rounded-[2rem] border border-slate-900/10 bg-slate-950 px-6 py-8 text-orange-50 shadow-[0_24px_80px_rgba(10,34,51,0.12)] sm:px-8"
+          className="rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-8 text-slate-900 shadow-[var(--theme-shadow-soft)] sm:px-8"
         >
           <div className="grid gap-8 md:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
             <div>
-              <p className="text-sm uppercase tracking-[0.24em] text-orange-200/75">
+              <p className="text-sm uppercase tracking-[0.24em] text-slate-700">
                 Contact
               </p>
               <h2 className="mt-3 text-3xl font-semibold tracking-tight">
                 Need a larger rollout or custom onboarding?
               </h2>
-              <p className="mt-4 max-w-2xl text-base leading-7 text-orange-100/80">
+              <p className="mt-4 max-w-2xl text-base leading-7 text-slate-600">
                 Reach out for enterprise pricing, implementation support, or product questions.
               </p>
             </div>
 
-            <div className="grid gap-4 text-sm leading-6 text-orange-100/85">
-              <div className="rounded-[1.5rem] border border-white/10 bg-white/5 p-5">
-                <p className="text-xs uppercase tracking-[0.18em] text-orange-200/70">
-                  Email
-                </p>
-                <a
-                  href="mailto:hello@innovationery.app"
-                  className="mt-2 block text-lg font-medium text-white"
-                >
-                  hello@innovationery.app
-                </a>
-              </div>
+            <div className="grid justify-items-center gap-4 text-sm leading-6 text-slate-600">
+              <a
+                href="mailto:hello@innovationery.app"
+                className={gradientButtonMediumClass}
+              >
+                Contact us
+              </a>
+              <a
+                href="mailto:hello@innovationery.app"
+                className="text-center text-lg font-medium text-slate-900"
+              >
+                hello@innovationery.app
+              </a>
             </div>
           </div>
         </footer>
@@ -1521,11 +1689,11 @@ function AdminPage() {
   }, [])
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(14,165,233,0.12),_transparent_26%),linear-gradient(180deg,_#f7fafc_0%,_#edf4f7_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
+    <main className="min-h-screen bg-[image:var(--theme-bg-admin)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
       <div className="mx-auto grid max-w-7xl gap-6">
-        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-10 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:px-10 md:py-14">
-          <div className="absolute -right-10 top-0 h-48 w-48 rounded-full bg-[radial-gradient(circle,_rgba(14,165,233,0.16),_transparent_70%)]" />
-          <p className="relative text-xs uppercase tracking-[0.24em] text-sky-700">
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-10 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-10 md:py-14">
+          <div className="absolute -right-10 top-0 h-48 w-48 rounded-full bg-[image:var(--theme-orb-admin)]" />
+          <p className="relative text-xs uppercase tracking-[0.24em] text-slate-700">
             Admin
           </p>
           <div className="relative mt-4 flex flex-wrap items-end justify-between gap-4">
@@ -1539,7 +1707,7 @@ function AdminPage() {
             </div>
             <a
               href="/"
-              className="inline-flex min-h-12 items-center rounded-full bg-slate-900 px-5 text-sm font-medium text-white transition hover:brightness-110"
+              className={gradientButtonMediumClass}
             >
               Back home
             </a>
@@ -1547,28 +1715,28 @@ function AdminPage() {
         </section>
 
         <section className="grid gap-4 md:grid-cols-3">
-          <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[0_24px_80px_rgba(10,34,51,0.08)]">
-            <p className="text-sm uppercase tracking-[0.18em] text-sky-700">Rooms</p>
+          <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[var(--theme-shadow-soft)]">
+            <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Rooms</p>
             <p className="mt-3 text-4xl font-semibold text-slate-900">{rooms.length}</p>
           </article>
-          <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[0_24px_80px_rgba(10,34,51,0.08)]">
-            <p className="text-sm uppercase tracking-[0.18em] text-sky-700">Members</p>
+          <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[var(--theme-shadow-soft)]">
+            <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Members</p>
             <p className="mt-3 text-4xl font-semibold text-slate-900">
               {Object.values(memberCounts).reduce((total, count) => total + count, 0)}
             </p>
           </article>
-          <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[0_24px_80px_rgba(10,34,51,0.08)]">
-            <p className="text-sm uppercase tracking-[0.18em] text-sky-700">Sync</p>
+          <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[var(--theme-shadow-soft)]">
+            <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Sync</p>
             <p className="mt-3 text-2xl font-semibold text-slate-900">
               {roomStatus === 'ready' && memberStatus === 'ready' ? 'Live' : 'Loading'}
             </p>
           </article>
         </section>
 
-        <section className="overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/90 shadow-[0_24px_80px_rgba(10,34,51,0.08)]">
+        <section className="overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/90 shadow-[var(--theme-shadow-soft)]">
           <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-900/10 px-6 py-5">
             <div>
-              <p className="text-sm uppercase tracking-[0.18em] text-sky-700">
+              <p className="text-sm uppercase tracking-[0.18em] text-slate-700">
                 Firestore rooms
               </p>
               <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
@@ -1623,7 +1791,7 @@ function AdminPage() {
                         <div>
                           <a
                             href={`/room/${encodeURIComponent(room.id)}`}
-                            className="text-base font-semibold text-slate-900 underline decoration-slate-300 underline-offset-4 transition hover:decoration-sky-600"
+                            className="text-base font-semibold text-slate-900 underline decoration-slate-300 underline-offset-4 transition hover:decoration-slate-600"
                           >
                             {room.roomId || room.id}
                           </a>
@@ -1636,7 +1804,7 @@ function AdminPage() {
                         {getRoomCurrentStage(room)}
                       </td>
                       <td className="px-6 py-5">
-                        <span className="inline-flex rounded-full bg-sky-50 px-3 py-1 text-sm font-medium text-sky-900">
+                        <span className="inline-flex rounded-full bg-slate-50 px-3 py-1 text-sm font-medium text-slate-900">
                           {memberCounts[room.id] ?? 0}
                         </span>
                       </td>
@@ -1874,13 +2042,13 @@ function RoomPage({ roomId }) {
   ])
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.14),_transparent_30%),linear-gradient(180deg,_#f8fbff_0%,_#eef4ff_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
+    <main className="min-h-screen bg-[image:var(--theme-bg-room)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
       <div className="mx-auto grid min-h-[calc(100vh-3rem)] max-w-7xl gap-6">
-        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-8 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:px-8 md:py-9">
-          <div className="absolute -right-12 top-0 h-56 w-56 rounded-full bg-[radial-gradient(circle,_rgba(14,165,233,0.18),_transparent_70%)]" />
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-8 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-8 md:py-9">
+          <div className="absolute -right-12 top-0 h-56 w-56 rounded-full bg-[image:var(--theme-orb-room)]" />
           <div className="relative flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
             <div className="max-w-3xl">
-              <p className="text-xs uppercase tracking-[0.24em] text-sky-700">Room Page</p>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-700">Room Page</p>
               <h1 className="mt-4 font-serif text-4xl leading-tight tracking-tight text-slate-900 sm:text-5xl">
                 Room {roomId}
               </h1>
@@ -1892,17 +2060,17 @@ function RoomPage({ roomId }) {
                     : 'This route is wired for room-specific experiences. Use the room id from the URL to load presence, boards, chat, or other room-scoped data.'}
               </p>
               <div className="mt-6 flex flex-wrap items-center gap-4">
-                <code className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100">
+                <code className="rounded-full bg-slate-950 px-4 py-2 text-sm text-slate-50">
                   /room/{roomId}
                 </code>
                 {roomTypeName ? (
-                  <span className="rounded-full bg-sky-100 px-4 py-2 text-sm font-medium text-sky-900">
+                  <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-900">
                     {roomTypeName}
                   </span>
                 ) : null}
                 <a
                   href="/"
-                  className="inline-flex min-h-12 items-center rounded-full bg-sky-900 px-5 text-sm font-medium text-white transition hover:brightness-110"
+                  className={gradientButtonMediumClass}
                 >
                   Back home
                 </a>
@@ -1910,17 +2078,17 @@ function RoomPage({ roomId }) {
             </div>
 
             <div className="grid gap-3 sm:grid-cols-2 xl:min-w-[30rem]">
-              <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-950 px-4 py-4 text-white">
-                <p className="text-xs uppercase tracking-[0.18em] text-sky-200/80">Snapshot</p>
+              <div className="rounded-[1.25rem] border border-slate-900/20 bg-slate-950 px-4 py-4 text-white">
+                <p className="text-xs uppercase tracking-[0.18em] text-slate-200/80">Snapshot</p>
                 <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
                   <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-                    <p className="text-sky-100/70">Template</p>
+                    <p className="text-slate-100/70">Template</p>
                     <p className="mt-1 font-semibold text-white">
                       {roomTypeName ?? 'Waiting for data'}
                     </p>
                   </div>
                   <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-                    <p className="text-sky-100/70">Workflow</p>
+                    <p className="text-slate-100/70">Workflow</p>
                     <p className="mt-1 font-semibold text-white">
                       {roomWorkflow?.stepCount
                         ? `${roomWorkflow.activityCount ?? workflowActivities.length} / ${roomWorkflow.stepCount}`
@@ -1928,13 +2096,13 @@ function RoomPage({ roomId }) {
                     </p>
                   </div>
                   <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-                    <p className="text-sky-100/70">Total time</p>
+                    <p className="text-slate-100/70">Total time</p>
                     <p className="mt-1 font-semibold text-white">
                       {roomWorkflow?.totalMinutes ? `${roomWorkflow.totalMinutes} min` : 'N/A'}
                     </p>
                   </div>
                   <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-                    <p className="text-sky-100/70">Sync</p>
+                    <p className="text-slate-100/70">Sync</p>
                     <p className="mt-1 font-semibold text-white">
                       {status === 'ready' ? 'Live' : 'Pending'}
                     </p>
@@ -1942,10 +2110,10 @@ function RoomPage({ roomId }) {
                 </div>
               </div>
 
-              <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-50 px-4 py-4">
+              <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-50/70 px-4 py-4">
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <p className="text-xs uppercase tracking-[0.18em] text-sky-700">Members</p>
+                    <p className="text-xs uppercase tracking-[0.18em] text-slate-700">Members</p>
                     <p className="mt-1 text-sm text-slate-600">{members.length} in room</p>
                   </div>
                   <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-slate-700">
@@ -1991,9 +2159,9 @@ function RoomPage({ roomId }) {
 
         {banner ? (
           <section
-            className={`rounded-[1.5rem] border px-5 py-4 text-sm leading-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] ${
+            className={`rounded-[1.5rem] border px-5 py-4 text-sm leading-6 shadow-[var(--theme-shadow-soft)] ${
               banner.tone === 'sky'
-                ? 'border-sky-200 bg-sky-50 text-sky-900'
+                ? 'border-slate-200 bg-slate-50 text-slate-900'
                 : 'border-slate-200 bg-slate-50 text-slate-700'
             }`}
           >
@@ -2005,7 +2173,7 @@ function RoomPage({ roomId }) {
                   clearRoomBanner(roomId)
                   setBanner(null)
                 }}
-                className="text-sm font-medium text-slate-500 transition hover:text-slate-700"
+                className={gradientButtonCompactClass}
               >
                 Dismiss
               </button>
@@ -2014,23 +2182,23 @@ function RoomPage({ roomId }) {
         ) : null}
 
         <section className="grid gap-5 xl:grid-cols-[20rem_minmax(0,1fr)]">
-          <aside className="rounded-[1.75rem] border border-slate-900/10 bg-slate-950 p-5 text-white shadow-[0_24px_80px_rgba(10,34,51,0.16)]">
+          <aside className="rounded-[1.75rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-sm uppercase tracking-[0.2em] text-sky-200/80">Workflow</p>
+                <p className="text-sm uppercase tracking-[0.2em] text-slate-200/80">Workflow</p>
                 <h2 className="mt-2 text-2xl font-semibold tracking-tight text-white">
                   Activities
                 </h2>
               </div>
               {roomWorkflow?.totalMinutes ? (
-                <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-medium text-sky-100">
+                <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-medium text-slate-100">
                   {roomWorkflow.totalMinutes} min
                 </span>
               ) : null}
             </div>
 
             {roomWorkflow?.description ? (
-              <p className="mt-4 text-sm leading-6 text-sky-100/70">{roomWorkflow.description}</p>
+              <p className="mt-4 text-sm leading-6 text-slate-100/70">{roomWorkflow.description}</p>
             ) : null}
 
             {workflowActivities.length > 0 ? (
@@ -2055,13 +2223,13 @@ function RoomPage({ roomId }) {
                       key={activity.id || `activity-${activityIndex + 1}`}
                       className={`rounded-[1.5rem] border px-4 py-4 transition ${
                         isCurrentActivity
-                          ? 'border-sky-400/40 bg-sky-400/10'
+                          ? 'border-slate-400/40 bg-slate-400/10'
                           : 'border-white/10 bg-white/5'
                       }`}
                     >
                       <div className="flex items-center justify-between gap-3">
                         <div>
-                          <p className="text-xs uppercase tracking-[0.18em] text-sky-200/70">
+                          <p className="text-xs uppercase tracking-[0.18em] text-slate-200/70">
                             Activity {activityIndex + 1}
                           </p>
                           <h3 className="mt-1 text-base font-semibold text-white">
@@ -2087,7 +2255,7 @@ function RoomPage({ roomId }) {
                               </svg>
                             </span>
                           ) : null}
-                          <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs text-sky-100">
+                          <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs text-slate-100">
                             {activity.steps.length} steps
                           </span>
                         </div>
@@ -2097,7 +2265,7 @@ function RoomPage({ roomId }) {
                           className={`mt-4 text-sm ${
                             isCompletedActivity
                               ? 'text-emerald-100/80'
-                              : 'text-sky-100/65'
+                              : 'text-slate-100/65'
                           }`}
                         >
                           {isCompletedActivity ? 'Activity complete' : 'Starts later'}
@@ -2121,7 +2289,7 @@ function RoomPage({ roomId }) {
                                     ? 'bg-white text-slate-900'
                                     : isPastStep
                                       ? 'bg-emerald-400/10 text-emerald-100'
-                                      : 'bg-white/5 text-sky-100/75'
+                                      : 'bg-white/5 text-slate-100/75'
                                 }`}
                               >
                                 <div className="flex items-center justify-between gap-3">
@@ -2170,17 +2338,17 @@ function RoomPage({ roomId }) {
                 })}
               </div>
             ) : (
-              <p className="mt-6 text-sm text-sky-100/70">
+              <p className="mt-6 text-sm text-slate-100/70">
                 No workflow has been recorded for this room yet.
               </p>
             )}
           </aside>
 
           <div className="space-y-5">
-            <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
+            <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-6 shadow-[var(--theme-shadow-soft)] backdrop-blur">
               <div className="flex flex-col gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                  <p className="text-sm uppercase tracking-[0.2em] text-sky-700">Current Step</p>
+                  <p className="text-sm uppercase tracking-[0.2em] text-slate-700">Current Step</p>
                   <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">
                     {currentStep?.title ?? 'Waiting for workflow'}
                   </h2>
@@ -2190,36 +2358,17 @@ function RoomPage({ roomId }) {
                       : 'A room workflow will appear here once the room template is available.'}
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setIsPaused((paused) => !paused)}
-                  disabled={!currentStep || isWorkflowComplete}
-                  className="inline-flex min-h-11 items-center justify-center rounded-full bg-slate-950 px-5 text-sm font-medium text-white transition enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {isPaused ? 'Resume timer' : 'Pause timer'}
-                </button>
               </div>
 
-              <div className="mt-4">
-                <button
-                  type="button"
-                  onClick={completeCurrentStep}
-                  disabled={!currentStep || isWorkflowComplete}
-                  className="inline-flex min-h-11 items-center justify-center rounded-full bg-emerald-600 px-5 text-sm font-medium text-white transition enabled:hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Complete step
-                </button>
-              </div>
-
-              <div className="mt-5 rounded-[1.5rem] border border-slate-900/10 bg-slate-950 px-5 py-5 text-white">
+              <div className="mt-5 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 px-5 py-5 text-white">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <p className="text-xs uppercase tracking-[0.18em] text-sky-200/75">Timer</p>
+                    <p className="text-xs uppercase tracking-[0.18em] text-slate-200/75">Timer</p>
                     <p className="mt-2 text-2xl font-semibold tabular-nums">
                       {formatCountdown(remainingSeconds)}
                     </p>
                   </div>
-                  <p className="text-sm text-sky-100/70">
+                  <p className="text-sm text-slate-100/70">
                     {isWorkflowComplete
                       ? 'Workflow complete'
                       : isPaused
@@ -2229,13 +2378,31 @@ function RoomPage({ roomId }) {
                           : 'No duration recorded'}
                   </p>
                 </div>
+                <div className="mt-4 flex flex-wrap gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setIsPaused((paused) => !paused)}
+                    disabled={!currentStep || isWorkflowComplete}
+                    className={gradientButtonCompactClass}
+                  >
+                    {isPaused ? 'Resume timer' : 'Pause timer'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={completeCurrentStep}
+                    disabled={!currentStep || isWorkflowComplete}
+                    className={gradientButtonCompactClass}
+                  >
+                    Finish step
+                  </button>
+                </div>
                 <div className="mt-4 h-3 overflow-hidden rounded-full bg-white/10">
                   <div
-                    className="h-full rounded-full bg-[linear-gradient(90deg,_#38bdf8_0%,_#22c55e_100%)] transition-[width] duration-700 ease-out"
+                    className="h-full rounded-full bg-yellow-400 transition-[width] duration-700 ease-out"
                     style={{ width: `${currentStepProgressPercent}%` }}
                   />
                 </div>
-                <div className="mt-3 flex items-center justify-between text-xs text-sky-100/70">
+                <div className="mt-3 flex items-center justify-between text-xs text-slate-100/70">
                   <span>{Math.round(currentStepProgressPercent)}% complete</span>
                   <span>{formatCountdown(remainingSeconds)} remaining</span>
                 </div>
@@ -2247,8 +2414,8 @@ function RoomPage({ roomId }) {
                 </p>
               ) : null}
 
-              <div className="mt-6 rounded-[1.5rem] bg-slate-50 p-5">
-                <p className="text-sm uppercase tracking-[0.18em] text-sky-700">
+              <div className="mt-6 rounded-[1.5rem] bg-slate-50/70 p-5">
+                <p className="text-sm uppercase tracking-[0.18em] text-slate-700">
                   Facilitation cues
                 </p>
                 <div className="mt-4 grid gap-3 sm:grid-cols-2">
@@ -2278,12 +2445,12 @@ function RoomPage({ roomId }) {
 function NotFoundPage() {
   return (
     <main className="flex min-h-screen items-center justify-center bg-slate-950 px-5 py-6 text-slate-100">
-      <div className="rounded-[2rem] border border-white/10 bg-white/5 px-8 py-10 text-center shadow-[0_24px_80px_rgba(0,0,0,0.25)] backdrop-blur">
+      <div className="rounded-[2rem] border border-white/10 bg-white/5 px-8 py-10 text-center shadow-[var(--theme-shadow-modal)] backdrop-blur">
         <p className="text-sm uppercase tracking-[0.24em] text-slate-400">404</p>
         <h1 className="mt-4 font-serif text-4xl">Page not found</h1>
         <a
           href="/"
-          className="mt-8 inline-flex min-h-12 items-center rounded-full bg-white px-5 text-sm font-medium text-slate-950"
+          className={`${gradientButtonMediumClass} mt-8`}
         >
           Return home
         </a>
@@ -2381,9 +2548,9 @@ function App() {
 
   if (!authReady) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-[linear-gradient(180deg,_#fff8ef_0%,_#f5efe6_100%)] px-5 py-6 text-slate-800">
-        <div className="rounded-[2rem] border border-slate-900/10 bg-white/85 px-8 py-10 text-center shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
-          <p className="text-sm uppercase tracking-[0.24em] text-sky-700">Finishing sign-in</p>
+      <main className="flex min-h-screen items-center justify-center bg-[image:var(--theme-bg-auth)] px-5 py-6 text-slate-800">
+        <div className="rounded-[2rem] border border-slate-900/10 bg-white/85 px-8 py-10 text-center shadow-[var(--theme-shadow-soft)] backdrop-blur">
+          <p className="text-sm uppercase tracking-[0.24em] text-slate-700">Finishing sign-in</p>
           <h1 className="mt-4 font-serif text-4xl text-slate-900">Verifying your email link...</h1>
         </div>
       </main>
