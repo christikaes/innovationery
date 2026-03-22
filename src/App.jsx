@@ -41,7 +41,7 @@ const pipelineSteps = [
   'Turn outcomes into action',
 ]
 
-function App() {
+function HomePage() {
   const [activeTab, setActiveTab] = useState('join')
 
   return (
@@ -66,9 +66,12 @@ function App() {
             >
               Explore the vision
             </a>
-            <span className="inline-flex min-h-12 items-center rounded-full bg-sky-900/10 px-5 text-sm font-medium text-sky-900">
-              Vite + React + Firebase ready
-            </span>
+            <a
+              href="/room/demo-room"
+              className="inline-flex min-h-12 items-center rounded-full bg-sky-900/10 px-5 text-sm font-medium text-sky-900 transition hover:bg-sky-900/15"
+            >
+              Open demo room
+            </a>
           </div>
         </section>
 
@@ -250,6 +253,73 @@ function App() {
       </div>
     </main>
   )
+}
+
+function RoomPage({ roomId }) {
+  return (
+    <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.14),_transparent_30%),linear-gradient(180deg,_#f8fbff_0%,_#eef4ff_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
+      <div className="mx-auto flex min-h-[calc(100vh-3rem)] max-w-5xl items-center">
+        <section className="relative w-full overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-10 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:px-10 md:py-14">
+          <div className="absolute -right-12 top-0 h-56 w-56 rounded-full bg-[radial-gradient(circle,_rgba(14,165,233,0.18),_transparent_70%)]" />
+          <p className="relative text-xs uppercase tracking-[0.24em] text-sky-700">
+            Room Page
+          </p>
+          <h1 className="relative mt-4 font-serif text-5xl leading-tight tracking-tight text-slate-900 sm:text-6xl">
+            Room {roomId}
+          </h1>
+          <p className="relative mt-6 max-w-2xl text-lg leading-8 text-slate-600">
+            This route is now wired for room-specific experiences. Use the room
+            id from the URL to load presence, boards, chat, or any other
+            room-scoped data.
+          </p>
+          <div className="relative mt-8 flex flex-wrap items-center gap-4">
+            <code className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100">
+              /room/{roomId}
+            </code>
+            <a
+              href="/"
+              className="inline-flex min-h-12 items-center rounded-full bg-sky-900 px-5 text-sm font-medium text-white transition hover:brightness-110"
+            >
+              Back home
+            </a>
+          </div>
+        </section>
+      </div>
+    </main>
+  )
+}
+
+function NotFoundPage() {
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-slate-950 px-5 py-6 text-slate-100">
+      <div className="rounded-[2rem] border border-white/10 bg-white/5 px-8 py-10 text-center shadow-[0_24px_80px_rgba(0,0,0,0.25)] backdrop-blur">
+        <p className="text-sm uppercase tracking-[0.24em] text-slate-400">404</p>
+        <h1 className="mt-4 font-serif text-4xl">Page not found</h1>
+        <a
+          href="/"
+          className="mt-8 inline-flex min-h-12 items-center rounded-full bg-white px-5 text-sm font-medium text-slate-950"
+        >
+          Return home
+        </a>
+      </div>
+    </main>
+  )
+}
+
+function App() {
+  const { pathname } = window.location
+  const roomMatch = pathname.match(/^\/room\/([^/]+)\/?$/)
+
+  if (roomMatch) {
+    const roomId = decodeURIComponent(roomMatch[1])
+    return <RoomPage roomId={roomId} />
+  }
+
+  if (pathname === '/') {
+    return <HomePage />
+  }
+
+  return <NotFoundPage />
 }
 
 export default App
