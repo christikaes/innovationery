@@ -457,6 +457,52 @@ function normalizeRoomTemplate(id, template) {
 
 const EMAIL_STORAGE_KEY = 'innovationery:email-link-email'
 const PENDING_AUTH_KEY = 'innovationery:pending-auth'
+const subscriptionTiers = [
+  {
+    name: 'Starter',
+    price: 'Free',
+    summary: 'For lightweight workshops, pilots, and early team rituals.',
+    details: 'Up to 10 members per room',
+    cta: 'Start free',
+    featured: false,
+    features: [
+      'Unlimited rooms',
+      'Core facilitation templates',
+      'Basic realtime collaboration',
+      'Email link recovery',
+    ],
+  },
+  {
+    name: 'Team',
+    price: '$39',
+    cadence: '/month',
+    summary: 'For recurring product teams running active sessions every week.',
+    details: 'Up to 50 members per room',
+    cta: 'Talk to sales',
+    featured: true,
+    features: [
+      'Everything in Starter',
+      'Priority room performance',
+      'Admin controls for facilitators',
+      'Exportable session summaries',
+    ],
+  },
+  {
+    name: 'Business',
+    price: '$119',
+    cadence: '/month',
+    summary: 'For larger programs coordinating cross-functional rooms at scale.',
+    details: 'Up to 250 members per room',
+    cta: 'Talk to sales',
+    featured: false,
+    features: [
+      'Everything in Team',
+      'Multiple facilitators per room',
+      'Advanced reporting',
+      'Dedicated onboarding support',
+    ],
+  },
+]
 
 function createRoomId() {
   return Math.random().toString(36).slice(2, 8).toUpperCase()
@@ -1190,40 +1236,133 @@ function HomePage() {
 
         <section
           id="about"
-          className="grid gap-5 md:grid-cols-2 xl:grid-cols-3"
+          className="rounded-[2rem] border border-slate-900/10 bg-white/75 p-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur sm:p-7 md:p-8"
         >
-          <article className="relative overflow-hidden rounded-[1.75rem] border border-slate-900/10 bg-white/80 p-7 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
-            <div className="absolute -bottom-14 -right-8 h-40 w-40 rounded-full bg-[radial-gradient(circle,_rgba(242,127,90,0.18),_transparent_68%)]" />
-            <h2 className="relative text-xl font-semibold text-slate-900">
-              Fast foundation
-            </h2>
-            <p className="relative mt-3 leading-7 text-slate-600">
-              Built on Vite and React so the app is ready for quick iteration
-              from day one.
+          <div className="max-w-3xl">
+            <p className="text-sm uppercase tracking-[0.24em] text-amber-800">
+              Pricing
             </p>
-          </article>
+            <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900 sm:text-4xl">
+              Plans that fit one room or a whole program
+            </h2>
+            <p className="mt-4 text-base leading-7 text-slate-600 sm:text-lg">
+              Start free for small workshops, then upgrade when you need larger rooms, facilitator controls, and reporting.
+            </p>
+          </div>
 
-          <article className="relative overflow-hidden rounded-[1.75rem] border border-slate-900/10 bg-white/80 p-7 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
-            <div className="absolute -bottom-14 -right-8 h-40 w-40 rounded-full bg-[radial-gradient(circle,_rgba(242,127,90,0.18),_transparent_68%)]" />
-            <h2 className="relative text-xl font-semibold text-slate-900">
-              Firebase enabled
-            </h2>
-            <p className="relative mt-3 leading-7 text-slate-600">
-              Firebase is installed and Firestore now stores room ids and room membership when someone creates or joins a room.
-            </p>
-          </article>
-
-          <article className="relative overflow-hidden rounded-[1.75rem] border border-slate-900/10 bg-white/80 p-7 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:col-span-2 xl:col-span-1">
-            <div className="absolute -bottom-14 -right-8 h-40 w-40 rounded-full bg-[radial-gradient(circle,_rgba(242,127,90,0.18),_transparent_68%)]" />
-            <h2 className="relative text-xl font-semibold text-slate-900">
-              Room to grow
-            </h2>
-            <p className="relative mt-3 leading-7 text-slate-600">
-              This homepage is intentionally minimal so you can layer in auth,
-              boards, chat, and room-scoped workflows without reworking the foundation.
-            </p>
-          </article>
+          <div className="mt-8 grid gap-5 xl:grid-cols-3">
+            {subscriptionTiers.map((tier) => (
+              <article
+                key={tier.name}
+                className={`relative overflow-hidden rounded-[1.75rem] border p-7 shadow-[0_24px_80px_rgba(10,34,51,0.08)] ${
+                  tier.featured
+                    ? 'border-slate-900 bg-slate-950 text-orange-50'
+                    : 'border-slate-900/10 bg-white/85 text-slate-900'
+                }`}
+              >
+                <div
+                  className={`absolute -bottom-14 -right-8 h-40 w-40 rounded-full ${
+                    tier.featured
+                      ? 'bg-[radial-gradient(circle,_rgba(56,189,248,0.22),_transparent_68%)]'
+                      : 'bg-[radial-gradient(circle,_rgba(242,127,90,0.18),_transparent_68%)]'
+                  }`}
+                />
+                <div className="relative">
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="text-2xl font-semibold">{tier.name}</h3>
+                    {tier.featured ? (
+                      <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-orange-100">
+                        Most Popular
+                      </span>
+                    ) : null}
+                  </div>
+                  <p
+                    className={`mt-3 text-sm leading-6 ${
+                      tier.featured ? 'text-orange-100/80' : 'text-slate-600'
+                    }`}
+                  >
+                    {tier.summary}
+                  </p>
+                  <div className="mt-6 flex items-end gap-1">
+                    <span className="text-5xl font-semibold tracking-tight">
+                      {tier.price}
+                    </span>
+                    {tier.cadence ? (
+                      <span
+                        className={`pb-1 text-sm ${
+                          tier.featured ? 'text-orange-100/75' : 'text-slate-500'
+                        }`}
+                      >
+                        {tier.cadence}
+                      </span>
+                    ) : null}
+                  </div>
+                  <p
+                    className={`mt-3 rounded-full px-4 py-2 text-sm font-medium ${
+                      tier.featured
+                        ? 'bg-white/10 text-orange-50'
+                        : 'bg-slate-100 text-slate-700'
+                    }`}
+                  >
+                    {tier.details}
+                  </p>
+                  <ul
+                    className={`mt-6 space-y-3 text-sm leading-6 ${
+                      tier.featured ? 'text-orange-100/85' : 'text-slate-600'
+                    }`}
+                  >
+                    {tier.features.map((feature) => (
+                      <li key={feature}>{feature}</li>
+                    ))}
+                  </ul>
+                  <a
+                    href={tier.name === 'Business' ? '#footer-contact' : '#'}
+                    className={`mt-8 inline-flex min-h-12 items-center rounded-full px-5 text-sm font-medium transition ${
+                      tier.featured
+                        ? 'bg-orange-100 text-slate-950 hover:bg-white'
+                        : 'bg-slate-900 text-orange-50 hover:brightness-110'
+                    }`}
+                  >
+                    {tier.cta}
+                  </a>
+                </div>
+              </article>
+            ))}
+          </div>
         </section>
+
+        <footer
+          id="footer-contact"
+          className="rounded-[2rem] border border-slate-900/10 bg-slate-950 px-6 py-8 text-orange-50 shadow-[0_24px_80px_rgba(10,34,51,0.12)] sm:px-8"
+        >
+          <div className="grid gap-8 md:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+            <div>
+              <p className="text-sm uppercase tracking-[0.24em] text-orange-200/75">
+                Contact
+              </p>
+              <h2 className="mt-3 text-3xl font-semibold tracking-tight">
+                Need a larger rollout or custom onboarding?
+              </h2>
+              <p className="mt-4 max-w-2xl text-base leading-7 text-orange-100/80">
+                Reach out for enterprise pricing, implementation support, or product questions.
+              </p>
+            </div>
+
+            <div className="grid gap-4 text-sm leading-6 text-orange-100/85">
+              <div className="rounded-[1.5rem] border border-white/10 bg-white/5 p-5">
+                <p className="text-xs uppercase tracking-[0.18em] text-orange-200/70">
+                  Email
+                </p>
+                <a
+                  href="mailto:hello@innovationery.app"
+                  className="mt-2 block text-lg font-medium text-white"
+                >
+                  hello@innovationery.app
+                </a>
+              </div>
+            </div>
+          </div>
+        </footer>
       </div>
     </main>
   )
