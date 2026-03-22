@@ -1,4 +1,12 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import {
+  collection,
+  doc,
+  onSnapshot,
+  serverTimestamp,
+  setDoc,
+} from 'firebase/firestore'
+import { db } from './firebase.js'
 
 const roomTypes = [
   {
@@ -41,8 +49,158 @@ const pipelineSteps = [
   'Turn outcomes into action',
 ]
 
+const roomTypeLookup = Object.fromEntries(roomTypes.map((roomType) => [roomType.id, roomType]))
+
+function createRoomId() {
+  return Math.random().toString(36).slice(2, 8).toUpperCase()
+}
+
+function createMemberKey(email, name) {
+  const source = (email || name).trim().toLowerCase()
+  return source.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'guest'
+}
+
+function navigateToRoom(roomId) {
+  window.location.assign(`/room/${encodeURIComponent(roomId)}`)
+}
+
+function normalizeMembers(room, persistedMembers) {
+  if (persistedMembers.length > 0) {
+    return persistedMembers
+  }
+
+  const nestedMembers = room?.members
+  if (Array.isArray(nestedMembers)) {
+    return nestedMembers
+  }
+
+  if (nestedMembers && typeof nestedMembers === 'object') {
+    return Object.values(nestedMembers)
+  }
+
+  return Object.entries(room ?? {})
+    .filter(([key, value]) => key.startsWith('members.') && value && typeof value === 'object')
+    .map(([, value]) => value)
+}
+
+async function upsertRoomMembership({
+  roomId,
+  roomTypeId,
+  name,
+  email,
+  created = false,
+}) {
+  const memberKey = createMemberKey(email, name)
+  const member = {
+    id: memberKey,
+    name: name.trim(),
+    email: email.trim().toLowerCase(),
+    joinedAt: new Date().toISOString(),
+  }
+  const roomRef = doc(db, 'rooms', roomId)
+  const memberRef = doc(db, 'rooms', roomId, 'members', memberKey)
+
+  await setDoc(
+    roomRef,
+    {
+      roomId,
+      roomTypeId,
+      roomTypeName: roomTypeLookup[roomTypeId]?.name ?? 'Custom Room',
+      updatedAt: serverTimestamp(),
+      ...(created
+        ? {
+            createdAt: serverTimestamp(),
+            createdBy: member,
+          }
+        : {}),
+    },
+    { merge: true },
+  )
+  await setDoc(memberRef, member, { merge: true })
+
+  window.localStorage.setItem(
+    `innovationery:room-member:${roomId}`,
+    JSON.stringify(member),
+  )
+}
+
 function HomePage() {
   const [activeTab, setActiveTab] = useState('join')
+  const [selectedRoomType, setSelectedRoomType] = useState(roomTypes[0].id)
+  const [joinForm, setJoinForm] = useState({
+    roomId: '',
+    name: '',
+    email: '',
+  })
+  const [createForm, setCreateForm] = useState({
+    name: '',
+    email: '',
+  })
+  const [joinError, setJoinError] = useState('')
+  const [createError, setCreateError] = useState('')
+  const [joinLoading, setJoinLoading] = useState(false)
+  const [createLoading, setCreateLoading] = useState(false)
+
+  async function handleJoinSubmit(event) {
+    event.preventDefault()
+    setJoinError('')
+
+    const roomId = joinForm.roomId.trim().toUpperCase()
+    const name = joinForm.name.trim()
+    const email = joinForm.email.trim()
+
+    if (!roomId || !name || !email) {
+      setJoinError('Enter a room id, name, and email to join.')
+      return
+    }
+
+    setJoinLoading(true)
+
+    try {
+      await upsertRoomMembership({
+        roomId,
+        roomTypeId: 'custom',
+        name,
+        email,
+      })
+      navigateToRoom(roomId)
+    } catch (error) {
+      setJoinError('Unable to join the room right now. Check Firestore setup and try again.')
+    } finally {
+      setJoinLoading(false)
+    }
+  }
+
+  async function handleCreateSubmit(event) {
+    event.preventDefault()
+    setCreateError('')
+
+    const name = createForm.name.trim()
+    const email = createForm.email.trim()
+
+    if (!name || !email) {
+      setCreateError('Enter your name and email to create a room.')
+      return
+    }
+
+    const roomId = createRoomId()
+    setCreateLoading(true)
+
+    try {
+      await upsertRoomMembership({
+        roomId,
+        roomTypeId: selectedRoomType,
+        name,
+        email,
+        created: true,
+      })
+      navigateToRoom(roomId)
+    } catch (error) {
+      setCreateError('Unable to create the room right now. Check Firestore setup and try again.')
+    } finally {
+      setCreateLoading(false)
+    }
+  }
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(242,127,90,0.16),_transparent_28%),linear-gradient(180deg,_#fff8ef_0%,_#f5efe6_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
@@ -112,11 +270,18 @@ function HomePage() {
                 </h2>
               </div>
 
-              <form className="mt-8 grid gap-4 md:grid-cols-2">
+              <form onSubmit={handleJoinSubmit} className="mt-8 grid gap-4 md:grid-cols-2">
                 <label className="grid gap-2 text-sm font-medium text-slate-700">
                   Room Number
                   <input
                     type="text"
+                    value={joinForm.roomId}
+                    onChange={(event) =>
+                      setJoinForm((current) => ({
+                        ...current,
+                        roomId: event.target.value.toUpperCase(),
+                      }))
+                    }
                     placeholder="Enter room number"
                     className="min-h-14 rounded-2xl border border-slate-900/10 bg-white px-4 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-700 focus:ring-2 focus:ring-sky-700/15"
                   />
@@ -125,6 +290,13 @@ function HomePage() {
                   Your Name
                   <input
                     type="text"
+                    value={joinForm.name}
+                    onChange={(event) =>
+                      setJoinForm((current) => ({
+                        ...current,
+                        name: event.target.value,
+                      }))
+                    }
                     placeholder="Enter your name"
                     className="min-h-14 rounded-2xl border border-slate-900/10 bg-white px-4 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-700 focus:ring-2 focus:ring-sky-700/15"
                   />
@@ -133,16 +305,29 @@ function HomePage() {
                   Email
                   <input
                     type="email"
+                    value={joinForm.email}
+                    onChange={(event) =>
+                      setJoinForm((current) => ({
+                        ...current,
+                        email: event.target.value,
+                      }))
+                    }
                     placeholder="Enter your email"
                     className="min-h-14 rounded-2xl border border-slate-900/10 bg-white px-4 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-sky-700 focus:ring-2 focus:ring-sky-700/15"
                   />
                 </label>
+                {joinError ? (
+                  <p className="md:col-span-2 text-sm font-medium text-rose-700">
+                    {joinError}
+                  </p>
+                ) : null}
                 <div className="md:col-span-2">
                   <button
                     type="submit"
-                    className="inline-flex min-h-14 items-center justify-center rounded-full bg-gradient-to-br from-slate-900 to-sky-700 px-7 text-base font-medium text-orange-50 transition hover:brightness-110"
+                    disabled={joinLoading}
+                    className="inline-flex min-h-14 items-center justify-center rounded-full bg-gradient-to-br from-slate-900 to-sky-700 px-7 text-base font-medium text-orange-50 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
                   >
-                    Join Now
+                    {joinLoading ? 'Joining...' : 'Join Now'}
                   </button>
                 </div>
               </form>
@@ -170,7 +355,12 @@ function HomePage() {
                       <button
                         key={roomType.id}
                         type="button"
-                        className="w-full rounded-[1.25rem] border border-slate-900/10 bg-slate-50 px-4 py-4 text-left transition hover:border-sky-700/40 hover:bg-sky-50"
+                        onClick={() => setSelectedRoomType(roomType.id)}
+                        className={`w-full rounded-[1.25rem] border px-4 py-4 text-left transition ${
+                          selectedRoomType === roomType.id
+                            ? 'border-sky-700 bg-sky-50 shadow-[0_18px_30px_rgba(14,165,233,0.12)]'
+                            : 'border-slate-900/10 bg-slate-50 hover:border-sky-700/40 hover:bg-sky-50'
+                        }`}
                       >
                         <span className="block text-lg font-semibold text-slate-900">
                           {roomType.name}
@@ -207,6 +397,52 @@ function HomePage() {
                       </div>
                     ))}
                   </div>
+
+                  <form onSubmit={handleCreateSubmit} className="mt-6 space-y-4">
+                    <label className="grid gap-2 text-sm font-medium text-orange-50">
+                      Your Name
+                      <input
+                        type="text"
+                        value={createForm.name}
+                        onChange={(event) =>
+                          setCreateForm((current) => ({
+                            ...current,
+                            name: event.target.value,
+                          }))
+                        }
+                        placeholder="Enter your name"
+                        className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-orange-50/45 focus:border-orange-200 focus:ring-2 focus:ring-orange-100/20"
+                      />
+                    </label>
+                    <label className="grid gap-2 text-sm font-medium text-orange-50">
+                      Email
+                      <input
+                        type="email"
+                        value={createForm.email}
+                        onChange={(event) =>
+                          setCreateForm((current) => ({
+                            ...current,
+                            email: event.target.value,
+                          }))
+                        }
+                        placeholder="Enter your email"
+                        className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-orange-50/45 focus:border-orange-200 focus:ring-2 focus:ring-orange-100/20"
+                      />
+                    </label>
+                    <div className="rounded-[1.25rem] border border-white/10 bg-white/5 px-4 py-3 text-sm text-orange-100/80">
+                      Creating a room stores the room id in Firestore and adds you as the first member.
+                    </div>
+                    {createError ? (
+                      <p className="text-sm font-medium text-rose-300">{createError}</p>
+                    ) : null}
+                    <button
+                      type="submit"
+                      disabled={createLoading}
+                      className="inline-flex min-h-14 items-center justify-center rounded-full bg-orange-100 px-7 text-base font-medium text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {createLoading ? 'Creating room...' : 'Create Room'}
+                    </button>
+                  </form>
                 </div>
               </div>
             </div>
@@ -234,8 +470,7 @@ function HomePage() {
               Firebase enabled
             </h2>
             <p className="relative mt-3 leading-7 text-slate-600">
-              Firebase is installed and the project includes an environment-based
-              app bootstrap for when you wire in credentials.
+              Firebase is installed and Firestore now stores room ids and room membership when someone creates or joins a room.
             </p>
           </article>
 
@@ -246,7 +481,7 @@ function HomePage() {
             </h2>
             <p className="relative mt-3 leading-7 text-slate-600">
               This homepage is intentionally minimal so you can layer in auth,
-              data, and product flows without reworking the foundation.
+              boards, chat, and room-scoped workflows without reworking the foundation.
             </p>
           </article>
         </section>
@@ -256,10 +491,59 @@ function HomePage() {
 }
 
 function RoomPage({ roomId }) {
+  const [room, setRoom] = useState(null)
+  const [persistedMembers, setPersistedMembers] = useState([])
+  const [status, setStatus] = useState('loading')
+  const [memberStatus, setMemberStatus] = useState('loading')
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      doc(db, 'rooms', roomId),
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          setRoom(null)
+          setStatus('missing')
+          return
+        }
+
+        setRoom(snapshot.data())
+        setStatus('ready')
+      },
+      () => {
+        setRoom(null)
+        setStatus('error')
+      },
+    )
+
+    return unsubscribe
+  }, [roomId])
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      collection(db, 'rooms', roomId, 'members'),
+      (snapshot) => {
+        setPersistedMembers(snapshot.docs.map((memberDoc) => memberDoc.data()))
+        setMemberStatus('ready')
+      },
+      () => {
+        setPersistedMembers([])
+        setMemberStatus('error')
+      },
+    )
+
+    return unsubscribe
+  }, [roomId])
+
+  const currentMember = JSON.parse(
+    window.localStorage.getItem(`innovationery:room-member:${roomId}`) || 'null',
+  )
+  const members = normalizeMembers(room, persistedMembers)
+    .sort((left, right) => left.name.localeCompare(right.name))
+
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.14),_transparent_30%),linear-gradient(180deg,_#f8fbff_0%,_#eef4ff_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
-      <div className="mx-auto flex min-h-[calc(100vh-3rem)] max-w-5xl items-center">
-        <section className="relative w-full overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-10 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:px-10 md:py-14">
+      <div className="mx-auto grid min-h-[calc(100vh-3rem)] max-w-5xl gap-6">
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-10 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:px-10 md:py-14">
           <div className="absolute -right-12 top-0 h-56 w-56 rounded-full bg-[radial-gradient(circle,_rgba(14,165,233,0.18),_transparent_70%)]" />
           <p className="relative text-xs uppercase tracking-[0.24em] text-sky-700">
             Room Page
@@ -268,14 +552,19 @@ function RoomPage({ roomId }) {
             Room {roomId}
           </h1>
           <p className="relative mt-6 max-w-2xl text-lg leading-8 text-slate-600">
-            This route is now wired for room-specific experiences. Use the room
-            id from the URL to load presence, boards, chat, or any other
-            room-scoped data.
+            {status === 'ready'
+              ? `This room is connected to Firestore and currently shows ${members.length} member${members.length === 1 ? '' : 's'} in realtime.`
+              : 'This route is wired for room-specific experiences. Use the room id from the URL to load presence, boards, chat, or other room-scoped data.'}
           </p>
           <div className="relative mt-8 flex flex-wrap items-center gap-4">
             <code className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100">
               /room/{roomId}
             </code>
+            {room?.roomTypeName ? (
+              <span className="rounded-full bg-sky-100 px-4 py-2 text-sm font-medium text-sky-900">
+                {room.roomTypeName}
+              </span>
+            ) : null}
             <a
               href="/"
               className="inline-flex min-h-12 items-center rounded-full bg-sky-900 px-5 text-sm font-medium text-white transition hover:brightness-110"
@@ -283,6 +572,109 @@ function RoomPage({ roomId }) {
               Back home
             </a>
           </div>
+        </section>
+
+        <section className="grid gap-5 lg:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]">
+          <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/85 p-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm uppercase tracking-[0.2em] text-sky-700">
+                  Members
+                </p>
+                <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                  Everyone currently in this room
+                </h2>
+              </div>
+              <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700">
+                {members.length} total
+              </span>
+            </div>
+
+            {status === 'loading' || memberStatus === 'loading' ? (
+              <p className="mt-6 text-base text-slate-600">Loading room members...</p>
+            ) : null}
+            {status === 'error' || memberStatus === 'error' ? (
+              <p className="mt-6 text-base text-rose-700">
+                Unable to load the room from Firestore.
+              </p>
+            ) : null}
+            {status === 'missing' ? (
+              <p className="mt-6 text-base text-slate-600">
+                No Firestore room document exists for this room id yet. Create or join the room from the homepage first.
+              </p>
+            ) : null}
+            {status === 'ready' && members.length === 0 ? (
+              <p className="mt-6 text-base text-slate-600">This room has no members yet.</p>
+            ) : null}
+
+            {status === 'ready' && members.length > 0 ? (
+              <div className="mt-6 grid gap-3">
+                {members.map((member) => {
+                  const initials = member.name
+                    .split(/\s+/)
+                    .filter(Boolean)
+                    .slice(0, 2)
+                    .map((part) => part[0]?.toUpperCase())
+                    .join('')
+
+                  const isCurrentMember = currentMember?.id === member.id
+
+                  return (
+                    <div
+                      key={member.id}
+                      className="flex items-center justify-between gap-4 rounded-[1.25rem] border border-slate-900/10 bg-slate-50 px-4 py-4"
+                    >
+                      <div className="flex items-center gap-4">
+                        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-sky-900 text-sm font-semibold text-white">
+                          {initials || '??'}
+                        </div>
+                        <div>
+                          <p className="text-base font-semibold text-slate-900">
+                            {member.name}
+                          </p>
+                          <p className="text-sm text-slate-600">{member.email}</p>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center justify-end gap-2">
+                        {isCurrentMember ? (
+                          <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-amber-900">
+                            You
+                          </span>
+                        ) : null}
+                        <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
+                          Active member
+                        </span>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            ) : null}
+          </article>
+
+          <aside className="rounded-[1.75rem] border border-slate-900/10 bg-slate-950 p-6 text-white shadow-[0_24px_80px_rgba(10,34,51,0.16)]">
+            <p className="text-sm uppercase tracking-[0.2em] text-sky-200/80">
+              Room Snapshot
+            </p>
+            <div className="mt-5 space-y-4">
+              <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
+                <p className="text-sm text-sky-100/75">Room id</p>
+                <p className="mt-2 text-lg font-semibold">{roomId}</p>
+              </div>
+              <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
+                <p className="text-sm text-sky-100/75">Template</p>
+                <p className="mt-2 text-lg font-semibold">
+                  {room?.roomTypeName ?? 'Waiting for Firestore data'}
+                </p>
+              </div>
+              <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
+                <p className="text-sm text-sky-100/75">Member sync</p>
+                <p className="mt-2 text-lg font-semibold">
+                  {status === 'ready' ? 'Live' : 'Pending'}
+                </p>
+              </div>
+            </div>
+          </aside>
         </section>
       </div>
     </main>
