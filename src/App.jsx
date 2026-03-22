@@ -25,6 +25,20 @@ function formatCountdown(totalSeconds) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
+function shuffleArray(items) {
+  const nextItems = [...items]
+
+  for (let index = nextItems.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1))
+    const currentValue = nextItems[index]
+
+    nextItems[index] = nextItems[swapIndex]
+    nextItems[swapIndex] = currentValue
+  }
+
+  return nextItems
+}
+
 const fallbackRoomTemplates = [
   {
     id: 'hackathon',
@@ -1831,6 +1845,8 @@ function RoomPage({ roomId }) {
   const [currentStepIndex, setCurrentStepIndex] = useState(0)
   const [remainingSeconds, setRemainingSeconds] = useState(0)
   const [isPaused, setIsPaused] = useState(false)
+  const [roundRobinOrder, setRoundRobinOrder] = useState([])
+  const [completedRoundRobinSpeakerIds, setCompletedRoundRobinSpeakerIds] = useState([])
   const currentMember = JSON.parse(
     window.localStorage.getItem(`innovationery:room-member:${roomId}`) || 'null',
   )
@@ -1950,8 +1966,18 @@ function RoomPage({ roomId }) {
   const safeCurrentStepIndex =
     workflowSequence.length > 0 ? Math.min(currentStepIndex, workflowSequence.length - 1) : 0
   const currentStep = workflowSequence[safeCurrentStepIndex] ?? null
+  const hasWorkflowStarted = Boolean(room?.workflowStartedAt)
   const currentActivityIndex = currentStep?.activityIndex ?? 0
-  const isWorkflowComplete = workflowSequence.length > 0 && safeCurrentStepIndex === workflowSequence.length - 1 && remainingSeconds === 0
+  const isRoundRobinStep = currentStep?.activityType === 'roundrobin'
+  const roundRobinMembers = roundRobinOrder
+    .map((memberId) => members.find((member) => member.id === memberId))
+    .filter(Boolean)
+  const activeRoundRobinMember =
+    roundRobinMembers.find((member) => !completedRoundRobinSpeakerIds.includes(member.id)) ?? null
+  const isWorkflowComplete =
+    workflowSequence.length > 0 &&
+    safeCurrentStepIndex === workflowSequence.length - 1 &&
+    remainingSeconds === 0
   const firstStepDurationSeconds = (workflowSequence[0]?.durationMinutes ?? 0) * 60
   const nextStepDurationSeconds =
     (workflowSequence[safeCurrentStepIndex + 1]?.durationMinutes ?? 0) * 60
@@ -1974,9 +2000,31 @@ function RoomPage({ roomId }) {
     setRemainingSeconds((nextStep?.durationMinutes ?? 0) * 60)
     setIsPaused(false)
   }
+  const startWorkflow = async () => {
+    await setDoc(
+      doc(db, 'rooms', roomId),
+      {
+        workflowStartedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true },
+    )
+  }
   const completeCurrentStep = () => {
     if (!currentStep) {
       return
+    }
+
+    if (isRoundRobinStep && activeRoundRobinMember) {
+      const nextCompletedSpeakerIds = completedRoundRobinSpeakerIds.includes(activeRoundRobinMember.id)
+        ? completedRoundRobinSpeakerIds
+        : [...completedRoundRobinSpeakerIds, activeRoundRobinMember.id]
+
+      setCompletedRoundRobinSpeakerIds(nextCompletedSpeakerIds)
+
+      if (nextCompletedSpeakerIds.length < roundRobinMembers.length) {
+        return
+      }
     }
 
     if (safeCurrentStepIndex < workflowSequence.length - 1) {
@@ -1989,7 +2037,7 @@ function RoomPage({ roomId }) {
   }
 
   useEffect(() => {
-    if (workflowSequence.length === 0) {
+    if (workflowSequence.length === 0 || !hasWorkflowStarted) {
       return undefined
     }
 
@@ -2000,10 +2048,43 @@ function RoomPage({ roomId }) {
     }, 0)
 
     return () => window.clearTimeout(timeoutId)
-  }, [firstStepDurationSeconds, roomId, workflowSequence.length])
+  }, [firstStepDurationSeconds, hasWorkflowStarted, roomId, workflowSequence.length])
 
   useEffect(() => {
-    if (!currentStep || workflowSequence.length === 0) {
+    if (hasWorkflowStarted) {
+      return
+    }
+
+    setCurrentStepIndex(0)
+    setRemainingSeconds(0)
+    setIsPaused(true)
+    setRoundRobinOrder([])
+    setCompletedRoundRobinSpeakerIds([])
+  }, [hasWorkflowStarted])
+
+  useEffect(() => {
+    if (!isRoundRobinStep) {
+      setRoundRobinOrder([])
+      setCompletedRoundRobinSpeakerIds([])
+      return
+    }
+
+    const randomizedMemberIds = shuffleArray(
+      members
+        .map((member) => member.id)
+        .filter(Boolean),
+    )
+
+    setRoundRobinOrder(randomizedMemberIds)
+    setCompletedRoundRobinSpeakerIds([])
+  }, [
+    currentStep?.sequenceIndex,
+    isRoundRobinStep,
+    members,
+  ])
+
+  useEffect(() => {
+    if (!hasWorkflowStarted || !currentStep || workflowSequence.length === 0) {
       return undefined
     }
 
@@ -2034,6 +2115,7 @@ function RoomPage({ roomId }) {
     return undefined
   }, [
     currentStep,
+    hasWorkflowStarted,
     isPaused,
     nextStepDurationSeconds,
     remainingSeconds,
@@ -2053,7 +2135,9 @@ function RoomPage({ roomId }) {
                 Room {roomId}
               </h1>
               <p className="mt-4 max-w-2xl text-base leading-7 text-slate-600 sm:text-lg">
-                {currentStep
+                {!hasWorkflowStarted
+                  ? `Everyone is in the room. Start when you're ready to begin the first activity.`
+                  : currentStep
                   ? `The room is currently in ${currentStep.activityTitle}. The timer will move the workflow through each step automatically.`
                   : status === 'ready'
                     ? `This room is connected to Firestore and currently shows ${members.length} member${members.length === 1 ? '' : 's'} in realtime.`
@@ -2350,35 +2434,87 @@ function RoomPage({ roomId }) {
                 <div>
                   <p className="text-sm uppercase tracking-[0.2em] text-slate-700">Current Step</p>
                   <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">
-                    {currentStep?.title ?? 'Waiting for workflow'}
+                    {hasWorkflowStarted
+                      ? currentStep?.title ?? 'Waiting for workflow'
+                      : 'Ready to start'}
                   </h2>
                   <p className="mt-2 text-base text-slate-600">
-                    {currentStep
+                    {hasWorkflowStarted && currentStep
                       ? `${currentStep.activityTitle} • Step ${currentStep.stepIndex + 1} of ${workflowActivities[currentActivityIndex]?.steps.length ?? 0}`
-                      : 'A room workflow will appear here once the room template is available.'}
+                      : 'Review who is in the room, then start the session when everyone is ready.'}
                   </p>
                 </div>
               </div>
 
-              <div className="mt-5 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 px-5 py-5 text-white">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.18em] text-slate-200/75">Timer</p>
-                    <p className="mt-2 text-2xl font-semibold tabular-nums">
-                      {formatCountdown(remainingSeconds)}
+              {!hasWorkflowStarted ? (
+                <div className="mt-5 rounded-[1.5rem] border border-slate-900/10 bg-slate-50/70 p-5">
+                  <div className="flex flex-wrap items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Room Members</p>
+                      <p className="mt-2 text-sm text-slate-600">
+                        {members.length > 0
+                          ? `${members.length} member${members.length === 1 ? '' : 's'} ready to begin this session.`
+                          : 'No members are in this room yet.'}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void startWorkflow()
+                      }}
+                      disabled={members.length === 0}
+                      className={gradientButtonCompactClass}
+                    >
+                      Start
+                    </button>
+                  </div>
+                  <div className="mt-5 flex flex-wrap gap-3">
+                    {members.map((member) => {
+                      const displayName = getMemberDisplayName(member)
+
+                      return (
+                        <div
+                          key={member.id || member.email || displayName}
+                          className="flex items-center gap-3 rounded-full border border-slate-200 bg-white px-3 py-2"
+                        >
+                          <img
+                            src={createAvatarUrl(member.email, member.name)}
+                            alt={`${displayName} avatar`}
+                            className="h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover"
+                          />
+                          <div className="min-w-0">
+                            <p className="max-w-[10rem] truncate text-sm font-medium text-slate-900">
+                              {displayName}
+                            </p>
+                            <p className="text-xs text-slate-500">
+                              {member.isOnline ? 'Online' : 'In room'}
+                            </p>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-5 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 px-5 py-5 text-white">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-xs uppercase tracking-[0.18em] text-slate-200/75">Timer</p>
+                      <p className="mt-2 text-2xl font-semibold tabular-nums">
+                        {formatCountdown(remainingSeconds)}
+                      </p>
+                    </div>
+                    <p className="text-sm text-slate-100/70">
+                      {isWorkflowComplete
+                        ? 'Workflow complete'
+                        : isPaused
+                          ? 'Paused'
+                          : currentStep?.durationMinutes
+                            ? `${currentStep.durationMinutes} minute step`
+                            : 'No duration recorded'}
                     </p>
                   </div>
-                  <p className="text-sm text-slate-100/70">
-                    {isWorkflowComplete
-                      ? 'Workflow complete'
-                      : isPaused
-                        ? 'Paused'
-                        : currentStep?.durationMinutes
-                          ? `${currentStep.durationMinutes} minute step`
-                          : 'No duration recorded'}
-                  </p>
-                </div>
-                <div className="mt-4 flex flex-wrap gap-3">
+                  <div className="mt-4 flex flex-wrap gap-3">
                   <button
                     type="button"
                     onClick={() => setIsPaused((paused) => !paused)}
@@ -2390,23 +2526,34 @@ function RoomPage({ roomId }) {
                   <button
                     type="button"
                     onClick={completeCurrentStep}
-                    disabled={!currentStep || isWorkflowComplete}
+                    disabled={
+                      !currentStep ||
+                      isWorkflowComplete ||
+                      (isRoundRobinStep && roundRobinMembers.length === 0)
+                    }
                     className={gradientButtonCompactClass}
                   >
-                    Finish step
+                    {isRoundRobinStep
+                      ? activeRoundRobinMember
+                        ? completedRoundRobinSpeakerIds.length === roundRobinMembers.length - 1
+                          ? 'Complete round robin'
+                          : 'Next speaker'
+                        : 'Round robin complete'
+                      : 'Finish step'}
                   </button>
+                  </div>
+                  <div className="mt-4 h-3 overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className="h-full rounded-full bg-yellow-400 transition-[width] duration-700 ease-out"
+                      style={{ width: `${currentStepProgressPercent}%` }}
+                    />
+                  </div>
+                  <div className="mt-3 flex items-center justify-between text-xs text-slate-100/70">
+                    <span>{Math.round(currentStepProgressPercent)}% complete</span>
+                    <span>{formatCountdown(remainingSeconds)} remaining</span>
+                  </div>
                 </div>
-                <div className="mt-4 h-3 overflow-hidden rounded-full bg-white/10">
-                  <div
-                    className="h-full rounded-full bg-yellow-400 transition-[width] duration-700 ease-out"
-                    style={{ width: `${currentStepProgressPercent}%` }}
-                  />
-                </div>
-                <div className="mt-3 flex items-center justify-between text-xs text-slate-100/70">
-                  <span>{Math.round(currentStepProgressPercent)}% complete</span>
-                  <span>{formatCountdown(remainingSeconds)} remaining</span>
-                </div>
-              </div>
+              )}
 
               {currentStep?.description ? (
                 <p className="mt-5 max-w-3xl text-lg leading-8 text-slate-600">
@@ -2414,25 +2561,115 @@ function RoomPage({ roomId }) {
                 </p>
               ) : null}
 
-              <div className="mt-6 rounded-[1.5rem] bg-slate-50/70 p-5">
-                <p className="text-sm uppercase tracking-[0.18em] text-slate-700">
-                  Facilitation cues
-                </p>
-                <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                  <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
-                    <p className="text-sm text-slate-500">Activity</p>
-                    <p className="mt-1 text-lg font-semibold text-slate-900">
-                      {currentStep?.activityTitle ?? 'N/A'}
-                    </p>
-                  </div>
-                  <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
-                    <p className="text-sm text-slate-500">Format</p>
-                    <p className="mt-1 text-lg font-semibold capitalize text-slate-900">
-                      {currentStep?.activityType || 'Open discussion'}
-                    </p>
+              {hasWorkflowStarted && isRoundRobinStep ? (
+                <div className="mt-6 rounded-[1.5rem] bg-slate-50/70 p-5">
+                  <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Round Robin</p>
+                  {activeRoundRobinMember ? (
+                    <div className="mt-4 rounded-[1.5rem] border border-slate-200 bg-white p-4 shadow-[var(--theme-shadow-soft)]">
+                      <div className="flex items-center gap-4">
+                        <img
+                          src={createAvatarUrl(
+                            activeRoundRobinMember.email,
+                            activeRoundRobinMember.name,
+                          )}
+                          alt={`${getMemberDisplayName(activeRoundRobinMember)} avatar`}
+                          className="h-16 w-16 rounded-full border border-slate-300 bg-slate-200 object-cover"
+                        />
+                        <div>
+                          <p className="text-sm text-slate-500">Now speaking</p>
+                          <p className="mt-1 text-2xl font-semibold text-slate-900">
+                            {getMemberDisplayName(activeRoundRobinMember)}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-4 rounded-[1.5rem] border border-emerald-200 bg-emerald-50 px-4 py-4 text-sm font-medium text-emerald-900">
+                      {roundRobinMembers.length > 0
+                        ? 'Everyone in the room has had a turn.'
+                        : 'No room members are available for this round robin yet.'}
+                    </div>
+                  )}
+                  <div className="mt-5 flex flex-wrap gap-3">
+                    {roundRobinMembers.map((member) => {
+                      const displayName = getMemberDisplayName(member)
+                      const isActiveSpeaker = activeRoundRobinMember?.id === member.id
+                      const isCompletedSpeaker = completedRoundRobinSpeakerIds.includes(member.id)
+
+                      return (
+                        <div
+                          key={member.id || member.email || displayName}
+                          className={`relative flex items-center gap-3 rounded-full border bg-white px-3 py-2 transition ${
+                            isCompletedSpeaker
+                              ? 'border-emerald-500 ring-2 ring-emerald-200'
+                              : isActiveSpeaker
+                                ? 'border-slate-400 ring-2 ring-slate-200'
+                                : 'border-slate-200'
+                          }`}
+                        >
+                          <div className="relative">
+                            <img
+                              src={createAvatarUrl(member.email, member.name)}
+                              alt={`${displayName} avatar`}
+                              className="h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover"
+                            />
+                            {isCompletedSpeaker ? (
+                              <span className="absolute -bottom-1 -right-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-white">
+                                <svg
+                                  viewBox="0 0 16 16"
+                                  fill="none"
+                                  className="h-3 w-3"
+                                  aria-hidden="true"
+                                >
+                                  <path
+                                    d="M3.5 8.5L6.5 11.5L12.5 4.5"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="min-w-0">
+                            <p className="max-w-[10rem] truncate text-sm font-medium text-slate-900">
+                              {displayName}
+                            </p>
+                            <p className="text-xs text-slate-500">
+                              {isCompletedSpeaker
+                                ? 'Done'
+                                : isActiveSpeaker
+                                  ? 'Speaking'
+                                  : 'Waiting'}
+                            </p>
+                          </div>
+                        </div>
+                      )
+                    })}
                   </div>
                 </div>
-              </div>
+              ) : hasWorkflowStarted ? (
+                <div className="mt-6 rounded-[1.5rem] bg-slate-50/70 p-5">
+                  <p className="text-sm uppercase tracking-[0.18em] text-slate-700">
+                    Facilitation cues
+                  </p>
+                  <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
+                      <p className="text-sm text-slate-500">Activity</p>
+                      <p className="mt-1 text-lg font-semibold text-slate-900">
+                        {currentStep?.activityTitle ?? 'N/A'}
+                      </p>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
+                      <p className="text-sm text-slate-500">Format</p>
+                      <p className="mt-1 text-lg font-semibold capitalize text-slate-900">
+                        {currentStep?.activityType || 'Open discussion'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
             </article>
 
           </div>
