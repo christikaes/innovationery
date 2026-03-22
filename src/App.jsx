@@ -9,6 +9,7 @@ import {
 } from 'firebase/auth'
 import {
   collection,
+  collectionGroup,
   doc,
   onSnapshot,
   serverTimestamp,
@@ -554,6 +555,77 @@ function getMemberDisplayName(member) {
   return member?.name?.trim() || member?.email?.trim() || 'Guest'
 }
 
+function formatRoomTimestamp(value) {
+  if (!value) {
+    return 'No activity yet'
+  }
+
+  const resolvedDate =
+    typeof value?.toDate === 'function'
+      ? value.toDate()
+      : value instanceof Date
+        ? value
+        : typeof value === 'string' || typeof value === 'number'
+          ? new Date(value)
+          : null
+
+  if (!resolvedDate || Number.isNaN(resolvedDate.getTime())) {
+    return 'No activity yet'
+  }
+
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(resolvedDate)
+}
+
+function resolveStageLabel(stageValue) {
+  if (typeof stageValue === 'string') {
+    const trimmed = stageValue.trim()
+    return trimmed || null
+  }
+
+  if (typeof stageValue === 'number') {
+    return `Stage ${stageValue}`
+  }
+
+  if (!stageValue || typeof stageValue !== 'object') {
+    return null
+  }
+
+  return (
+    stageValue.title ||
+    stageValue.name ||
+    stageValue.label ||
+    stageValue.status ||
+    null
+  )
+}
+
+function getRoomCurrentStage(room) {
+  const directStage =
+    resolveStageLabel(room?.currentActivity) ||
+    resolveStageLabel(room?.currentStage) ||
+    resolveStageLabel(room?.currentStep) ||
+    resolveStageLabel(room?.stage) ||
+    resolveStageLabel(room?.activity) ||
+    resolveStageLabel(room?.status)
+
+  if (directStage) {
+    return directStage
+  }
+
+  const workflow = room?.roomTemplate?.workflow
+  const activeStage =
+    workflow?.activities?.[0]?.title ||
+    workflow?.steps?.[0]?.title ||
+    null
+
+  return activeStage ? `Ready for ${activeStage}` : 'Waiting for workflow'
+}
+
 function readPendingAuthContext() {
   try {
     return JSON.parse(window.localStorage.getItem(PENDING_AUTH_KEY) || 'null')
@@ -913,6 +985,12 @@ function HomePage() {
               className="inline-flex min-h-12 items-center rounded-full bg-gradient-to-br from-slate-900 to-sky-700 px-5 text-sm font-medium text-orange-50 transition hover:brightness-110"
             >
               Explore the vision
+            </a>
+            <a
+              href="/admin"
+              className="inline-flex min-h-12 items-center rounded-full bg-slate-900/10 px-5 text-sm font-medium text-slate-900 transition hover:bg-slate-900/15"
+            >
+              Open admin
             </a>
             <a
               href="/room/demo-room"
@@ -1371,6 +1449,207 @@ function HomePage() {
             </div>
           </div>
         </footer>
+      </div>
+    </main>
+  )
+}
+
+function AdminPage() {
+  const [rooms, setRooms] = useState([])
+  const [roomStatus, setRoomStatus] = useState('loading')
+  const [memberCounts, setMemberCounts] = useState({})
+  const [memberStatus, setMemberStatus] = useState('loading')
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      collection(db, 'rooms'),
+      (snapshot) => {
+        const nextRooms = snapshot.docs.map((roomDoc) => ({
+          id: roomDoc.id,
+          ...roomDoc.data(),
+        }))
+
+        nextRooms.sort((left, right) => {
+          const leftUpdated = left.updatedAt?.seconds ?? 0
+          const rightUpdated = right.updatedAt?.seconds ?? 0
+
+          if (leftUpdated !== rightUpdated) {
+            return rightUpdated - leftUpdated
+          }
+
+          return left.id.localeCompare(right.id)
+        })
+
+        setRooms(nextRooms)
+        setRoomStatus('ready')
+      },
+      () => {
+        setRooms([])
+        setRoomStatus('error')
+      },
+    )
+
+    return unsubscribe
+  }, [])
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      collectionGroup(db, 'members'),
+      (snapshot) => {
+        const counts = {}
+
+        snapshot.docs.forEach((memberDoc) => {
+          const roomId = memberDoc.ref.parent.parent?.id
+
+          if (!roomId) {
+            return
+          }
+
+          counts[roomId] = (counts[roomId] ?? 0) + 1
+        })
+
+        setMemberCounts(counts)
+        setMemberStatus('ready')
+      },
+      () => {
+        setMemberCounts({})
+        setMemberStatus('error')
+      },
+    )
+
+    return unsubscribe
+  }, [])
+
+  return (
+    <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(14,165,233,0.12),_transparent_26%),linear-gradient(180deg,_#f7fafc_0%,_#edf4f7_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
+      <div className="mx-auto grid max-w-7xl gap-6">
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-10 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:px-10 md:py-14">
+          <div className="absolute -right-10 top-0 h-48 w-48 rounded-full bg-[radial-gradient(circle,_rgba(14,165,233,0.16),_transparent_70%)]" />
+          <p className="relative text-xs uppercase tracking-[0.24em] text-sky-700">
+            Admin
+          </p>
+          <div className="relative mt-4 flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <h1 className="font-serif text-5xl leading-tight tracking-tight text-slate-900 sm:text-6xl">
+                Active rooms
+              </h1>
+              <p className="mt-4 max-w-3xl text-lg leading-8 text-slate-600">
+                Live overview of room ids, room types, current stage, and member counts from Firestore.
+              </p>
+            </div>
+            <a
+              href="/"
+              className="inline-flex min-h-12 items-center rounded-full bg-slate-900 px-5 text-sm font-medium text-white transition hover:brightness-110"
+            >
+              Back home
+            </a>
+          </div>
+        </section>
+
+        <section className="grid gap-4 md:grid-cols-3">
+          <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[0_24px_80px_rgba(10,34,51,0.08)]">
+            <p className="text-sm uppercase tracking-[0.18em] text-sky-700">Rooms</p>
+            <p className="mt-3 text-4xl font-semibold text-slate-900">{rooms.length}</p>
+          </article>
+          <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[0_24px_80px_rgba(10,34,51,0.08)]">
+            <p className="text-sm uppercase tracking-[0.18em] text-sky-700">Members</p>
+            <p className="mt-3 text-4xl font-semibold text-slate-900">
+              {Object.values(memberCounts).reduce((total, count) => total + count, 0)}
+            </p>
+          </article>
+          <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[0_24px_80px_rgba(10,34,51,0.08)]">
+            <p className="text-sm uppercase tracking-[0.18em] text-sky-700">Sync</p>
+            <p className="mt-3 text-2xl font-semibold text-slate-900">
+              {roomStatus === 'ready' && memberStatus === 'ready' ? 'Live' : 'Loading'}
+            </p>
+          </article>
+        </section>
+
+        <section className="overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/90 shadow-[0_24px_80px_rgba(10,34,51,0.08)]">
+          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-900/10 px-6 py-5">
+            <div>
+              <p className="text-sm uppercase tracking-[0.18em] text-sky-700">
+                Firestore rooms
+              </p>
+              <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                Room operations dashboard
+              </h2>
+            </div>
+            <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700">
+              {rooms.length} active
+            </span>
+          </div>
+
+          {roomStatus === 'loading' || memberStatus === 'loading' ? (
+            <p className="px-6 py-10 text-base text-slate-600">Loading rooms...</p>
+          ) : null}
+          {roomStatus === 'error' || memberStatus === 'error' ? (
+            <p className="px-6 py-10 text-base text-rose-700">
+              Unable to load the admin room list from Firestore.
+            </p>
+          ) : null}
+          {roomStatus === 'ready' && rooms.length === 0 ? (
+            <p className="px-6 py-10 text-base text-slate-600">
+              No rooms have been created yet.
+            </p>
+          ) : null}
+
+          {roomStatus === 'ready' && memberStatus === 'ready' && rooms.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="min-w-full border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 text-left">
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Room
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Room type
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Current stage
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Members
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Updated
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rooms.map((room) => (
+                    <tr key={room.id} className="border-t border-slate-900/10 align-top">
+                      <td className="px-6 py-5">
+                        <div>
+                          <a
+                            href={`/room/${encodeURIComponent(room.id)}`}
+                            className="text-base font-semibold text-slate-900 underline decoration-slate-300 underline-offset-4 transition hover:decoration-sky-600"
+                          >
+                            {room.roomId || room.id}
+                          </a>
+                        </div>
+                      </td>
+                      <td className="px-6 py-5 text-sm text-slate-600">
+                        {room.roomTypeName || room.roomTemplate?.name || 'Custom Room'}
+                      </td>
+                      <td className="px-6 py-5 text-sm text-slate-600">
+                        {getRoomCurrentStage(room)}
+                      </td>
+                      <td className="px-6 py-5">
+                        <span className="inline-flex rounded-full bg-sky-50 px-3 py-1 text-sm font-medium text-sky-900">
+                          {memberCounts[room.id] ?? 0}
+                        </span>
+                      </td>
+                      <td className="px-6 py-5 text-sm text-slate-500">
+                        {formatRoomTimestamp(room.updatedAt || room.createdAt)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </section>
       </div>
     </main>
   )
@@ -2114,6 +2393,10 @@ function App() {
   if (roomMatch) {
     const roomId = decodeURIComponent(roomMatch[1])
     return <RoomPage roomId={roomId} />
+  }
+
+  if (pathname === '/admin') {
+    return <AdminPage />
   }
 
   if (pathname === '/') {
