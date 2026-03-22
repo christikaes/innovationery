@@ -1,0 +1,367 @@
+{
+  "id": "hackathon",
+  "fetchedAt": "2026-03-22T22:42:44.275Z",
+  "data": {
+    "activities": [
+      {
+        "description": "Quickly get to know each other and bond as a team",
+        "id": "activity-xcvlfsnv",
+        "title": "Intro",
+        "steps": [
+          {
+            "title": "Namaste World!",
+            "inputStepIds": [],
+            "id": "step-7vnj26by",
+            "data": {},
+            "durationMinutes": 1,
+            "type": "roundrobin",
+            "description": "",
+            "prompt": "Welcome to the team! Introduce yourself!"
+          },
+          {
+            "prompt": "What is a fun fact about you?",
+            "durationMinutes": 1,
+            "description": "",
+            "type": "roundrobin",
+            "data": {},
+            "id": "step-g5cv7rnq",
+            "title": "Fun Fact",
+            "inputStepIds": []
+          },
+          {
+            "data": {},
+            "prompt": "What is one thing you want to accomplish during this hackathon?",
+            "type": "roundrobin",
+            "durationMinutes": 1,
+            "description": "",
+            "title": "Hackathon Goals",
+            "inputStepIds": [],
+            "id": "step-jztk0aef"
+          },
+          {
+            "data": {},
+            "description": "",
+            "durationMinutes": 2,
+            "type": "roundrobin",
+            "prompt": "Why is the hackathon theme meaningful to you?",
+            "inputStepIds": [],
+            "title": "Hackathon Theme",
+            "id": "step-tdv83n0u"
+          }
+        ]
+      },
+      {
+        "title": "Problem Brainstorm",
+        "steps": [
+          {
+            "id": "step-5bvlw5py",
+            "title": "Problems Brainstorm",
+            "inputStepIds": [],
+            "type": "individual stickies",
+            "durationMinutes": 1,
+            "description": "There is no wrong answer! Think broadly and put down all your ideas",
+            "prompt": "Given the hackathon theme, what are some problems you could solve in this space?",
+            "data": {}
+          },
+          {
+            "inputStepIds": [
+              "step-5bvlw5py"
+            ],
+            "title": "Problems Grouping",
+            "id": "step-jbs0rymm",
+            "data": {},
+            "prompt": "Group together similar problems to start narrowing down the space",
+            "description": "You don't have to be exact here, just try to put similar pain points in the same bucket",
+            "type": "group stickies",
+            "durationMinutes": 1
+          },
+          {
+            "data": {
+              "numberOfVotes": 3
+            },
+            "prompt": "Pick the 3 problems that have the most potential for this hackathon",
+            "type": "voting",
+            "durationMinutes": 1,
+            "description": "You can put more than one vote on the same group if you feel passionately about it",
+            "title": "Vote on impactful problems",
+            "inputStepIds": [
+              "step-jbs0rymm"
+            ],
+            "id": "step-xy2lc04i"
+          },
+          {
+            "prompt": "Which of these do you think has the most potential for the hackathon?",
+            "description": "This is open discussion time! We will vote next so share your thoughts now",
+            "type": "card selection",
+            "durationMinutes": 2,
+            "data": {
+              "numberOfCards": 3
+            },
+            "id": "step-zmt7i7te",
+            "inputStepIds": [
+              "step-xy2lc04i"
+            ],
+            "title": "Discuss top Problems"
+          },
+          {
+            "data": {
+              "numberOfVotes": 1
+            },
+            "prompt": "Vote on the top problem it would be best for the team to work on during this hackathon",
+            "type": "voting",
+            "description": "",
+            "durationMinutes": 1,
+            "title": "Vote on primary problem",
+            "inputStepIds": [
+              "step-zmt7i7te"
+            ],
+            "id": "step-yqujzpbf"
+          },
+          {
+            "data": {
+              "numberOfCards": 1
+            },
+            "prompt": "Pick 1 problem that your team will address this hackathon",
+            "description": "",
+            "durationMinutes": 1,
+            "type": "card selection",
+            "title": "Problem Selection",
+            "inputStepIds": [
+              "step-yqujzpbf"
+            ],
+            "id": "step-1yrcwi5x"
+          }
+        ],
+        "id": "activity-eho7nfhl",
+        "description": "Brainstorm broadly about what problems your team can solve"
+      },
+      {
+        "steps": [
+          {
+            "durationMinutes": 1,
+            "type": "group fill in the blank",
+            "description": "",
+            "prompt": "What is the main pain point you are solving?",
+            "data": {
+              "text": "The main pain point is _"
+            },
+            "id": "step-xbzberb4",
+            "inputStepIds": [],
+            "title": "What?"
+          },
+          {
+            "data": {
+              "text": "The people that have this problem the most are _"
+            },
+            "prompt": "Who are you solving this for?",
+            "description": "",
+            "durationMinutes": 1,
+            "type": "group fill in the blank",
+            "title": "Who?",
+            "inputStepIds": [],
+            "id": "step-c1cx0ol5"
+          },
+          {
+            "data": {
+              "text": "It is important to solve this because _"
+            },
+            "prompt": "Why is it important that you solve it?",
+            "description": "",
+            "durationMinutes": 1,
+            "type": "group fill in the blank",
+            "inputStepIds": [],
+            "title": "Why?",
+            "id": "step-y7p8nl8v"
+          }
+        ],
+        "title": "Problem Statement",
+        "description": "Clearly define the problem you're solving",
+        "id": "activity-6le4rowr"
+      },
+      {
+        "id": "activity-q4mlwk5r",
+        "description": "Brainstorm broadly about what solutions your team can build",
+        "title": "Solution Brainstorm",
+        "steps": [
+          {
+            "id": "step-wg4xtmoz",
+            "title": "Solution Brainstorm",
+            "inputStepIds": [
+              "step-xbzberb4",
+              "step-c1cx0ol5",
+              "step-y7p8nl8v"
+            ],
+            "type": "individual stickies",
+            "description": "There is no wrong answer! Be creative and think outside of the box! Come up with as many solutions as you can think of",
+            "durationMinutes": 1,
+            "prompt": "What are some ways we could solve the problem we identified?",
+            "data": {}
+          },
+          {
+            "data": {},
+            "type": "group stickies",
+            "durationMinutes": 1,
+            "description": "",
+            "prompt": "Group together similar solutions to start narrowing down the space",
+            "inputStepIds": [
+              "step-wg4xtmoz"
+            ],
+            "title": "Solutions Grouping",
+            "id": "step-55st844a"
+          },
+          {
+            "id": "step-r5k59qec",
+            "title": "Vote on impactful solutions",
+            "inputStepIds": [
+              "step-55st844a"
+            ],
+            "type": "voting",
+            "durationMinutes": 1,
+            "description": "",
+            "prompt": "Pick the 3 solutions that have the most potential for this hackathon",
+            "data": {
+              "numberOfVotes": 3
+            }
+          },
+          {
+            "description": "This is open discussion time! We will vote next so share your thoughts now",
+            "type": "card selection",
+            "durationMinutes": 2,
+            "prompt": "Which of these do you think has the most potential for the hackathon?",
+            "data": {
+              "numberOfCards": 0
+            },
+            "id": "step-skakd0ga",
+            "inputStepIds": [
+              "step-r5k59qec"
+            ],
+            "title": "Discuss top Solutions"
+          },
+          {
+            "data": {
+              "numberOfVotes": 1
+            },
+            "prompt": "Vote on the top problem it would be best for the team to work on during this hackathon",
+            "type": "voting",
+            "description": "",
+            "durationMinutes": 1,
+            "title": "Vote on primary solution",
+            "inputStepIds": [
+              "step-skakd0ga"
+            ],
+            "id": "step-i8pui4ht"
+          },
+          {
+            "data": {
+              "numberOfCards": 0
+            },
+            "durationMinutes": 1,
+            "type": "card selection",
+            "description": "",
+            "prompt": "Pick 1 solution that your team will address this hackathon",
+            "title": "Solution Selection",
+            "inputStepIds": [
+              "step-i8pui4ht"
+            ],
+            "id": "step-0q6zp98z"
+          }
+        ]
+      },
+      {
+        "id": "activity-vzarim28",
+        "description": "Clearly define the solution you're building",
+        "title": "Value Proposition",
+        "steps": [
+          {
+            "data": {
+              "text": "Our solution to the problem is _"
+            },
+            "description": "",
+            "type": "group fill in the blank",
+            "durationMinutes": 1,
+            "prompt": "How will you solve the problem?",
+            "title": "How?",
+            "inputStepIds": [
+              "step-xbzberb4",
+              "step-c1cx0ol5",
+              "step-y7p8nl8v"
+            ],
+            "id": "step-32aqcr7g"
+          },
+          {
+            "title": "Which?",
+            "inputStepIds": [],
+            "id": "step-gjtiauzq",
+            "data": {
+              "text": "The technologies we will use are _"
+            },
+            "type": "group fill in the blank",
+            "description": "For example - are you going to build a mobile app or a web app? What tools will you use?",
+            "durationMinutes": 1,
+            "prompt": "Which technologies will you use to build your solution?"
+          },
+          {
+            "type": "group fill in the blank",
+            "durationMinutes": 1,
+            "description": "There isn't a lot of time during a hackathon so come up with a deadline as a team for when you want to have a rough prototype and presentation you can share with a mentor or friend. This will prepare you for your final pitch!",
+            "prompt": "When will you test your prototype and presentation?",
+            "data": {
+              "text": "We will tes"
+            },
+            "id": "step-caiux050",
+            "title": "When?",
+            "inputStepIds": []
+          }
+        ]
+      },
+      {
+        "id": "activity-jicrbaku",
+        "description": "Putting it all together so you have a starting point for the hackathon!",
+        "title": "Conclusion",
+        "steps": [
+          {
+            "id": "step-6t23ce5o",
+            "title": "Value Proposition",
+            "inputStepIds": [
+              "step-xbzberb4",
+              "step-c1cx0ol5",
+              "step-y7p8nl8v",
+              "step-32aqcr7g",
+              "step-gjtiauzq",
+              "step-caiux050"
+            ],
+            "description": "",
+            "type": "group fill in the blank",
+            "durationMinutes": 3,
+            "prompt": "Combine everything you brainstormed so far into a single value proposition statement",
+            "data": {
+              "text": "Our _(how)_ helps _(who)_ who are struggling with _(what)_ so that _(why)_."
+            }
+          },
+          {
+            "prompt": "",
+            "durationMinutes": 1,
+            "description": "",
+            "type": "roundrobin",
+            "data": {},
+            "id": "step-0plarceh",
+            "title": "What is one thing you are taking away from this workshop?",
+            "inputStepIds": []
+          },
+          {
+            "data": {},
+            "prompt": "",
+            "description": "",
+            "durationMinutes": 1,
+            "type": "roundrobin",
+            "title": "What do you think the team should do next?",
+            "inputStepIds": [],
+            "id": "step-jtvcxkm5"
+          }
+        ]
+      }
+    ],
+    "name": "Hackathon Brainstorm",
+    "description": "Guide teams from introductions into shared problem discovery and selection."
+  }
+}

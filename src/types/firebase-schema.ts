@@ -13,26 +13,6 @@ export interface FirebaseRoomMember {
 export interface FirebaseWorkflowStepState {
   startTime: string | null
   pauseTime: string | null
-}
-
-export interface FirebaseWorkflowCard {
-  id: string
-  activityId: string
-  activityTitle: string
-  activityIndex: number
-  sectionId: string
-  authorId: string
-  authorName: string
-  text: string
-  createdAt: string
-}
-
-export interface FirebaseWorkflowSectionState {
-  id: string
-  activityId: string
-  activityTitle: string
-  activityDescription: string
-  activityIndex: number
   cards: FirebaseWorkflowCard[]
 }
 
@@ -40,13 +20,25 @@ export interface FirebaseRoomWorkflowState {
   currentStepIndex: number
   startedAt: string | null
   steps: Record<string, FirebaseWorkflowStepState>
-  sections: Record<string, FirebaseWorkflowSectionState>
+}
+
+export interface FirebaseWorkflowCardMetadata {
+  variables?: string[]
+  groupId?: string | null
+}
+
+export interface FirebaseWorkflowCard {
+  id: string
+  authorId: string
+  authorName: string
+  text: string
+  createdAt: string
+  metadata?: FirebaseWorkflowCardMetadata
 }
 
 export interface FirebaseRoomDocument {
   workflowId: string | null
   workflowState: FirebaseRoomWorkflowState
-  members: Record<string, FirebaseRoomMember>
 }
 
 export interface FirebaseWorkflowStep {
@@ -56,6 +48,7 @@ export interface FirebaseWorkflowStep {
   type: string
   durationMinutes: number | null
   prompt: string
+  inputStepIds: string[]
   data: Record<string, string | number | boolean>
 }
 

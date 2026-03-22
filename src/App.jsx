@@ -12,6 +12,7 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
   onSnapshot,
   serverTimestamp,
   setDoc,
@@ -359,7 +360,7 @@ const workflowStepPalette = [
   },
   {
     id: 'individual-stickies',
-    label: 'Individual Cards',
+    label: 'Brainstrom Individually',
     type: 'individual stickies',
     instructions: 'People add cards privately before sharing.',
     input: [],
@@ -387,13 +388,15 @@ const workflowStepPalette = [
     },
   },
   {
-    id: 'open-discuss',
-    label: 'Discussion',
-    type: 'open discuss',
-    instructions: 'Open discussion around a set of options or outputs.',
-    input: ['Card', 'CardList', 'FillInTheBlankInputs'],
-    outputs: [],
-    data: {},
+    id: 'card-selection',
+    label: 'Card Selection',
+    type: 'card selection',
+    instructions: 'Participants select a limited number of cards from the available set.',
+    input: ['CardList'],
+    outputs: ['CardList'],
+    data: {
+      numberOfCards: 'number',
+    },
   },
   {
     id: 'group-fill',
@@ -412,14 +415,19 @@ function createEditorId(prefix) {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+function normalizeActivityType(activityType) {
+  return activityType === 'open discuss' ? 'card selection' : activityType
+}
+
 function serializeWorkflowStep(step) {
   return {
     id: step?.id || createEditorId('step'),
     title: step?.title || 'Untitled step',
     description: step?.description || '',
-    type: step?.activityType || step?.type || '',
+    type: normalizeActivityType(step?.activityType || step?.type || ''),
     durationMinutes: toNumber(step?.durationMinutes) ?? 0,
     prompt: step?.prompt || '',
+    inputStepIds: normalizeStepInputIds(step?.inputStepIds),
     data: step?.data && typeof step.data === 'object' ? step.data : {},
   }
 }
@@ -487,10 +495,20 @@ function getWorkflowPersistenceKey(template) {
 }
 
 function getStepTypeDefinition(activityType) {
+  const normalizedActivityType = normalizeActivityType(activityType)
+
   return (
-    workflowStepPalette.find((item) => item.type === activityType) ??
+    workflowStepPalette.find((item) => item.type === normalizedActivityType) ??
     workflowStepPalette[0]
   )
+}
+
+function getStepTypeLabel(activityType) {
+  if (!activityType) {
+    return 'Step'
+  }
+
+  return getStepTypeDefinition(activityType)?.label || activityType
 }
 
 function createStepDataFromDefinition(definition) {
@@ -498,6 +516,30 @@ function createStepDataFromDefinition(definition) {
     accumulator[key] = valueType === 'number' ? 0 : valueType === 'boolean' ? false : ''
     return accumulator
   }, {})
+}
+
+function normalizeStepInputIds(inputStepIds) {
+  if (!Array.isArray(inputStepIds)) {
+    return []
+  }
+
+  const uniqueIds = new Set()
+
+  inputStepIds.forEach((value) => {
+    if (typeof value !== 'string') {
+      return
+    }
+
+    const normalizedValue = value.trim()
+
+    if (!normalizedValue) {
+      return
+    }
+
+    uniqueIds.add(normalizedValue)
+  })
+
+  return [...uniqueIds]
 }
 
 function createWorkflowStep(activityType) {
@@ -511,6 +553,7 @@ function createWorkflowStep(activityType) {
     activityType: definition.type,
     durationMinutes: 0,
     data: createStepDataFromDefinition(definition),
+    inputStepIds: [],
   }
 }
 
@@ -562,29 +605,11 @@ function getWorkflowStepStateKey(step, index = 0) {
 
 function getDefaultStepStatePaths(step, index = 0) {
   const stepKey = getWorkflowStepStateKey(step, index)
-  const statePaths = [
+  return [
     `steps.${stepKey}.startTime`,
     `steps.${stepKey}.pauseTime`,
+    `steps.${stepKey}.cards`,
   ]
-
-  switch (step?.activityType) {
-    case 'individual stickies':
-      statePaths.push(`steps.${stepKey}.cards`)
-      break
-    case 'group stickies':
-      statePaths.push(`steps.${stepKey}.cards`, `steps.${stepKey}.groups`)
-      break
-    case 'voting':
-      statePaths.push(`steps.${stepKey}.cards`, `steps.${stepKey}.groups`, `steps.${stepKey}.votes`)
-      break
-    case 'group fill in the blank':
-      statePaths.push(`steps.${stepKey}.fillInTheBlank`)
-      break
-    default:
-      break
-  }
-
-  return statePaths
 }
 
 function getWorkflowStateValueForPath(path) {
@@ -592,16 +617,8 @@ function getWorkflowStateValueForPath(path) {
     return 0
   }
 
-  if (
-    path.endsWith('.cards') ||
-    path.endsWith('.groups') ||
-    path.endsWith('.votes')
-  ) {
+  if (path.endsWith('.cards')) {
     return []
-  }
-
-  if (path.endsWith('.fillInTheBlank')) {
-    return ''
   }
 
   return null
@@ -655,6 +672,68 @@ function deriveWorkflowState(steps, workflowStateSource) {
   return createWorkflowStateShape([...uniquePaths])
 }
 
+function normalizeWorkflowCardMetadata(card) {
+  const metadataSource =
+    card?.metadata && typeof card.metadata === 'object' && !Array.isArray(card.metadata)
+      ? card.metadata
+      : {}
+  const variablesSource =
+    Array.isArray(metadataSource.variables)
+      ? metadataSource.variables
+      : Array.isArray(card?.variables)
+        ? card.variables
+        : []
+  const variables = variablesSource
+    .filter((value) => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter(Boolean)
+  const groupIdSource =
+    typeof metadataSource.groupId === 'string'
+      ? metadataSource.groupId
+      : typeof card?.groupId === 'string'
+        ? card.groupId
+        : null
+  const metadata = {}
+
+  if (variables.length > 0) {
+    metadata.variables = variables
+  }
+
+  if (groupIdSource && groupIdSource.trim()) {
+    metadata.groupId = groupIdSource.trim()
+  }
+
+  return Object.keys(metadata).length > 0 ? metadata : undefined
+}
+
+function normalizeWorkflowCard(card, index = 0) {
+  if (!card || typeof card !== 'object') {
+    return null
+  }
+
+  const text = typeof card.text === 'string' ? card.text.trim() : ''
+
+  if (!text) {
+    return null
+  }
+
+  return {
+    id: typeof card.id === 'string' && card.id.trim() ? card.id : `card-${index + 1}`,
+    authorId: typeof card.authorId === 'string' ? card.authorId : '',
+    authorName: typeof card.authorName === 'string' ? card.authorName : '',
+    text,
+    createdAt:
+      typeof card.createdAt === 'string' && card.createdAt.trim()
+        ? card.createdAt
+        : new Date(0).toISOString(),
+    ...(normalizeWorkflowCardMetadata(card)
+      ? {
+          metadata: normalizeWorkflowCardMetadata(card),
+        }
+      : {}),
+  }
+}
+
 function synchronizeWorkflowDefinition(template) {
   if (!template) {
     return template
@@ -685,7 +764,45 @@ function synchronizeWorkflowDefinition(template) {
   }
 }
 
-function normalizeWorkflowRuntime(runtime, steps) {
+function buildLegacyStepCardsByKey(workflowStateSource, steps) {
+  const sectionsSource =
+    workflowStateSource?.sections && typeof workflowStateSource.sections === 'object'
+      ? workflowStateSource.sections
+      : {}
+
+  return Object.values(sectionsSource).reduce((accumulator, section) => {
+    if (!section || typeof section !== 'object') {
+      return accumulator
+    }
+
+    const sectionCards = Array.isArray(section.cards)
+      ? section.cards
+          .map((card, index) => normalizeWorkflowCard(card, index))
+          .filter(Boolean)
+      : []
+
+    if (sectionCards.length === 0) {
+      return accumulator
+    }
+
+    const matchingStepIndex = steps.findIndex((step) => step.activityId === section.activityId)
+    const fallbackStepIndex = steps.findIndex(
+      (step) => step.activityId === section.activityId && step.activityType === 'individual stickies',
+    )
+    const resolvedStepIndex = fallbackStepIndex >= 0 ? fallbackStepIndex : matchingStepIndex
+
+    if (resolvedStepIndex < 0) {
+      return accumulator
+    }
+
+    const stepKey = getWorkflowStepStateKey(steps[resolvedStepIndex], resolvedStepIndex)
+
+    accumulator[stepKey] = [...(accumulator[stepKey] ?? []), ...sectionCards]
+    return accumulator
+  }, {})
+}
+
+function normalizeWorkflowRuntime(runtime, steps, legacyStepCardsByKey = {}) {
   const normalizedSteps = steps.reduce((accumulator, step, index) => {
     const stepKey = getWorkflowStepStateKey(step, index)
     const persistedStepState = runtime?.steps?.[stepKey]
@@ -695,6 +812,11 @@ function normalizeWorkflowRuntime(runtime, steps) {
         typeof persistedStepState?.startTime === 'string' ? persistedStepState.startTime : null,
       pauseTime:
         typeof persistedStepState?.pauseTime === 'string' ? persistedStepState.pauseTime : null,
+      cards: Array.isArray(persistedStepState?.cards)
+        ? persistedStepState.cards
+            .map((card, cardIndex) => normalizeWorkflowCard(card, cardIndex))
+            .filter(Boolean)
+        : [...(legacyStepCardsByKey[stepKey] ?? [])],
     }
 
     return accumulator
@@ -706,11 +828,61 @@ function normalizeWorkflowRuntime(runtime, steps) {
   }
 }
 
+function getSeedCardsForStep(steps, stepIndex, runtime) {
+  const step = steps[stepIndex]
+
+  if (!step) {
+    return []
+  }
+
+  const normalizedRuntime = normalizeWorkflowRuntime(runtime, steps)
+  const referencedStepIds = normalizeStepInputIds(step.inputStepIds)
+
+  if (referencedStepIds.length > 0) {
+    const combinedCards = []
+
+    referencedStepIds.forEach((sourceStepId) => {
+      const sourceStepIndex = steps.findIndex((candidateStep) => candidateStep.id === sourceStepId)
+
+      if (sourceStepIndex < 0) {
+        return
+      }
+
+      const sourceStepKey = getWorkflowStepStateKey(steps[sourceStepIndex], sourceStepIndex)
+      const sourceCards = normalizedRuntime.steps[sourceStepKey]?.cards ?? []
+
+      sourceCards.forEach((card) => {
+        combinedCards.push({ ...card })
+      })
+    })
+
+    return combinedCards
+  }
+
+  const previousStepKey =
+    stepIndex > 0
+      ? getWorkflowStepStateKey(steps[stepIndex - 1], stepIndex - 1)
+      : null
+
+  if (
+    previousStepKey &&
+    ['group stickies', 'voting', 'card selection', 'group fill in the blank'].includes(
+      normalizeActivityType(step.activityType),
+    )
+  ) {
+    return (normalizedRuntime.steps[previousStepKey]?.cards ?? []).map((card) => ({ ...card }))
+  }
+
+  return []
+}
+
 function createWorkflowRuntimeForStep(steps, stepIndex, runtime, timestamp = new Date()) {
   const normalizedRuntime = normalizeWorkflowRuntime(runtime, steps)
   const boundedStepIndex =
     steps.length > 0 ? Math.max(0, Math.min(stepIndex, steps.length - 1)) : 0
   const stepKey = getWorkflowStepStateKey(steps[boundedStepIndex], boundedStepIndex)
+  const existingCards = stepKey ? normalizedRuntime.steps[stepKey]?.cards ?? [] : []
+  const seededCards = getSeedCardsForStep(steps, boundedStepIndex, normalizedRuntime)
 
   return {
     ...normalizedRuntime,
@@ -723,6 +895,10 @@ function createWorkflowRuntimeForStep(steps, stepIndex, runtime, timestamp = new
               ...(normalizedRuntime.steps[stepKey] ?? {}),
               startTime: timestamp.toISOString(),
               pauseTime: null,
+              cards:
+                existingCards.length > 0
+                  ? existingCards
+                  : seededCards,
             },
           }
         : {}),
@@ -845,7 +1021,7 @@ function normalizePipelineStep(step, index) {
     }
   }
 
-  const activityType = step.activityType || step.type || step.format || ''
+  const activityType = normalizeActivityType(step.activityType || step.type || step.format || '')
   const stepTypeDefinition = getStepTypeDefinition(activityType)
   const normalizedData = createStepDataFromDefinition(stepTypeDefinition)
 
@@ -862,6 +1038,7 @@ function normalizePipelineStep(step, index) {
       step.durationMinutes ?? step.minutes ?? step.duration,
     ),
     prompt: step.prompt || '',
+    inputStepIds: normalizeStepInputIds(step.inputStepIds),
     data: normalizedData,
   }
 }
@@ -1132,64 +1309,34 @@ function normalizeMembers(room, persistedMembers) {
     .map(([, value]) => value)
 }
 
+function normalizeRoomMemberDocument(memberId, member) {
+  if (!member || typeof member !== 'object') {
+    return null
+  }
+
+  return {
+    ...member,
+    id: member.id || memberId,
+  }
+}
+
 function normalizeRoomWorkflowState(workflowStateSource, steps) {
-  const runtime = normalizeWorkflowRuntime(workflowStateSource, steps)
-  const sectionsSource =
-    workflowStateSource?.sections && typeof workflowStateSource.sections === 'object'
-      ? workflowStateSource.sections
-      : {}
-
-  const sections = Object.entries(sectionsSource).reduce((accumulator, [sectionId, section]) => {
-    if (!section || typeof section !== 'object') {
-      return accumulator
-    }
-
-    accumulator[sectionId] = {
-      id: sectionId,
-      activityId:
-        typeof section.activityId === 'string' && section.activityId.trim()
-          ? section.activityId
-          : sectionId,
-      activityTitle: typeof section.activityTitle === 'string' ? section.activityTitle : '',
-      activityDescription:
-        typeof section.activityDescription === 'string' ? section.activityDescription : '',
-      activityIndex: toNumber(section.activityIndex) ?? 0,
-      cards: Array.isArray(section.cards) ? section.cards.filter(Boolean) : [],
-    }
-
-    return accumulator
-  }, {})
+  const legacyStepCardsByKey = buildLegacyStepCardsByKey(workflowStateSource, steps)
+  const runtime = normalizeWorkflowRuntime(workflowStateSource, steps, legacyStepCardsByKey)
 
   return {
     currentStepIndex: runtime.currentStepIndex,
     startedAt:
       typeof workflowStateSource?.startedAt === 'string' ? workflowStateSource.startedAt : null,
     steps: runtime.steps,
-    sections,
   }
 }
 
 function normalizeRoomDocument(room) {
-  const normalizedMembersSource =
-    room?.members && typeof room.members === 'object' && !Array.isArray(room.members)
-      ? room.members
-      : {}
-
   return {
     workflowId: typeof room?.workflowId === 'string' ? room.workflowId : null,
     workflowState:
       room?.workflowState && typeof room.workflowState === 'object' ? room.workflowState : {},
-    members: Object.entries(normalizedMembersSource).reduce((accumulator, [memberId, member]) => {
-      if (!member || typeof member !== 'object') {
-        return accumulator
-      }
-
-      accumulator[memberId] = {
-        ...member,
-        id: member.id || memberId,
-      }
-      return accumulator
-    }, {}),
   }
 }
 
@@ -1200,7 +1347,7 @@ function hasStrictRoomSchema(room) {
 
   const keys = Object.keys(room)
 
-  return keys.every((key) => ['workflowId', 'workflowState', 'members'].includes(key))
+  return keys.every((key) => ['workflowId', 'workflowState'].includes(key))
 }
 
 function hasStrictWorkflowSchema(workflow) {
@@ -1345,6 +1492,18 @@ async function upsertRoomMembership({
     { merge: true },
   )
 
+  const roomMemberRef = doc(db, 'rooms', roomId, 'members', memberKey)
+  const roomMemberSnapshot = await getDoc(roomMemberRef)
+  const roomMember = {
+    ...member,
+    lastSeenAt: new Date().toISOString(),
+    createdAt:
+      roomMemberSnapshot.data()?.createdAt ??
+      (created ? new Date().toISOString() : null),
+  }
+
+  await setDoc(roomMemberRef, roomMember, { merge: true })
+
   await updateRoomDocument(roomId, (currentRoom) => {
     const resolvedWorkflowId =
       workflowId ?? currentRoom.workflowId ?? null
@@ -1352,20 +1511,10 @@ async function upsertRoomMembership({
     return {
       workflowId: resolvedWorkflowId,
       workflowState: currentRoom.workflowState ?? {},
-      members: {
-        ...currentRoom.members,
-        [memberKey]: {
-          ...member,
-          lastSeenAt: new Date().toISOString(),
-          createdAt:
-            currentRoom.members?.[memberKey]?.createdAt ??
-            (created ? new Date().toISOString() : null),
-        },
-      },
     }
   })
 
-  return member
+  return roomMember
 }
 
 function HomePage() {
@@ -1573,7 +1722,7 @@ function HomePage() {
           </p>
           <div className="relative mt-8 flex flex-wrap items-center gap-4">
             <a
-              href="/room/demo-room"
+                href="/room/demo"
               className={gradientButtonMediumClass}
             >
               Demo
@@ -2126,10 +2275,17 @@ function AdminPage() {
   const [rooms, setRooms] = useState([])
   const [roomStatus, setRoomStatus] = useState('loading')
   const [workflowSeedStatus, setWorkflowSeedStatus] = useState('loading')
-  const memberCounts = rooms.reduce((counts, room) => {
-    counts[room.id] = normalizeMembers(room, []).length
-    return counts
-  }, {})
+  const [memberCounts, setMemberCounts] = useState({})
+  const sortedRooms = [...rooms].sort((left, right) => {
+    const leftMemberCount = memberCounts[left.id] ?? 0
+    const rightMemberCount = memberCounts[right.id] ?? 0
+
+    if (leftMemberCount !== rightMemberCount) {
+      return rightMemberCount - leftMemberCount
+    }
+
+    return left.id.localeCompare(right.id)
+  })
 
   useEffect(() => {
     let cancelled = false
@@ -2179,17 +2335,6 @@ function AdminPage() {
           ...normalizeRoomDocument(roomDoc.data()),
         }))
 
-        nextRooms.sort((left, right) => {
-          const leftMemberCount = Object.keys(left.members ?? {}).length
-          const rightMemberCount = Object.keys(right.members ?? {}).length
-
-          if (leftMemberCount !== rightMemberCount) {
-            return rightMemberCount - leftMemberCount
-          }
-
-          return left.id.localeCompare(right.id)
-        })
-
         setRooms(nextRooms)
         setRoomStatus('ready')
       },
@@ -2201,6 +2346,34 @@ function AdminPage() {
 
     return unsubscribe
   }, [])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadMemberCounts() {
+      const entries = await Promise.all(
+        rooms.map(async (room) => {
+          const snapshot = await getDocs(collection(db, 'rooms', room.id, 'members'))
+          return [room.id, snapshot.size]
+        }),
+      )
+
+      if (!cancelled) {
+        setMemberCounts(Object.fromEntries(entries))
+      }
+    }
+
+    if (rooms.length === 0) {
+      setMemberCounts({})
+      return undefined
+    }
+
+    void loadMemberCounts()
+
+    return () => {
+      cancelled = true
+    }
+  }, [rooms])
 
   return (
     <main className="min-h-screen bg-[image:var(--theme-bg-admin)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
@@ -2314,7 +2487,7 @@ function AdminPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {rooms.map((room) => (
+                  {sortedRooms.map((room) => (
                     <tr key={room.id} className="border-t border-slate-900/10 align-top">
                       <td className="px-6 py-5">
                         <div>
@@ -2779,17 +2952,51 @@ function WorkflowEditorPage({ workflowId }) {
     selectedNode.type === 'step' && selectedActivity
       ? selectedActivity.steps[selectedNode.stepIndex ?? -1] ?? null
       : null
+  const getActivityDurationMinutes = (activity) =>
+    (activity?.steps ?? []).reduce(
+      (total, step) => total + (toNumber(step?.durationMinutes) ?? 0),
+      0,
+    )
+  const workflowDurationMinutes = (workflowDefinition?.workflow?.activities ?? []).reduce(
+    (total, activity) => total + getActivityDurationMinutes(activity),
+    0,
+  )
+  const selectedActivityDurationMinutes = selectedActivity
+    ? getActivityDurationMinutes(selectedActivity)
+    : 0
   const selectedStepTypeDefinition = selectedStep
     ? getStepTypeDefinition(selectedStep.activityType)
     : null
-  const workflowStatePreview = JSON.stringify(
-    deriveWorkflowState(
-      workflowDefinition?.workflow?.steps ?? [],
-      workflowDefinition?.workflow?.state ?? {},
-    ),
-    null,
-    2,
-  )
+  const previousStepOptions =
+    selectedStep && workflowDefinition
+      ? workflowDefinition.workflow.activities.flatMap((activity, activityIndex) =>
+          activity.steps.flatMap((step, stepIndex) => {
+            const isSelectedStepPosition =
+              activityIndex === selectedNode.activityIndex && stepIndex === selectedNode.stepIndex
+
+            if (
+              activityIndex > selectedNode.activityIndex ||
+              isSelectedStepPosition
+            ) {
+              return []
+            }
+
+            if (
+              activityIndex === selectedNode.activityIndex &&
+              stepIndex > (selectedNode.stepIndex ?? -1)
+            ) {
+              return []
+            }
+
+            return [
+              {
+                id: step.id,
+                label: `${activity.title} - ${step.title || step.id}`,
+              },
+            ]
+          }),
+        )
+      : []
 
   if (editorStatus === 'loading' || !workflowDefinition) {
     return (
@@ -2848,17 +3055,9 @@ function WorkflowEditorPage({ workflowId }) {
                 className="min-h-24 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
               />
             </label>
-            <label className="grid gap-2 text-sm font-medium text-slate-800">
-              Workflow State
-              <textarea
-                value={workflowStatePreview}
-                readOnly
-                className="min-h-36 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 font-mono text-sm text-slate-900 outline-none"
-              />
-              <p className="text-xs text-slate-500">
-                Auto-derived list of workflow state keys that will be persisted to Firebase for this workflow.
-              </p>
-            </label>
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+              Workflow Duration: <span className="font-semibold text-slate-900">{workflowDurationMinutes} min</span>
+            </div>
           </div>
         </section>
 
@@ -2899,7 +3098,7 @@ function WorkflowEditorPage({ workflowId }) {
                         <p className={`text-xs uppercase tracking-[0.18em] ${
                           isSelectedActivity ? 'text-slate-300' : 'text-slate-500'
                         }`}>
-                          Activity {activityIndex + 1}
+                          Activity {activityIndex + 1} · {getActivityDurationMinutes(activity)} min
                         </p>
                         <h3 className={`mt-1 truncate text-base font-semibold ${
                           isSelectedActivity ? 'text-white' : 'text-slate-900'
@@ -2998,7 +3197,7 @@ function WorkflowEditorPage({ workflowId }) {
                                 <div className="min-w-0 flex-1 cursor-pointer text-left">
                                   <p className="truncate font-medium">{step.title || `Step ${stepIndex + 1}`}</p>
                                   <p className={`mt-1 text-xs ${isSelectedStep ? 'text-slate-300' : 'text-slate-500'}`}>
-                                    {step.activityType || 'Step'}
+                                    {getStepTypeLabel(step.activityType)}
                                   </p>
                                 </div>
                                 <div className="flex items-center gap-2">
@@ -3072,6 +3271,15 @@ function WorkflowEditorPage({ workflowId }) {
                   {selectedNode.type === 'activity' ? (
                     <div className="mt-4 grid gap-4">
                       <label className="grid gap-2 text-sm font-medium text-slate-800">
+                        Activity ID
+                        <input
+                          type="text"
+                          value={selectedActivity.id || ''}
+                          readOnly
+                          className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 font-mono text-sm text-slate-900 outline-none"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800">
                         Activity Title
                         <input
                           type="text"
@@ -3082,9 +3290,40 @@ function WorkflowEditorPage({ workflowId }) {
                           className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
                         />
                       </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800">
+                        Activity Description
+                        <textarea
+                          value={selectedActivity.description || ''}
+                          onChange={(event) =>
+                            updateActivity(selectedNode.activityIndex, 'description', event.target.value)
+                          }
+                          className="min-h-24 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                      </label>
+                      <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                        Activity Duration: <span className="font-semibold text-slate-900">{selectedActivityDurationMinutes} min</span>
+                      </div>
                     </div>
                   ) : selectedStep ? (
                     <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
+                        Activity ID
+                        <input
+                          type="text"
+                          value={selectedActivity?.id || ''}
+                          readOnly
+                          className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 font-mono text-sm text-slate-900 outline-none"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
+                        Step ID
+                        <input
+                          type="text"
+                          value={selectedStep.id || ''}
+                          readOnly
+                          className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 font-mono text-sm text-slate-900 outline-none"
+                        />
+                      </label>
                       <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
                         Step Type
                         <select
@@ -3223,6 +3462,39 @@ function WorkflowEditorPage({ workflowId }) {
                           ))}
                         </div>
                       ) : null}
+                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
+                        Input Card Step IDs
+                        <select
+                          multiple
+                          size={Math.min(Math.max(previousStepOptions.length + 1, 4), 10)}
+                          value={
+                            (selectedStep.inputStepIds ?? []).length > 0
+                              ? selectedStep.inputStepIds
+                              : ['__none__']
+                          }
+                          onChange={(event) =>
+                            updateStep(
+                              selectedNode.activityIndex,
+                              selectedNode.stepIndex,
+                              'inputStepIds',
+                              Array.from(event.target.selectedOptions, (option) => option.value).includes('__none__')
+                                ? []
+                                : Array.from(event.target.selectedOptions, (option) => option.value),
+                            )
+                          }
+                          className="min-h-48 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-500"
+                        >
+                          <option value="__none__">No previous steps</option>
+                          {previousStepOptions.map((stepOption) => (
+                            <option key={stepOption.id} value={stepOption.id}>
+                              {`${stepOption.label} (${stepOption.id})`}
+                            </option>
+                          ))}
+                        </select>
+                        <p className="text-xs text-slate-500">
+                          Select one or more previous steps. Cards from those step outputs will be combined for this step.
+                        </p>
+                      </label>
                     </div>
                   ) : null}
                 </section>
@@ -3237,6 +3509,7 @@ function WorkflowEditorPage({ workflowId }) {
 function RoomPage({ roomId }) {
   const [room, setRoom] = useState(null)
   const [authUser, setAuthUser] = useState(() => auth.currentUser)
+  const [members, setMembers] = useState([])
   const [workflowDefinition, setWorkflowDefinition] = useState(null)
   const [workflowStatus, setWorkflowStatus] = useState('loading')
   const [brainstormDraft, setBrainstormDraft] = useState('')
@@ -3251,7 +3524,7 @@ function RoomPage({ roomId }) {
   const [nowMs, setNowMs] = useState(() => Date.now())
   const [roundRobinOrder, setRoundRobinOrder] = useState([])
   const [completedRoundRobinSpeakerIds, setCompletedRoundRobinSpeakerIds] = useState([])
-  const isDemoRoom = roomId.trim().toLowerCase() === 'demo-room'
+  const isDemoRoom = roomId.trim().toLowerCase() === 'demo'
   const demoTemplate =
     normalizedFallbackRoomTemplates.find((template) => template.id === 'hackathon') ?? null
 
@@ -3273,6 +3546,24 @@ function RoomPage({ roomId }) {
       () => {
         setRoom(null)
         setStatus('error')
+      },
+    )
+
+    return unsubscribe
+  }, [roomId])
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      collection(db, 'rooms', roomId, 'members'),
+      (snapshot) => {
+        const nextMembers = snapshot.docs
+          .map((memberDoc) => normalizeRoomMemberDocument(memberDoc.id, memberDoc.data()))
+          .filter(Boolean)
+
+        setMembers(nextMembers)
+      },
+      () => {
+        setMembers([])
       },
     )
 
@@ -3334,13 +3625,12 @@ function RoomPage({ roomId }) {
     return unsubscribe
   }, [room?.workflowId])
 
-  const members = normalizeMembers(room, [])
-    .sort((left, right) =>
-      getMemberDisplayName(left).localeCompare(getMemberDisplayName(right)),
-    )
+  const sortedMembers = [...members].sort((left, right) =>
+    getMemberDisplayName(left).localeCompare(getMemberDisplayName(right)),
+  )
   const currentMember =
     authUser
-      ? members.find(
+      ? sortedMembers.find(
           (member) =>
             member.authUid === authUser.uid ||
             (authUser.email && member.email === authUser.email),
@@ -3352,19 +3642,18 @@ function RoomPage({ roomId }) {
       return undefined
     }
 
+    const memberId = currentMember.id
+    const memberSnapshot = currentMember
     const setPresence = (isOnline) =>
-      updateRoomDocument(roomId, (currentRoom) => ({
-        workflowId: currentRoom.workflowId,
-        workflowState: currentRoom.workflowState,
-        members: {
-          ...currentRoom.members,
-          [currentMember.id]: {
-            ...(currentRoom.members?.[currentMember.id] ?? currentMember),
-            isOnline,
-            lastSeenAt: new Date().toISOString(),
-          },
+      setDoc(
+        doc(db, 'rooms', roomId, 'members', memberId),
+        {
+          ...memberSnapshot,
+          isOnline,
+          lastSeenAt: new Date().toISOString(),
         },
-      }))
+        { merge: true },
+      )
 
     void setPresence(true)
 
@@ -3441,8 +3730,11 @@ function RoomPage({ roomId }) {
       ? Math.min(workflowRuntime.currentStepIndex, workflowSequence.length - 1)
       : 0
   const currentStep = workflowSequence[safeCurrentStepIndex] ?? null
+  const currentStepKey = currentStep
+    ? getWorkflowStepStateKey(currentStep, safeCurrentStepIndex)
+    : null
   const currentStepRuntime = currentStep
-    ? workflowRuntime.steps[getWorkflowStepStateKey(currentStep, safeCurrentStepIndex)] ?? null
+    ? workflowRuntime.steps[currentStepKey] ?? null
     : null
   const hasWorkflowStarted = Boolean(roomWorkflowState.startedAt)
   const currentActivityIndex = currentStep?.activityIndex ?? 0
@@ -3455,7 +3747,7 @@ function RoomPage({ roomId }) {
     : 0
   const isPaused = Boolean(currentStepRuntime?.pauseTime)
   const roundRobinMembers = roundRobinOrder
-    .map((memberId) => members.find((member) => member.id === memberId))
+    .map((memberId) => sortedMembers.find((member) => member.id === memberId))
     .filter(Boolean)
   const roundRobinSpeakerCount = roundRobinMembers.length
   const activeRoundRobinMember =
@@ -3511,16 +3803,15 @@ function RoomPage({ roomId }) {
   const stepProgressPercent =
     workflowSequence.length > 0 ? (displayedCompletedSteps / workflowSequence.length) * 100 : 0
   const compactRadialCircumference = 2 * Math.PI * 18
-  const currentSectionId = currentStep?.activityId ?? null
-  const currentActivityCards = currentSectionId
-    ? roomWorkflowState.sections?.[currentSectionId]?.cards ?? []
+  const currentStepCards = currentStepKey
+    ? roomWorkflowState.steps?.[currentStepKey]?.cards ?? []
     : []
   const shouldRevealAllBrainstormCards = isGroupBrainstormStep
   const shouldPromptForRoomIdentity = !currentMember?.id && (status === 'ready' || isDemoRoom)
-  const visibleBrainstormCardCount = currentActivityCards.filter(
+  const visibleBrainstormCardCount = currentStepCards.filter(
     (card) => shouldRevealAllBrainstormCards || card.authorId === currentMember?.id,
   ).length
-  const hiddenBrainstormCardCount = currentActivityCards.length - visibleBrainstormCardCount
+  const hiddenBrainstormCardCount = currentStepCards.length - visibleBrainstormCardCount
   const persistWorkflowState = async (updater) => {
     await updateRoomDocument(roomId, (currentRoom) => {
       const currentWorkflowState = normalizeRoomWorkflowState(currentRoom.workflowState, workflowSequence)
@@ -3530,7 +3821,6 @@ function RoomPage({ roomId }) {
       return {
         workflowId: currentRoom.workflowId ?? room?.workflowId ?? demoTemplate?.id ?? null,
         workflowState: nextWorkflowState,
-        members: currentRoom.members,
       }
     })
   }
@@ -3627,7 +3917,7 @@ function RoomPage({ roomId }) {
 
     const trimmedDraft = brainstormDraft.trim()
 
-    if (!trimmedDraft || !currentMember?.id || !currentStep?.activityId || !isIndividualBrainstormStep) {
+    if (!trimmedDraft || !currentMember?.id || !currentStepKey || !isIndividualBrainstormStep) {
       return
     }
 
@@ -3635,29 +3925,22 @@ function RoomPage({ roomId }) {
 
     try {
       await persistWorkflowState((currentWorkflowState) => {
-        const currentSection = currentWorkflowState.sections?.[currentSectionId] ?? {
-          id: currentSectionId,
-          activityId: currentStep.activityId,
-          activityTitle: currentStep.activityTitle ?? '',
-          activityDescription: currentStep.activityDescription ?? '',
-          activityIndex: currentStep.activityIndex ?? 0,
+        const currentStepState = currentWorkflowState.steps?.[currentStepKey] ?? {
+          startTime: null,
+          pauseTime: null,
           cards: [],
         }
 
         return {
           ...currentWorkflowState,
-          sections: {
-            ...currentWorkflowState.sections,
-            [currentSectionId]: {
-              ...currentSection,
+          steps: {
+            ...currentWorkflowState.steps,
+            [currentStepKey]: {
+              ...currentStepState,
               cards: [
-                ...currentSection.cards,
+                ...currentStepState.cards,
                 {
                   id: createEditorId('card'),
-                  activityId: currentStep.activityId,
-                  activityTitle: currentStep.activityTitle ?? '',
-                  activityIndex: currentStep.activityIndex ?? 0,
-                  sectionId: currentSectionId,
                   authorId: currentMember.id,
                   authorName: getMemberDisplayName(currentMember),
                   text: trimmedDraft,
@@ -4491,7 +4774,7 @@ function RoomPage({ roomId }) {
                     </div>
                     <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-100/70">
                       <p>
-                        {currentActivityCards.length} card{currentActivityCards.length === 1 ? '' : 's'}
+                        {currentStepCards.length} card{currentStepCards.length === 1 ? '' : 's'}
                       </p>
                       {hiddenBrainstormCardCount > 0 ? (
                         <p className="mt-1 text-xs uppercase tracking-[0.14em] text-slate-500">
@@ -4538,8 +4821,8 @@ function RoomPage({ roomId }) {
                   ) : null}
 
                   <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                    {currentActivityCards.length > 0 ? (
-                      currentActivityCards.map((card) => {
+                    {currentStepCards.length > 0 ? (
+                      currentStepCards.map((card) => {
                         const isCurrentUsersCard = card.authorId === currentMember?.id
                         const isHiddenCard = !shouldRevealAllBrainstormCards && !isCurrentUsersCard
 
@@ -4576,8 +4859,8 @@ function RoomPage({ roomId }) {
                     ) : (
                       <div className="rounded-[1.5rem] border border-dashed border-white/15 bg-white/5 px-5 py-10 text-sm text-slate-300 md:col-span-2 xl:col-span-3">
                         {isIndividualBrainstormStep
-                          ? 'No cards yet. Add the first idea for this activity.'
-                          : 'No cards were added during the individual brainstorm.'}
+                          ? 'No cards yet. Add the first idea for this step.'
+                          : 'No cards are available for this step yet.'}
                       </div>
                     )}
                   </div>
