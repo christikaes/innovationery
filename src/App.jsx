@@ -16,6 +16,14 @@ import {
 } from 'firebase/firestore'
 import { auth, db } from './firebase.js'
 
+function formatCountdown(totalSeconds) {
+  const safeSeconds = Math.max(0, totalSeconds)
+  const minutes = Math.floor(safeSeconds / 60)
+  const seconds = safeSeconds % 60
+
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
 const fallbackRoomTemplates = [
   {
     id: 'hackathon',
@@ -1372,8 +1380,10 @@ function RoomPage({ roomId }) {
   const [room, setRoom] = useState(null)
   const [persistedMembers, setPersistedMembers] = useState([])
   const [status, setStatus] = useState('loading')
-  const [memberStatus, setMemberStatus] = useState('loading')
   const [banner, setBanner] = useState(() => readRoomBanner(roomId))
+  const [currentStepIndex, setCurrentStepIndex] = useState(0)
+  const [remainingSeconds, setRemainingSeconds] = useState(0)
+  const [isPaused, setIsPaused] = useState(false)
   const currentMember = JSON.parse(
     window.localStorage.getItem(`innovationery:room-member:${roomId}`) || 'null',
   )
@@ -1405,11 +1415,9 @@ function RoomPage({ roomId }) {
       collection(db, 'rooms', roomId, 'members'),
       (snapshot) => {
         setPersistedMembers(snapshot.docs.map((memberDoc) => memberDoc.data()))
-        setMemberStatus('ready')
       },
       () => {
         setPersistedMembers([])
-        setMemberStatus('error')
       },
     )
 
@@ -1461,38 +1469,244 @@ function RoomPage({ roomId }) {
     .sort((left, right) =>
       getMemberDisplayName(left).localeCompare(getMemberDisplayName(right)),
     )
+  const workflowActivities =
+    roomWorkflow?.activities?.length
+      ? roomWorkflow.activities
+      : roomWorkflow?.steps?.length
+        ? [
+            {
+              id: 'default-activity',
+              title: roomWorkflow.title || 'Workflow',
+              description: roomWorkflow.description || '',
+              totalMinutes: roomWorkflow.totalMinutes ?? null,
+              steps: roomWorkflow.steps,
+            },
+          ]
+        : []
+  const workflowSequence = workflowActivities.flatMap((activity, activityIndex) =>
+    activity.steps.map((step, stepIndex) => {
+      const stepsBeforeActivity = workflowActivities
+        .slice(0, activityIndex)
+        .reduce((total, segment) => total + segment.steps.length, 0)
+
+      return {
+        ...step,
+        activityId: activity.id || `activity-${activityIndex + 1}`,
+        activityTitle: activity.title,
+        activityDescription: activity.description,
+        activityIndex,
+        stepIndex,
+        sequenceIndex: stepsBeforeActivity + stepIndex,
+      }
+    }),
+  )
+  const safeCurrentStepIndex =
+    workflowSequence.length > 0 ? Math.min(currentStepIndex, workflowSequence.length - 1) : 0
+  const currentStep = workflowSequence[safeCurrentStepIndex] ?? null
+  const currentActivityIndex = currentStep?.activityIndex ?? 0
+  const isWorkflowComplete = workflowSequence.length > 0 && safeCurrentStepIndex === workflowSequence.length - 1 && remainingSeconds === 0
+  const firstStepDurationSeconds = (workflowSequence[0]?.durationMinutes ?? 0) * 60
+  const nextStepDurationSeconds =
+    (workflowSequence[safeCurrentStepIndex + 1]?.durationMinutes ?? 0) * 60
+  const currentStepDurationSeconds = (currentStep?.durationMinutes ?? 0) * 60
+  const currentStepProgressPercent =
+    currentStepDurationSeconds > 0
+      ? Math.min(
+          100,
+          Math.max(
+            0,
+            ((currentStepDurationSeconds - remainingSeconds) / currentStepDurationSeconds) * 100,
+          ),
+        )
+      : 0
+  const moveToStep = (stepIndex) => {
+    const nextIndex = Math.max(0, Math.min(stepIndex, workflowSequence.length - 1))
+    const nextStep = workflowSequence[nextIndex]
+
+    setCurrentStepIndex(nextIndex)
+    setRemainingSeconds((nextStep?.durationMinutes ?? 0) * 60)
+    setIsPaused(false)
+  }
+  const completeCurrentStep = () => {
+    if (!currentStep) {
+      return
+    }
+
+    if (safeCurrentStepIndex < workflowSequence.length - 1) {
+      moveToStep(safeCurrentStepIndex + 1)
+      return
+    }
+
+    setRemainingSeconds(0)
+    setIsPaused(false)
+  }
+
+  useEffect(() => {
+    if (workflowSequence.length === 0) {
+      return undefined
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setCurrentStepIndex(0)
+      setRemainingSeconds(firstStepDurationSeconds)
+      setIsPaused(false)
+    }, 0)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [firstStepDurationSeconds, roomId, workflowSequence.length])
+
+  useEffect(() => {
+    if (!currentStep || workflowSequence.length === 0) {
+      return undefined
+    }
+
+    if (isPaused) {
+      return undefined
+    }
+
+    if (remainingSeconds > 0) {
+      const intervalId = window.setInterval(() => {
+        setRemainingSeconds((seconds) => Math.max(0, seconds - 1))
+      }, 1000)
+
+      return () => window.clearInterval(intervalId)
+    }
+
+    if (safeCurrentStepIndex < workflowSequence.length - 1) {
+      const timeoutId = window.setTimeout(() => {
+        const nextIndex = safeCurrentStepIndex + 1
+
+        setCurrentStepIndex(nextIndex)
+        setRemainingSeconds(nextStepDurationSeconds)
+        setIsPaused(false)
+      }, 1200)
+
+      return () => window.clearTimeout(timeoutId)
+    }
+
+    return undefined
+  }, [
+    currentStep,
+    isPaused,
+    nextStepDurationSeconds,
+    remainingSeconds,
+    safeCurrentStepIndex,
+    workflowSequence.length,
+  ])
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.14),_transparent_30%),linear-gradient(180deg,_#f8fbff_0%,_#eef4ff_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
-      <div className="mx-auto grid min-h-[calc(100vh-3rem)] max-w-5xl gap-6">
-        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-10 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:px-10 md:py-14">
+      <div className="mx-auto grid min-h-[calc(100vh-3rem)] max-w-7xl gap-6">
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-8 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur md:px-8 md:py-9">
           <div className="absolute -right-12 top-0 h-56 w-56 rounded-full bg-[radial-gradient(circle,_rgba(14,165,233,0.18),_transparent_70%)]" />
-          <p className="relative text-xs uppercase tracking-[0.24em] text-sky-700">
-            Room Page
-          </p>
-          <h1 className="relative mt-4 font-serif text-5xl leading-tight tracking-tight text-slate-900 sm:text-6xl">
-            Room {roomId}
-          </h1>
-          <p className="relative mt-6 max-w-2xl text-lg leading-8 text-slate-600">
-            {status === 'ready'
-              ? `This room is connected to Firestore and currently shows ${members.length} member${members.length === 1 ? '' : 's'} in realtime.`
-              : 'This route is wired for room-specific experiences. Use the room id from the URL to load presence, boards, chat, or other room-scoped data.'}
-          </p>
-          <div className="relative mt-8 flex flex-wrap items-center gap-4">
-            <code className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100">
-              /room/{roomId}
-            </code>
-            {roomTypeName ? (
-              <span className="rounded-full bg-sky-100 px-4 py-2 text-sm font-medium text-sky-900">
-                {roomTypeName}
-              </span>
-            ) : null}
-            <a
-              href="/"
-              className="inline-flex min-h-12 items-center rounded-full bg-sky-900 px-5 text-sm font-medium text-white transition hover:brightness-110"
-            >
-              Back home
-            </a>
+          <div className="relative flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
+            <div className="max-w-3xl">
+              <p className="text-xs uppercase tracking-[0.24em] text-sky-700">Room Page</p>
+              <h1 className="mt-4 font-serif text-4xl leading-tight tracking-tight text-slate-900 sm:text-5xl">
+                Room {roomId}
+              </h1>
+              <p className="mt-4 max-w-2xl text-base leading-7 text-slate-600 sm:text-lg">
+                {currentStep
+                  ? `The room is currently in ${currentStep.activityTitle}. The timer will move the workflow through each step automatically.`
+                  : status === 'ready'
+                    ? `This room is connected to Firestore and currently shows ${members.length} member${members.length === 1 ? '' : 's'} in realtime.`
+                    : 'This route is wired for room-specific experiences. Use the room id from the URL to load presence, boards, chat, or other room-scoped data.'}
+              </p>
+              <div className="mt-6 flex flex-wrap items-center gap-4">
+                <code className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100">
+                  /room/{roomId}
+                </code>
+                {roomTypeName ? (
+                  <span className="rounded-full bg-sky-100 px-4 py-2 text-sm font-medium text-sky-900">
+                    {roomTypeName}
+                  </span>
+                ) : null}
+                <a
+                  href="/"
+                  className="inline-flex min-h-12 items-center rounded-full bg-sky-900 px-5 text-sm font-medium text-white transition hover:brightness-110"
+                >
+                  Back home
+                </a>
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2 xl:min-w-[30rem]">
+              <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-950 px-4 py-4 text-white">
+                <p className="text-xs uppercase tracking-[0.18em] text-sky-200/80">Snapshot</p>
+                <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+                  <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+                    <p className="text-sky-100/70">Template</p>
+                    <p className="mt-1 font-semibold text-white">
+                      {roomTypeName ?? 'Waiting for data'}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+                    <p className="text-sky-100/70">Workflow</p>
+                    <p className="mt-1 font-semibold text-white">
+                      {roomWorkflow?.stepCount
+                        ? `${roomWorkflow.activityCount ?? workflowActivities.length} / ${roomWorkflow.stepCount}`
+                        : 'Pending'}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+                    <p className="text-sky-100/70">Total time</p>
+                    <p className="mt-1 font-semibold text-white">
+                      {roomWorkflow?.totalMinutes ? `${roomWorkflow.totalMinutes} min` : 'N/A'}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+                    <p className="text-sky-100/70">Sync</p>
+                    <p className="mt-1 font-semibold text-white">
+                      {status === 'ready' ? 'Live' : 'Pending'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-50 px-4 py-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-sky-700">Members</p>
+                    <p className="mt-1 text-sm text-slate-600">{members.length} in room</p>
+                  </div>
+                  <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-slate-700">
+                    {members.filter((member) => member.isOnline).length} online
+                  </span>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {members.slice(0, 6).map((member) => {
+                    const displayName = getMemberDisplayName(member)
+                    const isCurrentMember = currentMember?.id === member.id
+
+                    return (
+                      <div
+                        key={member.id || member.email || displayName}
+                        className="flex items-center gap-2 rounded-full border border-slate-900/10 bg-white px-2.5 py-2"
+                      >
+                        <img
+                          src={createAvatarUrl(member.email, member.name)}
+                          alt={`${displayName} avatar`}
+                          className="h-8 w-8 rounded-full border border-slate-900/10 bg-slate-200 object-cover"
+                        />
+                        <div className="min-w-0">
+                          <p className="max-w-[8rem] truncate text-sm font-medium text-slate-900">
+                            {displayName}
+                          </p>
+                          <p className="text-xs text-slate-500">
+                            {isCurrentMember ? 'You' : member.isOnline ? 'Online' : 'Offline'}
+                          </p>
+                        </div>
+                      </div>
+                    )
+                  })}
+                  {members.length > 6 ? (
+                    <div className="flex items-center rounded-full border border-dashed border-slate-300 px-3 py-2 text-sm text-slate-500">
+                      +{members.length - 6} more
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -1520,236 +1734,262 @@ function RoomPage({ roomId }) {
           </section>
         ) : null}
 
-        <section className="grid gap-5 lg:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]">
-          <div className="space-y-5">
-            <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/85 p-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <p className="text-sm uppercase tracking-[0.2em] text-sky-700">
-                    Workflow Details
-                  </p>
-                  <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
-                    Activities and steps for this room
-                  </h2>
-                </div>
-                {roomWorkflow?.totalMinutes ? (
-                  <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700">
-                    {roomWorkflow.totalMinutes} min
-                  </span>
-                ) : null}
+        <section className="grid gap-5 xl:grid-cols-[20rem_minmax(0,1fr)]">
+          <aside className="rounded-[1.75rem] border border-slate-900/10 bg-slate-950 p-5 text-white shadow-[0_24px_80px_rgba(10,34,51,0.16)]">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm uppercase tracking-[0.2em] text-sky-200/80">Workflow</p>
+                <h2 className="mt-2 text-2xl font-semibold tracking-tight text-white">
+                  Activities
+                </h2>
               </div>
-
-              {roomWorkflow?.description ? (
-                <p className="mt-4 max-w-3xl text-base leading-7 text-slate-600">
-                  {roomWorkflow.description}
-                </p>
-              ) : null}
-
-              {roomWorkflow ? (
-                <div className="mt-6 space-y-4">
-                  {(roomWorkflow.activities ?? []).map((activity, activityIndex) => (
-                    <section
-                      key={activity.id}
-                      className="rounded-[1.5rem] border border-slate-900/10 bg-slate-50 p-4"
-                    >
-                      <div className="flex flex-wrap items-center gap-3">
-                        <p className="text-sm uppercase tracking-[0.18em] text-sky-700">
-                          Activity {activityIndex + 1}
-                        </p>
-                        <h3 className="text-lg font-semibold text-slate-900">
-                          {activity.title}
-                        </h3>
-                        {activity.totalMinutes ? (
-                          <span className="rounded-full bg-white px-2.5 py-1 text-xs font-medium text-slate-600">
-                            {activity.totalMinutes} min
-                          </span>
-                        ) : null}
-                      </div>
-                      {activity.description ? (
-                        <p className="mt-2 text-sm leading-6 text-slate-600">
-                          {activity.description}
-                        </p>
-                      ) : null}
-
-                      <div className="mt-4 space-y-4">
-                        {activity.steps.map((step, index) => (
-                          <div
-                            key={step.id}
-                            className="relative rounded-[1.25rem] border border-slate-900/10 bg-white p-4 pl-16"
-                          >
-                            {index < activity.steps.length - 1 ? (
-                              <div className="absolute bottom-[-1rem] left-6 top-[3.5rem] w-px bg-slate-200" />
-                            ) : null}
-                            <span className="absolute left-4 top-4 flex h-8 w-8 items-center justify-center rounded-full bg-sky-900 text-sm font-semibold text-white">
-                              {index + 1}
-                            </span>
-                            <div className="space-y-2">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <p className="text-base font-medium leading-7 text-slate-900">
-                                  {step.title}
-                                </p>
-                                {step.activityType ? (
-                                  <span className="rounded-full bg-sky-50 px-2.5 py-1 text-xs font-medium text-sky-900">
-                                    {step.activityType}
-                                  </span>
-                                ) : null}
-                                {step.durationMinutes ? (
-                                  <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">
-                                    {step.durationMinutes} min
-                                  </span>
-                                ) : null}
-                              </div>
-                              {step.description ? (
-                                <p className="text-sm leading-6 text-slate-600">
-                                  {step.description}
-                                </p>
-                              ) : null}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </section>
-                  ))}
-                </div>
-              ) : (
-                <p className="mt-6 text-base text-slate-600">
-                  No workflow has been recorded for this room yet.
-                </p>
-              )}
-            </article>
-
-            <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/85 p-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <p className="text-sm uppercase tracking-[0.2em] text-sky-700">
-                    Members
-                  </p>
-                  <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
-                    Everyone currently in this room
-                  </h2>
-                </div>
-                <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700">
-                  {members.length} total
+              {roomWorkflow?.totalMinutes ? (
+                <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-medium text-sky-100">
+                  {roomWorkflow.totalMinutes} min
                 </span>
-              </div>
+              ) : null}
+            </div>
 
-              {status === 'loading' || memberStatus === 'loading' ? (
-                <p className="mt-6 text-base text-slate-600">Loading room members...</p>
-              ) : null}
-              {status === 'error' || memberStatus === 'error' ? (
-                <p className="mt-6 text-base text-rose-700">
-                  Unable to load the room from Firestore.
-                </p>
-              ) : null}
-              {status === 'missing' && !isDemoRoom ? (
-                <p className="mt-6 text-base text-slate-600">
-                  No Firestore room document exists for this room id yet. Create or join the room from the homepage first.
-                </p>
-              ) : null}
-              {status === 'missing' && isDemoRoom ? (
-                <p className="mt-6 text-base text-slate-600">
-                  This is the built-in demo room for the hackathon brainstorm workflow.
-                </p>
-              ) : null}
-              {status === 'ready' && members.length === 0 ? (
-                <p className="mt-6 text-base text-slate-600">This room has no members yet.</p>
-              ) : null}
+            {roomWorkflow?.description ? (
+              <p className="mt-4 text-sm leading-6 text-sky-100/70">{roomWorkflow.description}</p>
+            ) : null}
 
-              {status === 'ready' && members.length > 0 ? (
-                <div className="mt-6 grid gap-3">
-                  {members.map((member) => {
-                    const isCurrentMember = currentMember?.id === member.id
-                    const displayName = getMemberDisplayName(member)
+            {workflowActivities.length > 0 ? (
+              <div className="mt-6 space-y-4">
+                {workflowActivities.map((activity, activityIndex) => {
+                  const isCurrentActivity = currentActivityIndex === activityIndex
+                  const isFutureActivity = activityIndex > currentActivityIndex
+                  const activitySequenceItems = workflowSequence.filter(
+                    (item) => item.activityIndex === activityIndex,
+                  )
+                  const lastActivitySequenceIndex =
+                    activitySequenceItems[activitySequenceItems.length - 1]?.sequenceIndex ?? -1
+                  const isCompletedActivity =
+                    workflowSequence.length > 0 &&
+                    (lastActivitySequenceIndex < safeCurrentStepIndex ||
+                      (isWorkflowComplete &&
+                        lastActivitySequenceIndex === safeCurrentStepIndex))
+                  const isCollapsed = isCompletedActivity || isFutureActivity
 
-                    return (
-                      <div
-                        key={member.id || member.email || displayName}
-                        className="flex items-center justify-between gap-4 rounded-[1.25rem] border border-slate-900/10 bg-slate-50 px-4 py-4"
-                      >
-                        <div className="flex items-center gap-4">
-                          <img
-                            src={createAvatarUrl(member.email, member.name)}
-                            alt={`${displayName} avatar`}
-                            className="h-12 w-12 rounded-full border border-slate-900/10 bg-slate-200 object-cover"
-                          />
-                          <div>
-                            <p className="text-base font-semibold text-slate-900">
-                              {displayName}
-                            </p>
-                            <p className="text-sm text-slate-600">
-                              {member.email || 'No email provided'}
-                            </p>
-                          </div>
+                  return (
+                    <section
+                      key={activity.id || `activity-${activityIndex + 1}`}
+                      className={`rounded-[1.5rem] border px-4 py-4 transition ${
+                        isCurrentActivity
+                          ? 'border-sky-400/40 bg-sky-400/10'
+                          : 'border-white/10 bg-white/5'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-xs uppercase tracking-[0.18em] text-sky-200/70">
+                            Activity {activityIndex + 1}
+                          </p>
+                          <h3 className="mt-1 text-base font-semibold text-white">
+                            {activity.title}
+                          </h3>
                         </div>
-                        <div className="flex flex-wrap items-center justify-end gap-2">
-                          {isCurrentMember ? (
-                            <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-amber-900">
-                              You
+                        <div className="flex items-center gap-2">
+                          {isCompletedActivity ? (
+                            <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-emerald-400/20 text-emerald-100">
+                              <svg
+                                viewBox="0 0 16 16"
+                                fill="none"
+                                className="h-3.5 w-3.5"
+                                aria-hidden="true"
+                              >
+                                <path
+                                  d="M3.5 8.5L6.5 11.5L12.5 4.5"
+                                  stroke="currentColor"
+                                  strokeWidth="2"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                              </svg>
                             </span>
                           ) : null}
-                          <span
-                            className={`rounded-full px-3 py-1 text-xs font-medium ${
-                              member.isOnline
-                                ? 'bg-emerald-50 text-emerald-700'
-                                : 'bg-slate-200 text-slate-600'
-                            }`}
-                          >
-                            {member.isOnline ? 'Online' : 'Offline'}
-                          </span>
-                          <span
-                            className={`rounded-full px-3 py-1 text-xs font-medium ${
-                              member.isVerified
-                                ? 'bg-sky-100 text-sky-800'
-                                : 'bg-amber-50 text-amber-700'
-                            }`}
-                          >
-                            {member.isVerified ? 'Verified' : 'Anonymous'}
+                          <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs text-sky-100">
+                            {activity.steps.length} steps
                           </span>
                         </div>
                       </div>
-                    )
-                  })}
-                </div>
-              ) : null}
-            </article>
-          </div>
+                      {isCollapsed ? (
+                        <p
+                          className={`mt-4 text-sm ${
+                            isCompletedActivity
+                              ? 'text-emerald-100/80'
+                              : 'text-sky-100/65'
+                          }`}
+                        >
+                          {isCompletedActivity ? 'Activity complete' : 'Starts later'}
+                        </p>
+                      ) : (
+                        <div className="mt-4 space-y-2">
+                          {activity.steps.map((step, stepIndex) => {
+                            const sequenceItem = activitySequenceItems.find(
+                              (item) => item.stepIndex === stepIndex,
+                            )
+                            const isCurrentStep =
+                              sequenceItem?.sequenceIndex === currentStep?.sequenceIndex
+                            const isPastStep =
+                              (sequenceItem?.sequenceIndex ?? Infinity) < safeCurrentStepIndex
 
-          <aside className="rounded-[1.75rem] border border-slate-900/10 bg-slate-950 p-6 text-white shadow-[0_24px_80px_rgba(10,34,51,0.16)]">
-            <p className="text-sm uppercase tracking-[0.2em] text-sky-200/80">
-              Room Snapshot
-            </p>
-            <div className="mt-5 space-y-4">
-              <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
-                <p className="text-sm text-sky-100/75">Room id</p>
-                <p className="mt-2 text-lg font-semibold">{roomId}</p>
+                            return (
+                              <div
+                                key={`${activity.id || activityIndex}-${step.id}-${stepIndex}`}
+                                className={`rounded-2xl px-3 py-3 text-sm ${
+                                  isCurrentStep
+                                    ? 'bg-white text-slate-900'
+                                    : isPastStep
+                                      ? 'bg-emerald-400/10 text-emerald-100'
+                                      : 'bg-white/5 text-sky-100/75'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="flex min-w-0 items-center gap-2">
+                                    {isPastStep ? (
+                                      <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-400/20 text-emerald-100">
+                                        <svg
+                                          viewBox="0 0 16 16"
+                                          fill="none"
+                                          className="h-3 w-3"
+                                          aria-hidden="true"
+                                        >
+                                          <path
+                                            d="M3.5 8.5L6.5 11.5L12.5 4.5"
+                                            stroke="currentColor"
+                                            strokeWidth="2"
+                                            strokeLinecap="round"
+                                            strokeLinejoin="round"
+                                          />
+                                        </svg>
+                                      </span>
+                                    ) : (
+                                      <span
+                                        className={`inline-flex h-5 w-5 shrink-0 rounded-full border ${
+                                          isCurrentStep
+                                            ? 'border-slate-900 bg-slate-900'
+                                            : 'border-current/40'
+                                        }`}
+                                      />
+                                    )}
+                                    <p className="truncate font-medium">{step.title}</p>
+                                  </div>
+                                  {step.durationMinutes ? (
+                                    <span className="shrink-0 text-xs">
+                                      {step.durationMinutes} min
+                                    </span>
+                                  ) : null}
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </section>
+                  )
+                })}
               </div>
-              <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
-                <p className="text-sm text-sky-100/75">Template</p>
-                <p className="mt-2 text-lg font-semibold">
-                  {roomTypeName ?? 'Waiting for Firestore data'}
-                </p>
-              </div>
-              <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
-                <p className="text-sm text-sky-100/75">Workflow</p>
-                <p className="mt-2 text-lg font-semibold">
-                  {roomWorkflow?.stepCount
-                    ? `${roomWorkflow.activityCount ?? roomWorkflow.activities?.length ?? 1} activities / ${roomWorkflow.stepCount} steps`
-                    : 'Waiting for Firestore data'}
-                </p>
-                <p className="mt-1 text-sm text-sky-100/70">
-                  {roomWorkflow?.totalMinutes
-                    ? `${roomWorkflow.totalMinutes} min total`
-                    : 'No duration recorded'}
-                </p>
-              </div>
-              <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
-                <p className="text-sm text-sky-100/75">Member sync</p>
-                <p className="mt-2 text-lg font-semibold">
-                  {status === 'ready' ? 'Live' : 'Pending'}
-                </p>
-              </div>
-            </div>
+            ) : (
+              <p className="mt-6 text-sm text-sky-100/70">
+                No workflow has been recorded for this room yet.
+              </p>
+            )}
           </aside>
+
+          <div className="space-y-5">
+            <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
+              <div className="flex flex-col gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <p className="text-sm uppercase tracking-[0.2em] text-sky-700">Current Step</p>
+                  <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">
+                    {currentStep?.title ?? 'Waiting for workflow'}
+                  </h2>
+                  <p className="mt-2 text-base text-slate-600">
+                    {currentStep
+                      ? `${currentStep.activityTitle} • Step ${currentStep.stepIndex + 1} of ${workflowActivities[currentActivityIndex]?.steps.length ?? 0}`
+                      : 'A room workflow will appear here once the room template is available.'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsPaused((paused) => !paused)}
+                  disabled={!currentStep || isWorkflowComplete}
+                  className="inline-flex min-h-11 items-center justify-center rounded-full bg-slate-950 px-5 text-sm font-medium text-white transition enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {isPaused ? 'Resume timer' : 'Pause timer'}
+                </button>
+              </div>
+
+              <div className="mt-4">
+                <button
+                  type="button"
+                  onClick={completeCurrentStep}
+                  disabled={!currentStep || isWorkflowComplete}
+                  className="inline-flex min-h-11 items-center justify-center rounded-full bg-emerald-600 px-5 text-sm font-medium text-white transition enabled:hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Complete step
+                </button>
+              </div>
+
+              <div className="mt-5 rounded-[1.5rem] border border-slate-900/10 bg-slate-950 px-5 py-5 text-white">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-sky-200/75">Timer</p>
+                    <p className="mt-2 text-2xl font-semibold tabular-nums">
+                      {formatCountdown(remainingSeconds)}
+                    </p>
+                  </div>
+                  <p className="text-sm text-sky-100/70">
+                    {isWorkflowComplete
+                      ? 'Workflow complete'
+                      : isPaused
+                        ? 'Paused'
+                        : currentStep?.durationMinutes
+                          ? `${currentStep.durationMinutes} minute step`
+                          : 'No duration recorded'}
+                  </p>
+                </div>
+                <div className="mt-4 h-3 overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className="h-full rounded-full bg-[linear-gradient(90deg,_#38bdf8_0%,_#22c55e_100%)] transition-[width] duration-700 ease-out"
+                    style={{ width: `${currentStepProgressPercent}%` }}
+                  />
+                </div>
+                <div className="mt-3 flex items-center justify-between text-xs text-sky-100/70">
+                  <span>{Math.round(currentStepProgressPercent)}% complete</span>
+                  <span>{formatCountdown(remainingSeconds)} remaining</span>
+                </div>
+              </div>
+
+              {currentStep?.description ? (
+                <p className="mt-5 max-w-3xl text-lg leading-8 text-slate-600">
+                  {currentStep.description}
+                </p>
+              ) : null}
+
+              <div className="mt-6 rounded-[1.5rem] bg-slate-50 p-5">
+                <p className="text-sm uppercase tracking-[0.18em] text-sky-700">
+                  Facilitation cues
+                </p>
+                <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
+                    <p className="text-sm text-slate-500">Activity</p>
+                    <p className="mt-1 text-lg font-semibold text-slate-900">
+                      {currentStep?.activityTitle ?? 'N/A'}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
+                    <p className="text-sm text-slate-500">Format</p>
+                    <p className="mt-1 text-lg font-semibold capitalize text-slate-900">
+                      {currentStep?.activityType || 'Open discussion'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </article>
+
+          </div>
         </section>
       </div>
     </main>
