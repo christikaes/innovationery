@@ -1999,6 +1999,36 @@ function RoomPage({ roomId }) {
           ),
         )
       : 0
+  const totalWorkflowSeconds = workflowSequence.reduce(
+    (total, step) => total + (step.durationMinutes ?? 0) * 60,
+    0,
+  )
+  const elapsedWorkflowSeconds = hasWorkflowStarted
+    ? Math.min(
+        totalWorkflowSeconds,
+        workflowSequence
+          .slice(0, safeCurrentStepIndex)
+          .reduce((total, step) => total + (step.durationMinutes ?? 0) * 60, 0) +
+          Math.max(0, currentStepDurationSeconds - remainingSeconds),
+      )
+    : 0
+  const displayedElapsedMinutes =
+    elapsedWorkflowSeconds > 0 ? Math.min(Math.ceil(elapsedWorkflowSeconds / 60), roomWorkflow?.totalMinutes ?? 0) : 0
+  const displayedTotalMinutes = roomWorkflow?.totalMinutes ?? Math.round(totalWorkflowSeconds / 60)
+  const roomCode = room?.roomId ?? roomId
+  const timerProgressPercent =
+    displayedTotalMinutes > 0
+      ? Math.min(100, Math.max(0, (displayedElapsedMinutes / displayedTotalMinutes) * 100))
+      : 0
+  const displayedCompletedSteps =
+    workflowSequence.length > 0
+      ? hasWorkflowStarted
+        ? Math.min(safeCurrentStepIndex + 1, workflowSequence.length)
+        : 0
+      : 0
+  const stepProgressPercent =
+    workflowSequence.length > 0 ? (displayedCompletedSteps / workflowSequence.length) * 100 : 0
+  const compactRadialCircumference = 2 * Math.PI * 18
   const moveToStep = (stepIndex) => {
     const nextIndex = Math.max(0, Math.min(stepIndex, workflowSequence.length - 1))
     const nextStep = workflowSequence[nextIndex]
@@ -2022,20 +2052,9 @@ function RoomPage({ roomId }) {
       return
     }
 
-    if (isRoundRobinStep && activeRoundRobinMember) {
-      const nextCompletedSpeakerIds = completedRoundRobinSpeakerIds.includes(activeRoundRobinMember.id)
-        ? completedRoundRobinSpeakerIds
-        : [...completedRoundRobinSpeakerIds, activeRoundRobinMember.id]
-
-      setCompletedRoundRobinSpeakerIds(nextCompletedSpeakerIds)
-
-      if (nextCompletedSpeakerIds.length < roundRobinMembers.length) {
-        return
-      }
-    }
-
     if (safeCurrentStepIndex < workflowSequence.length - 1) {
-      moveToStep(safeCurrentStepIndex + 1)
+      setRemainingSeconds(0)
+      setIsPaused(false)
       return
     }
 
@@ -2187,114 +2206,136 @@ function RoomPage({ roomId }) {
 
   return (
     <main className="min-h-screen bg-[image:var(--theme-bg-room)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
-      <div className="mx-auto grid min-h-[calc(100vh-3rem)] max-w-7xl gap-6">
-        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-8 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-8 md:py-9">
+      <div className="mx-auto grid max-w-7xl gap-6">
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-5 py-4 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-6 md:py-4">
           <div className="absolute -right-12 top-0 h-56 w-56 rounded-full bg-[image:var(--theme-orb-room)]" />
-          <div className="relative flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
-            <div className="max-w-3xl">
-              <p className="text-xs uppercase tracking-[0.24em] text-slate-700">Room Page</p>
-              <h1 className="mt-4 font-serif text-4xl leading-tight tracking-tight text-slate-900 sm:text-5xl">
-                Room {roomId}
-              </h1>
-              <p className="mt-4 max-w-2xl text-base leading-7 text-slate-600 sm:text-lg">
-                {!hasWorkflowStarted
-                  ? `Everyone is in the room. Start when you're ready to begin the first activity.`
-                  : currentStep
-                  ? `The room is currently in ${currentStep.activityTitle}. The timer will move the workflow through each step automatically.`
-                  : status === 'ready'
-                    ? `This room is connected to Firestore and currently shows ${members.length} member${members.length === 1 ? '' : 's'} in realtime.`
-                    : 'This route is wired for room-specific experiences. Use the room id from the URL to load presence, boards, chat, or other room-scoped data.'}
+          <div className="relative flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div className="min-w-0 max-w-3xl">
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-700">
+                Join with Room Code: {roomCode}
               </p>
-              <div className="mt-6 flex flex-wrap items-center gap-4">
-                <code className="rounded-full bg-slate-950 px-4 py-2 text-sm text-slate-50">
-                  /room/{roomId}
-                </code>
-                {roomTypeName ? (
-                  <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-900">
-                    {roomTypeName}
-                  </span>
-                ) : null}
-                <a
-                  href="/"
-                  className={gradientButtonMediumClass}
-                >
-                  Back home
-                </a>
-              </div>
+              <h1 className="font-serif text-3xl leading-tight tracking-tight text-slate-900 sm:text-4xl">
+                {roomTypeName ?? room?.roomTemplate?.name ?? `Room ${roomId}`}
+              </h1>
+              <p className="mt-1 text-sm leading-5 text-slate-600 sm:text-base">
+                {!hasWorkflowStarted
+                  ? 'Ready to start the first activity.'
+                  : currentStep
+                    ? `${currentStep.activityTitle} > ${currentStep.title}`
+                    : status === 'ready'
+                      ? 'Waiting for the current activity.'
+                    : 'Loading room details.'}
+              </p>
             </div>
 
-            <div className="grid gap-3 sm:grid-cols-2 xl:min-w-[30rem]">
-              <div className="rounded-[1.25rem] border border-slate-900/20 bg-slate-950 px-4 py-4 text-white">
-                <p className="text-xs uppercase tracking-[0.18em] text-slate-200/80">Snapshot</p>
-                <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
-                  <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-                    <p className="text-slate-100/70">Template</p>
-                    <p className="mt-1 font-semibold text-white">
-                      {roomTypeName ?? 'Waiting for data'}
-                    </p>
+            <div className="flex flex-col gap-2 sm:flex-row lg:justify-end">
+              <div className="rounded-[1.25rem] border border-slate-900/10 bg-white px-3 py-2.5 shadow-sm">
+                <p className="text-[0.65rem] uppercase tracking-[0.2em] text-slate-700">Progress</p>
+                <div className="mt-2 flex items-center gap-2.5">
+                  <div className="flex items-center gap-2">
+                    <div className="relative h-10 w-10">
+                      <svg
+                        viewBox="0 0 48 48"
+                        className="-rotate-90 h-10 w-10"
+                        aria-hidden="true"
+                      >
+                        <circle
+                          cx="24"
+                          cy="24"
+                          r="18"
+                          fill="none"
+                          stroke="rgb(226 232 240)"
+                          strokeWidth="4"
+                        />
+                        <circle
+                          cx="24"
+                          cy="24"
+                          r="18"
+                          fill="none"
+                          stroke="rgb(15 23 42)"
+                          strokeWidth="4"
+                          strokeLinecap="round"
+                          strokeDasharray={compactRadialCircumference}
+                          strokeDashoffset={
+                            compactRadialCircumference * (1 - timerProgressPercent / 100)
+                          }
+                        />
+                      </svg>
+                    </div>
+                    <div>
+                      <p className="text-[0.65rem] uppercase tracking-[0.18em] text-slate-500">Time</p>
+                      <p className="text-sm font-medium text-slate-900">
+                        {displayedTotalMinutes > 0 ? `${displayedElapsedMinutes}/${displayedTotalMinutes}mins` : 'N/A'}
+                      </p>
+                    </div>
                   </div>
-                  <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-                    <p className="text-slate-100/70">Workflow</p>
-                    <p className="mt-1 font-semibold text-white">
-                      {roomWorkflow?.stepCount
-                        ? `${roomWorkflow.activityCount ?? workflowActivities.length} / ${roomWorkflow.stepCount}`
-                        : 'Pending'}
-                    </p>
-                  </div>
-                  <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-                    <p className="text-slate-100/70">Total time</p>
-                    <p className="mt-1 font-semibold text-white">
-                      {roomWorkflow?.totalMinutes ? `${roomWorkflow.totalMinutes} min` : 'N/A'}
-                    </p>
-                  </div>
-                  <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-                    <p className="text-slate-100/70">Sync</p>
-                    <p className="mt-1 font-semibold text-white">
-                      {status === 'ready' ? 'Live' : 'Pending'}
-                    </p>
+
+                  <div className="flex items-center gap-2">
+                    <div className="relative h-10 w-10">
+                      <svg
+                        viewBox="0 0 48 48"
+                        className="-rotate-90 h-10 w-10"
+                        aria-hidden="true"
+                      >
+                        <circle
+                          cx="24"
+                          cy="24"
+                          r="18"
+                          fill="none"
+                          stroke="rgb(226 232 240)"
+                          strokeWidth="4"
+                        />
+                        <circle
+                          cx="24"
+                          cy="24"
+                          r="18"
+                          fill="none"
+                          stroke="rgb(100 116 139)"
+                          strokeWidth="4"
+                          strokeLinecap="round"
+                          strokeDasharray={compactRadialCircumference}
+                          strokeDashoffset={
+                            compactRadialCircumference * (1 - stepProgressPercent / 100)
+                          }
+                        />
+                      </svg>
+                    </div>
+                    <div>
+                      <p className="text-[0.65rem] uppercase tracking-[0.18em] text-slate-500">Steps</p>
+                      <p className="text-sm font-medium text-slate-900">
+                        {workflowSequence.length > 0 ? `${displayedCompletedSteps}/${workflowSequence.length}steps` : 'N/A'}
+                      </p>
+                    </div>
                   </div>
                 </div>
               </div>
 
-              <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-50/70 px-4 py-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.18em] text-slate-700">Members</p>
-                    <p className="mt-1 text-sm text-slate-600">{members.length} in room</p>
-                  </div>
-                  <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-slate-700">
-                    {members.filter((member) => member.isOnline).length} online
-                  </span>
-                </div>
-                <div className="mt-4 flex flex-wrap gap-2">
-                  {members.slice(0, 6).map((member) => {
+              <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-50/70 px-3 py-2.5">
+                <p className="text-[0.65rem] uppercase tracking-[0.2em] text-slate-700">Members</p>
+                <div className="mt-2 flex items-center">
+                  {members.slice(0, 6).map((member, memberIndex) => {
                     const displayName = getMemberDisplayName(member)
-                    const isCurrentMember = currentMember?.id === member.id
 
                     return (
                       <div
                         key={member.id || member.email || displayName}
-                        className="flex items-center gap-2 rounded-full border border-slate-900/10 bg-white px-2.5 py-2"
+                        className={`relative ${memberIndex === 0 ? '' : '-ml-3'}`}
+                        title={displayName}
                       >
                         <img
                           src={createAvatarUrl(member.email, member.name)}
                           alt={`${displayName} avatar`}
-                          className="h-8 w-8 rounded-full border border-slate-900/10 bg-slate-200 object-cover"
+                          className="h-8 w-8 rounded-full border-2 border-white bg-slate-200 object-cover shadow-sm"
                         />
-                        <div className="min-w-0">
-                          <p className="max-w-[8rem] truncate text-sm font-medium text-slate-900">
-                            {displayName}
-                          </p>
-                          <p className="text-xs text-slate-500">
-                            {isCurrentMember ? 'You' : member.isOnline ? 'Online' : 'Offline'}
-                          </p>
-                        </div>
+                        {member.isOnline ? (
+                          <span className="absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-white bg-emerald-500" />
+                        ) : null}
                       </div>
                     )
                   })}
                   {members.length > 6 ? (
-                    <div className="flex items-center rounded-full border border-dashed border-slate-300 px-3 py-2 text-sm text-slate-500">
-                      +{members.length - 6} more
+                    <div className="-ml-3 flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-slate-200 text-[10px] font-semibold text-slate-600 shadow-sm">
+                      +{members.length - 6}
                     </div>
                   ) : null}
                 </div>
@@ -2328,27 +2369,9 @@ function RoomPage({ roomId }) {
         ) : null}
 
         <section className="grid gap-5 xl:grid-cols-[20rem_minmax(0,1fr)]">
-          <aside className="rounded-[1.75rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <p className="text-sm uppercase tracking-[0.2em] text-slate-200/80">Workflow</p>
-                <h2 className="mt-2 text-2xl font-semibold tracking-tight text-white">
-                  Activities
-                </h2>
-              </div>
-              {roomWorkflow?.totalMinutes ? (
-                <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-medium text-slate-100">
-                  {roomWorkflow.totalMinutes} min
-                </span>
-              ) : null}
-            </div>
-
-            {roomWorkflow?.description ? (
-              <p className="mt-4 text-sm leading-6 text-slate-100/70">{roomWorkflow.description}</p>
-            ) : null}
-
+          <aside className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 text-slate-900 shadow-[var(--theme-shadow-soft)] backdrop-blur">
             {workflowActivities.length > 0 ? (
-              <div className="mt-6 space-y-4">
+              <div className="space-y-4">
                 {workflowActivities.map((activity, activityIndex) => {
                   const isCurrentActivity = currentActivityIndex === activityIndex
                   const isFutureActivity = activityIndex > currentActivityIndex
@@ -2363,28 +2386,47 @@ function RoomPage({ roomId }) {
                       (isWorkflowComplete &&
                         lastActivitySequenceIndex === safeCurrentStepIndex))
                   const isCollapsed = isCompletedActivity || isFutureActivity
+                  const activityProgressLabel = isCompletedActivity
+                    ? `${activity.steps.length}/${activity.steps.length}`
+                    : isCurrentActivity
+                      ? `${Math.min(currentStep?.stepIndex ?? 0, activity.steps.length - 1) + 1}/${activity.steps.length}`
+                      : `0/${activity.steps.length}`
 
                   return (
                     <section
                       key={activity.id || `activity-${activityIndex + 1}`}
                       className={`rounded-[1.5rem] border px-4 py-4 transition ${
                         isCurrentActivity
-                          ? 'border-slate-400/40 bg-slate-400/10'
-                          : 'border-white/10 bg-white/5'
+                          ? 'border-slate-900/90 bg-slate-950 text-white shadow-[var(--theme-shadow-dark-panel)]'
+                          : 'border-slate-900/10 bg-white text-slate-900 shadow-sm'
                       }`}
                     >
                       <div className="flex items-center justify-between gap-3">
                         <div>
-                          <p className="text-xs uppercase tracking-[0.18em] text-slate-200/70">
+                          <p
+                            className={`text-xs uppercase tracking-[0.18em] ${
+                              isCurrentActivity ? 'text-slate-300/80' : 'text-slate-500'
+                            }`}
+                          >
                             Activity {activityIndex + 1}
                           </p>
-                          <h3 className="mt-1 text-base font-semibold text-white">
+                          <h3
+                            className={`mt-1 text-base font-semibold ${
+                              isCurrentActivity ? 'text-white' : 'text-slate-900'
+                            }`}
+                          >
                             {activity.title}
                           </h3>
                         </div>
                         <div className="flex items-center gap-2">
                           {isCompletedActivity ? (
-                            <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-emerald-400/20 text-emerald-100">
+                            <span
+                              className={`inline-flex h-6 w-6 items-center justify-center rounded-full ${
+                                isCurrentActivity
+                                  ? 'bg-emerald-400/20 text-emerald-100'
+                                  : 'bg-emerald-100 text-emerald-700'
+                              }`}
+                            >
                               <svg
                                 viewBox="0 0 16 16"
                                 fill="none"
@@ -2401,8 +2443,14 @@ function RoomPage({ roomId }) {
                               </svg>
                             </span>
                           ) : null}
-                          <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs text-slate-100">
-                            {activity.steps.length} steps
+                          <span
+                            className={`rounded-full px-2.5 py-1 text-xs ${
+                              isCurrentActivity
+                                ? 'bg-white/10 text-slate-100'
+                                : 'bg-slate-100 text-slate-700'
+                            }`}
+                          >
+                            {activityProgressLabel}
                           </span>
                         </div>
                       </div>
@@ -2410,8 +2458,12 @@ function RoomPage({ roomId }) {
                         <p
                           className={`mt-4 text-sm ${
                             isCompletedActivity
-                              ? 'text-emerald-100/80'
-                              : 'text-slate-100/65'
+                              ? isCurrentActivity
+                                ? 'text-emerald-100/80'
+                                : 'text-emerald-700'
+                              : isCurrentActivity
+                                ? 'text-slate-100/65'
+                                : 'text-slate-500'
                           }`}
                         >
                           {isCompletedActivity ? 'Activity complete' : 'Starts later'}
@@ -2434,14 +2486,24 @@ function RoomPage({ roomId }) {
                                   isCurrentStep
                                     ? 'bg-white text-slate-900'
                                     : isPastStep
-                                      ? 'bg-emerald-400/10 text-emerald-100'
-                                      : 'bg-white/5 text-slate-100/75'
+                                      ? isCurrentActivity
+                                        ? 'bg-emerald-400/10 text-emerald-100'
+                                        : 'bg-emerald-50 text-emerald-700'
+                                      : isCurrentActivity
+                                        ? 'bg-white/5 text-slate-100/75'
+                                        : 'bg-slate-50 text-slate-600'
                                 }`}
                               >
                                 <div className="flex items-center justify-between gap-3">
                                   <div className="flex min-w-0 items-center gap-2">
                                     {isPastStep ? (
-                                      <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-400/20 text-emerald-100">
+                                      <span
+                                        className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${
+                                          isCurrentActivity
+                                            ? 'bg-emerald-400/20 text-emerald-100'
+                                            : 'bg-emerald-100 text-emerald-700'
+                                        }`}
+                                      >
                                         <svg
                                           viewBox="0 0 16 16"
                                           fill="none"
@@ -2462,7 +2524,9 @@ function RoomPage({ roomId }) {
                                         className={`inline-flex h-5 w-5 shrink-0 rounded-full border ${
                                           isCurrentStep
                                             ? 'border-slate-900 bg-slate-900'
-                                            : 'border-current/40'
+                                            : isCurrentActivity
+                                              ? 'border-current/40'
+                                              : 'border-slate-300'
                                         }`}
                                       />
                                     )}
@@ -2484,7 +2548,7 @@ function RoomPage({ roomId }) {
                 })}
               </div>
             ) : (
-              <p className="mt-6 text-sm text-slate-100/70">
+              <p className="text-sm text-slate-500">
                 No workflow has been recorded for this room yet.
               </p>
             )}
@@ -2556,13 +2620,7 @@ function RoomPage({ roomId }) {
                       }
                       className={gradientButtonCompactClass}
                     >
-                      {isRoundRobinStep
-                        ? activeRoundRobinMember
-                          ? completedRoundRobinSpeakerIds.length === roundRobinMembers.length - 1
-                            ? 'Complete round robin'
-                            : 'Next speaker'
-                          : 'Round robin complete'
-                        : 'Finish step'}
+                      Complete step
                     </button>
                   </div>
                 </div>
