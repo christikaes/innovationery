@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   EmailAuthProvider,
   isSignInWithEmailLink,
@@ -8,9 +8,11 @@ import {
   signInWithEmailLink,
 } from 'firebase/auth'
 import {
+  addDoc,
   collection,
   collectionGroup,
   doc,
+  getDoc,
   onSnapshot,
   serverTimestamp,
   setDoc,
@@ -346,9 +348,193 @@ const fallbackRoomTemplates = [
   },
 ]
 
+const workflowStepPalette = [
+  {
+    id: 'roundrobin',
+    label: 'Round Robin',
+    type: 'roundrobin',
+    instructions: 'Each person takes a turn responding to a prompt.',
+    input: [],
+    outputs: [],
+    data: {},
+  },
+  {
+    id: 'individual-stickies',
+    label: 'Individual Cards',
+    type: 'individual stickies',
+    instructions: 'People add cards privately before sharing.',
+    input: [],
+    outputs: ['CardList'],
+    data: {},
+  },
+  {
+    id: 'group-stickies',
+    label: 'Group Cards',
+    type: 'group stickies',
+    instructions: 'The room groups and reviews cards together.',
+    input: ['CardList'],
+    outputs: ['CardList'],
+    data: {},
+  },
+  {
+    id: 'voting',
+    label: 'Voting',
+    type: 'voting',
+    instructions: 'Participants vote on the strongest options.',
+    input: ['CardList'],
+    outputs: ['CardList'],
+    data: {
+      numberOfVotes: 'number',
+    },
+  },
+  {
+    id: 'open-discuss',
+    label: 'Discussion',
+    type: 'open discuss',
+    instructions: 'Open discussion around a set of options or outputs.',
+    input: ['Card', 'CardList', 'FillInTheBlankInputs'],
+    outputs: [],
+    data: {},
+  },
+  {
+    id: 'group-fill',
+    label: 'Fill In Blank',
+    type: 'group fill in the blank',
+    instructions: 'The room fills out a shared sentence together.',
+    input: ['FillInTheBlankInputs', 'CardList'],
+    outputs: ['FillInTheBlankInputs'],
+    data: {
+      text: 'string',
+    },
+  },
+]
+
+function createEditorId(prefix) {
+  return `${prefix}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function serializeWorkflowDefinition(template) {
+  const workflow = template?.workflow ?? {
+    title: 'Untitled workflow',
+    description: '',
+    state: {},
+    totalMinutes: 0,
+    activities: [],
+    steps: [],
+    activityCount: 0,
+    stepCount: 0,
+  }
+
+  return {
+    sortOrder: template?.sortOrder,
+    workflow,
+  }
+}
+
+function createEmptyWorkflowDefinition(workflowId) {
+  return normalizeRoomTemplate(workflowId, {
+    id: workflowId,
+    workflow: {
+      title: 'Untitled workflow',
+      description: '',
+      state: {},
+      totalMinutes: 0,
+      activities: [
+        {
+          id: createEditorId('activity'),
+          title: 'New Activity',
+          description: '',
+          steps: [],
+        },
+      ],
+    },
+  })
+}
+
+function getDefaultWorkflowDefinition(workflowId) {
+  return (
+    normalizedFallbackRoomTemplates.find((template) => template.id === workflowId) ??
+    createEmptyWorkflowDefinition(workflowId)
+  )
+}
+
+function getWorkflowPersistenceKey(template) {
+  return JSON.stringify(serializeWorkflowDefinition(template))
+}
+
+function getStepTypeDefinition(activityType) {
+  return (
+    workflowStepPalette.find((item) => item.type === activityType) ??
+    workflowStepPalette[0]
+  )
+}
+
+function createStepDataFromDefinition(definition) {
+  return Object.entries(definition?.data ?? {}).reduce((accumulator, [key, valueType]) => {
+    accumulator[key] = valueType === 'number' ? 0 : valueType === 'boolean' ? false : ''
+    return accumulator
+  }, {})
+}
+
+function createWorkflowStep(activityType) {
+  const definition = getStepTypeDefinition(activityType)
+
+  return {
+    id: createEditorId('step'),
+    title: 'New step',
+    prompt: '',
+    description: '',
+    activityType: definition.type,
+    durationMinutes: 0,
+    data: createStepDataFromDefinition(definition),
+    statePaths: [],
+  }
+}
+
 const normalizedFallbackRoomTemplates = fallbackRoomTemplates.map((template) =>
   normalizeRoomTemplate(template.id, template),
 )
+
+function remapWorkflowSelection(selectedNode, previousActivities, nextActivities) {
+  if (!selectedNode) {
+    return selectedNode
+  }
+
+  if (selectedNode.type === 'activity') {
+    const selectedActivityId = previousActivities[selectedNode.activityIndex]?.id
+    const nextActivityIndex = nextActivities.findIndex((activity) => activity.id === selectedActivityId)
+
+    return {
+      type: 'activity',
+      activityIndex: nextActivityIndex >= 0 ? nextActivityIndex : 0,
+      stepIndex: null,
+    }
+  }
+
+  const selectedActivityId = previousActivities[selectedNode.activityIndex]?.id
+  const selectedStepId =
+    previousActivities[selectedNode.activityIndex]?.steps?.[selectedNode.stepIndex ?? -1]?.id
+
+  for (let activityIndex = 0; activityIndex < nextActivities.length; activityIndex += 1) {
+    const stepIndex = nextActivities[activityIndex].steps.findIndex((step) => step.id === selectedStepId)
+
+    if (stepIndex >= 0) {
+      return {
+        type: 'step',
+        activityIndex,
+        stepIndex,
+      }
+    }
+  }
+
+  const nextActivityIndex = nextActivities.findIndex((activity) => activity.id === selectedActivityId)
+
+  return {
+    type: 'activity',
+    activityIndex: nextActivityIndex >= 0 ? nextActivityIndex : 0,
+    stepIndex: null,
+  }
+}
 
 function toNumber(value) {
   const parsed = Number(value)
@@ -363,6 +549,9 @@ function normalizePipelineStep(step, index) {
       description: '',
       activityType: '',
       durationMinutes: null,
+      prompt: '',
+      data: {},
+      statePaths: [],
     }
   }
 
@@ -373,17 +562,33 @@ function normalizePipelineStep(step, index) {
       description: '',
       activityType: '',
       durationMinutes: null,
+      prompt: '',
+      data: {},
+      statePaths: [],
     }
   }
+
+  const activityType = step.activityType || step.type || step.format || ''
+  const stepTypeDefinition = getStepTypeDefinition(activityType)
+  const normalizedData = createStepDataFromDefinition(stepTypeDefinition)
+
+  Object.entries(step.data && typeof step.data === 'object' ? step.data : {}).forEach(([key, value]) => {
+    normalizedData[key] = value
+  })
 
   return {
     id: step.id || `step-${index + 1}`,
     title: step.title || step.name || step.label || `Step ${index + 1}`,
     description: step.description || step.summary || '',
-    activityType: step.activityType || step.type || step.format || '',
+    activityType,
     durationMinutes: toNumber(
       step.durationMinutes ?? step.minutes ?? step.duration,
     ),
+    prompt: step.prompt || '',
+    data: normalizedData,
+    statePaths: Array.isArray(step.statePaths)
+      ? step.statePaths.filter((path) => typeof path === 'string')
+      : [],
   }
 }
 
@@ -461,6 +666,10 @@ function normalizeRoomTemplate(id, template) {
       template?.workflowDescription ||
       template?.pipelineDescription ||
       '',
+    state:
+      workflowSource.state && typeof workflowSource.state === 'object'
+        ? workflowSource.state
+        : {},
     totalMinutes,
     activities,
     activityCount: activities.length,
@@ -470,8 +679,10 @@ function normalizeRoomTemplate(id, template) {
 
   return {
     id,
-    name: template?.name || template?.title || 'Untitled room',
-    description: template?.description || '',
+    name:
+      workflow.title || template?.name || template?.title || 'Untitled workflow',
+    description:
+      workflow.description || template?.description || '',
     sortOrder: toNumber(template?.sortOrder) ?? Number.MAX_SAFE_INTEGER,
     workflow,
     pipeline: workflow,
@@ -716,11 +927,7 @@ function getRoomCurrentStage(room) {
     return directStage
   }
 
-  const workflow = room?.roomTemplate?.workflow
-  const activeStage =
-    workflow?.activities?.[0]?.title ||
-    workflow?.steps?.[0]?.title ||
-    null
+  const activeStage = room?.workflowFirstActivityTitle || room?.workflowFirstStepTitle || null
 
   return activeStage ? `Ready for ${activeStage}` : 'Waiting for workflow'
 }
@@ -828,28 +1035,16 @@ async function upsertRoomMembership({
     {
       roomId,
       roomTypeId,
-      roomTypeName: roomTemplate?.name ?? 'Custom Room',
+      workflowId: roomTemplate?.id ?? roomTypeId ?? null,
+      workflowTitle: roomTemplate?.workflow?.title ?? 'Untitled workflow',
+      workflowDescription: roomTemplate?.workflow?.description ?? '',
+      workflowFirstActivityTitle: roomTemplate?.workflow?.activities?.[0]?.title ?? null,
+      workflowFirstStepTitle: roomTemplate?.workflow?.steps?.[0]?.title ?? null,
       updatedAt: serverTimestamp(),
       ...(created
         ? {
             createdAt: serverTimestamp(),
             createdBy: member,
-            roomTemplate: roomTemplate
-              ? {
-                  id: roomTemplate.id,
-                  name: roomTemplate.name,
-                  description: roomTemplate.description,
-                  workflow: {
-                    title: roomTemplate.workflow.title,
-                    description: roomTemplate.workflow.description,
-                    totalMinutes: roomTemplate.workflow.totalMinutes,
-                    activityCount: roomTemplate.workflow.activities.length,
-                    stepCount: roomTemplate.workflow.steps.length,
-                    activities: roomTemplate.workflow.activities,
-                    steps: roomTemplate.workflow.steps,
-                  },
-                }
-              : null,
           }
         : {}),
     },
@@ -897,7 +1092,7 @@ function HomePage() {
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
-      collection(db, 'roomTemplates'),
+      collection(db, 'workflows'),
       (snapshot) => {
         if (snapshot.empty) {
           setRoomTemplates(
@@ -916,7 +1111,7 @@ function HomePage() {
               return left.sortOrder - right.sortOrder
             }
 
-            return left.name.localeCompare(right.name)
+            return (left.workflow?.title ?? '').localeCompare(right.workflow?.title ?? '')
           })
 
         setRoomTemplates(templates)
@@ -1241,7 +1436,7 @@ function HomePage() {
                         Create New Room
                       </p>
                       <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900">
-                        Start a {selectedTemplate?.name ?? 'new'} room
+                        Start a {selectedTemplate?.workflow?.title ?? 'new'} room
                       </h2>
                     </div>
                     <button
@@ -1350,7 +1545,7 @@ function HomePage() {
                             <span className="block min-w-0">
                               <span className="flex items-center justify-between gap-3">
                                 <span className={`block text-lg font-semibold ${isSelected ? 'text-white' : 'text-slate-900'}`}>
-                                  {roomType.name}
+                                  {roomType.workflow?.title ?? 'Untitled workflow'}
                                 </span>
                                 {roomType.id === 'hackathon' || roomType.id === 'ideation' ? (
                                   <span className={`rounded-full px-2.5 py-1 text-xs font-medium uppercase tracking-[0.18em] ${
@@ -1361,7 +1556,7 @@ function HomePage() {
                                 ) : null}
                               </span>
                               <span className={`mt-2 block text-sm leading-6 ${isSelected ? 'text-slate-200' : 'text-slate-600'}`}>
-                                {roomType.description}
+                                {roomType.workflow?.description ?? ''}
                               </span>
                             </span>
                           </button>
@@ -1371,7 +1566,7 @@ function HomePage() {
 
                     {templatesStatus === 'ready' ? (
                       <p className="mt-4 text-sm text-slate-500">
-                        Room templates are loading live from the Firestore `roomTemplates` collection.
+                        Room templates are loading live from the Firestore `workflows` collection.
                       </p>
                     ) : null}
                     {templatesStatus === 'error' ? (
@@ -1387,14 +1582,14 @@ function HomePage() {
                       className="absolute left-[-14px] top-16 hidden h-7 w-7 rotate-45 border-b border-l border-slate-900/20 bg-slate-950 lg:block"
                     />
                     <p className="text-xs uppercase tracking-[0.24em] text-slate-200/80">
-                      {selectedTemplate?.name ? `${selectedTemplate.name} Workflow` : 'Room Workflow'}
+                      Workflow
                     </p>
                     <h2 className="mt-2 text-2xl font-semibold tracking-tight">
-                      {selectedTemplate?.workflow.title ?? 'No workflow available'}
+                      {selectedTemplate?.workflow?.title ?? 'No workflow available'}
                     </h2>
-                    {selectedTemplate?.workflow.description ? (
+                    {selectedTemplate?.workflow?.description ? (
                       <p className="mt-3 max-w-xl text-sm leading-6 text-slate-100/80">
-                        {selectedTemplate.workflow.description}
+                        {selectedTemplate.workflow?.description}
                       </p>
                     ) : null}
 
@@ -1403,30 +1598,30 @@ function HomePage() {
                         <p className="text-sm text-slate-100/70">Activities / steps</p>
                         <p className="mt-2 text-3xl font-semibold">
                           {selectedTemplate
-                            ? `${selectedTemplate.workflow.activities.length || 1} / ${selectedTemplate.workflow.steps.length}`
+                            ? `${selectedTemplate.workflow?.activities?.length || 1} / ${selectedTemplate.workflow?.steps?.length ?? 0}`
                             : '0 / 0'}
                         </p>
                       </div>
                       <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
                         <p className="text-sm text-slate-100/70">Total time</p>
                         <p className="mt-2 text-3xl font-semibold">
-                          {selectedTemplate?.workflow.totalMinutes
-                            ? `${selectedTemplate.workflow.totalMinutes} min`
+                          {selectedTemplate?.workflow?.totalMinutes
+                            ? `${selectedTemplate.workflow?.totalMinutes} min`
                             : 'Custom'}
                         </p>
                       </div>
                     </div>
 
                     <div className="mt-6 space-y-4">
-                      {(selectedTemplate?.workflow.activities.length
-                        ? selectedTemplate.workflow.activities
+                      {(selectedTemplate?.workflow?.activities?.length
+                        ? selectedTemplate.workflow?.activities
                         : [
                             {
                               id: 'default-activity',
                               title: 'Workflow',
                               description: '',
-                              totalMinutes: selectedTemplate?.workflow.totalMinutes ?? null,
-                              steps: selectedTemplate?.workflow.steps ?? [],
+                              totalMinutes: selectedTemplate?.workflow?.totalMinutes ?? null,
+                              steps: selectedTemplate?.workflow?.steps ?? [],
                             },
                           ]
                       ).map((activity, activityIndex) => (
@@ -1640,6 +1835,46 @@ function AdminPage() {
   const [roomStatus, setRoomStatus] = useState('loading')
   const [memberCounts, setMemberCounts] = useState({})
   const [memberStatus, setMemberStatus] = useState('loading')
+  const [workflowSeedStatus, setWorkflowSeedStatus] = useState('loading')
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function ensureDefaultWorkflow() {
+      const hackathonTemplate =
+        normalizedFallbackRoomTemplates.find((template) => template.id === 'hackathon') ?? null
+
+      if (!hackathonTemplate) {
+        if (!cancelled) {
+          setWorkflowSeedStatus('error')
+        }
+        return
+      }
+
+      try {
+        const workflowRef = doc(db, 'workflows', hackathonTemplate.id)
+        const snapshot = await getDoc(workflowRef)
+
+        if (!snapshot.exists()) {
+          await setDoc(workflowRef, serializeWorkflowDefinition(hackathonTemplate))
+        }
+
+        if (!cancelled) {
+          setWorkflowSeedStatus('ready')
+        }
+      } catch {
+        if (!cancelled) {
+          setWorkflowSeedStatus('error')
+        }
+      }
+    }
+
+    void ensureDefaultWorkflow()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
@@ -1718,12 +1953,20 @@ function AdminPage() {
                 Live overview of room ids, room types, current stage, and member counts from Firestore.
               </p>
             </div>
-            <a
-              href="/"
-              className={gradientButtonMediumClass}
-            >
-              Back home
-            </a>
+            <div className="flex flex-wrap items-center gap-3">
+              <a
+                href="/admin/workflows/hackathon"
+                className={secondaryButtonMediumClass}
+              >
+                Edit workflows
+              </a>
+              <a
+                href="/"
+                className={gradientButtonMediumClass}
+              >
+                Back home
+              </a>
+            </div>
           </div>
         </section>
 
@@ -1741,7 +1984,14 @@ function AdminPage() {
           <article className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 p-5 shadow-[var(--theme-shadow-soft)]">
             <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Sync</p>
             <p className="mt-3 text-2xl font-semibold text-slate-900">
-              {roomStatus === 'ready' && memberStatus === 'ready' ? 'Live' : 'Loading'}
+              {roomStatus === 'ready' && memberStatus === 'ready' && workflowSeedStatus === 'ready'
+                ? 'Live'
+                : workflowSeedStatus === 'error'
+                  ? 'Issue'
+                  : 'Loading'}
+            </p>
+            <p className="mt-2 text-sm text-slate-500">
+              Ensures the default hackathon workflow exists in Firestore.
             </p>
           </article>
         </section>
@@ -1811,7 +2061,7 @@ function AdminPage() {
                         </div>
                       </td>
                       <td className="px-6 py-5 text-sm text-slate-600">
-                        {room.roomTypeName || room.roomTemplate?.name || 'Custom Room'}
+                        {room.workflowTitle || 'Untitled workflow'}
                       </td>
                       <td className="px-6 py-5 text-sm text-slate-600">
                         {getRoomCurrentStage(room)}
@@ -1836,9 +2086,945 @@ function AdminPage() {
   )
 }
 
+function WorkflowEditorPage({ workflowId }) {
+  const [workflowDefinition, setWorkflowDefinition] = useState(null)
+  const [editorStatus, setEditorStatus] = useState('loading')
+  const [saveStatus, setSaveStatus] = useState('idle')
+  const [selectedNode, setSelectedNode] = useState({ type: 'activity', activityIndex: 0, stepIndex: null })
+  const [dragState, setDragState] = useState(null)
+  const [workflowStateDraft, setWorkflowStateDraft] = useState('{}')
+  const [workflowStateError, setWorkflowStateError] = useState('')
+  const persistedKeyRef = useRef('')
+
+  useEffect(() => {
+    const workflowRef = doc(db, 'workflows', workflowId)
+    const unsubscribe = onSnapshot(
+      workflowRef,
+      (snapshot) => {
+        const nextWorkflow = snapshot.exists()
+          ? normalizeRoomTemplate(snapshot.id, snapshot.data())
+          : getDefaultWorkflowDefinition(workflowId)
+        const nextKey = snapshot.exists() ? getWorkflowPersistenceKey(nextWorkflow) : ''
+
+        persistedKeyRef.current = nextKey
+        setWorkflowDefinition((current) => {
+          if (current && getWorkflowPersistenceKey(current) === getWorkflowPersistenceKey(nextWorkflow)) {
+            return current
+          }
+
+          return nextWorkflow
+        })
+        setEditorStatus('ready')
+      },
+      () => {
+        setWorkflowDefinition(getDefaultWorkflowDefinition(workflowId))
+        setEditorStatus('error')
+      },
+    )
+
+    return unsubscribe
+  }, [workflowId])
+
+  useEffect(() => {
+    if (editorStatus !== 'ready' || !workflowDefinition) {
+      return undefined
+    }
+
+    const nextKey = getWorkflowPersistenceKey(workflowDefinition)
+
+    if (nextKey === persistedKeyRef.current) {
+      return undefined
+    }
+
+    setSaveStatus('saving')
+
+    const timeoutId = window.setTimeout(() => {
+      void setDoc(
+        doc(db, 'workflows', workflowId),
+        {
+          ...serializeWorkflowDefinition(workflowDefinition),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      )
+        .then(() => {
+          persistedKeyRef.current = nextKey
+          setSaveStatus('saved')
+        })
+        .catch(() => {
+          setSaveStatus('error')
+        })
+    }, 500)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [editorStatus, workflowDefinition, workflowId])
+
+  useEffect(() => {
+    if (!workflowDefinition) {
+      return
+    }
+
+    setWorkflowStateDraft(JSON.stringify(workflowDefinition.workflow?.state ?? {}, null, 2))
+    setWorkflowStateError('')
+  }, [workflowDefinition?.workflow?.state])
+
+  useEffect(() => {
+    if (!workflowDefinition) {
+      return
+    }
+
+    const selectedActivity = workflowDefinition.workflow?.activities?.[selectedNode.activityIndex]
+
+    if (!selectedActivity) {
+      setSelectedNode({ type: 'activity', activityIndex: 0, stepIndex: null })
+      return
+    }
+
+    if (selectedNode.type === 'step') {
+      const selectedStep = selectedActivity.steps[selectedNode.stepIndex ?? -1]
+
+      if (!selectedStep) {
+        setSelectedNode({ type: 'activity', activityIndex: selectedNode.activityIndex, stepIndex: null })
+      }
+    }
+  }, [selectedNode, workflowDefinition])
+
+  const updateWorkflowField = (field, value) => {
+    setWorkflowDefinition((current) =>
+      current
+        ? {
+            ...current,
+            [field]: value,
+          }
+        : current,
+    )
+  }
+
+  const updateWorkflowMeta = (field, value) => {
+    setWorkflowDefinition((current) =>
+      current
+        ? {
+            ...current,
+            workflow: {
+              ...current.workflow,
+              [field]: value,
+            },
+          }
+        : current,
+    )
+  }
+
+  const addActivity = () => {
+    setWorkflowDefinition((current) => {
+      if (!current) {
+        return current
+      }
+
+      const nextActivities = [
+        ...current.workflow.activities,
+        {
+          id: createEditorId('activity'),
+          title: 'New Activity',
+          description: '',
+          totalMinutes: null,
+          steps: [],
+        },
+      ]
+
+      setSelectedNode({ type: 'activity', activityIndex: nextActivities.length - 1, stepIndex: null })
+
+      return {
+        ...current,
+        workflow: {
+          ...current.workflow,
+          activities: nextActivities,
+        },
+      }
+    })
+  }
+
+  const updateActivity = (activityIndex, field, value) => {
+    setWorkflowDefinition((current) => {
+      if (!current) {
+        return current
+      }
+
+      return {
+        ...current,
+        workflow: {
+          ...current.workflow,
+          activities: current.workflow.activities.map((activity, index) =>
+            index === activityIndex
+              ? {
+                  ...activity,
+                  [field]: value,
+                }
+              : activity,
+          ),
+        },
+      }
+    })
+  }
+
+  const removeActivity = (activityIndex) => {
+    setWorkflowDefinition((current) => {
+      if (!current) {
+        return current
+      }
+
+      return {
+        ...current,
+        workflow: {
+          ...current.workflow,
+          activities: current.workflow.activities.filter((_, index) => index !== activityIndex),
+        },
+      }
+    })
+    setSelectedNode((current) => ({
+      type: 'activity',
+      activityIndex: Math.max(0, activityIndex - 1),
+      stepIndex: null,
+    }))
+  }
+
+  const addStepToActivity = (activityIndex, activityType = workflowStepPalette[0].type) => {
+    setWorkflowDefinition((current) => {
+      if (!current) {
+        return current
+      }
+
+      const nextStep = createWorkflowStep(activityType)
+      const nextStepIndex = current.workflow.activities[activityIndex]?.steps.length ?? 0
+
+      setSelectedNode({ type: 'step', activityIndex, stepIndex: nextStepIndex })
+
+      return {
+        ...current,
+        workflow: {
+          ...current.workflow,
+          activities: current.workflow.activities.map((activity, index) =>
+            index === activityIndex
+              ? {
+                  ...activity,
+                  steps: [...activity.steps, nextStep],
+                }
+              : activity,
+          ),
+        },
+      }
+    })
+  }
+
+  const updateStep = (activityIndex, stepIndex, field, value) => {
+    setWorkflowDefinition((current) => {
+      if (!current) {
+        return current
+      }
+
+      return {
+        ...current,
+        workflow: {
+          ...current.workflow,
+          activities: current.workflow.activities.map((activity, activityCursor) =>
+            activityCursor === activityIndex
+              ? {
+                  ...activity,
+                  steps: activity.steps.map((step, stepCursor) =>
+                    stepCursor === stepIndex
+                      ? {
+                          ...step,
+                          ...(field === 'activityType'
+                            ? {
+                                activityType: value,
+                                data: createStepDataFromDefinition(getStepTypeDefinition(value)),
+                              }
+                            : {
+                                [field]: value,
+                              }),
+                        }
+                      : step,
+                  ),
+                }
+              : activity,
+          ),
+        },
+      }
+    })
+  }
+
+  const removeStep = (activityIndex, stepIndex) => {
+    setWorkflowDefinition((current) => {
+      if (!current) {
+        return current
+      }
+
+      return {
+        ...current,
+        workflow: {
+          ...current.workflow,
+          activities: current.workflow.activities.map((activity, index) =>
+            index === activityIndex
+              ? {
+                  ...activity,
+                  steps: activity.steps.filter((_, stepCursor) => stepCursor !== stepIndex),
+                }
+              : activity,
+          ),
+        },
+      }
+    })
+  }
+
+  const moveActivity = (sourceIndex, targetIndex) => {
+    if (sourceIndex === targetIndex) {
+      return
+    }
+
+    setWorkflowDefinition((current) => {
+      if (!current) {
+        return current
+      }
+
+      const previousActivities = current.workflow.activities
+      const nextActivities = [...previousActivities]
+      const [movedActivity] = nextActivities.splice(sourceIndex, 1)
+
+      if (!movedActivity) {
+        return current
+      }
+
+      const boundedTargetIndex = Math.max(0, Math.min(targetIndex, nextActivities.length))
+      nextActivities.splice(boundedTargetIndex, 0, movedActivity)
+      setSelectedNode((selection) =>
+        remapWorkflowSelection(selection, previousActivities, nextActivities),
+      )
+
+      return {
+        ...current,
+        workflow: {
+          ...current.workflow,
+          activities: nextActivities,
+        },
+      }
+    })
+  }
+
+  const moveStep = (sourceActivityIndex, sourceStepIndex, targetActivityIndex, targetStepIndex) => {
+    setWorkflowDefinition((current) => {
+      if (!current) {
+        return current
+      }
+
+      const previousActivities = current.workflow.activities
+      const nextActivities = previousActivities.map((activity) => ({
+        ...activity,
+        steps: [...activity.steps],
+      }))
+      const sourceActivity = nextActivities[sourceActivityIndex]
+      const targetActivity = nextActivities[targetActivityIndex]
+
+      if (!sourceActivity || !targetActivity) {
+        return current
+      }
+
+      const [movedStep] = sourceActivity.steps.splice(sourceStepIndex, 1)
+
+      if (!movedStep) {
+        return current
+      }
+
+      let boundedTargetStepIndex = Math.max(0, Math.min(targetStepIndex, targetActivity.steps.length))
+
+      if (
+        sourceActivityIndex === targetActivityIndex &&
+        sourceStepIndex < boundedTargetStepIndex
+      ) {
+        boundedTargetStepIndex -= 1
+      }
+
+      targetActivity.steps.splice(boundedTargetStepIndex, 0, movedStep)
+      setSelectedNode((selection) =>
+        remapWorkflowSelection(selection, previousActivities, nextActivities),
+      )
+
+      return {
+        ...current,
+        workflow: {
+          ...current.workflow,
+          activities: nextActivities,
+        },
+      }
+    })
+  }
+
+  const selectedActivity = workflowDefinition?.workflow?.activities?.[selectedNode.activityIndex] ?? null
+  const selectedStep =
+    selectedNode.type === 'step' && selectedActivity
+      ? selectedActivity.steps[selectedNode.stepIndex ?? -1] ?? null
+      : null
+  const selectedStepTypeDefinition = selectedStep
+    ? getStepTypeDefinition(selectedStep.activityType)
+    : null
+
+  if (editorStatus === 'loading' || !workflowDefinition) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[image:var(--theme-bg-admin)] px-5 py-6 text-slate-900">
+        <div className="rounded-[1.5rem] border border-slate-900/10 bg-white/85 px-6 py-5 shadow-[var(--theme-shadow-soft)]">
+          Loading workflow editor...
+        </div>
+      </main>
+    )
+  }
+
+  return (
+    <main className="min-h-screen bg-[image:var(--theme-bg-admin)] px-5 py-6 text-slate-900 sm:px-8 lg:px-10">
+      <div className="mx-auto grid max-w-7xl gap-6">
+        <section className="rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-8 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-8">
+          <div className="flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-700">Admin Workflow Editor</p>
+              <h1 className="mt-3 font-serif text-4xl tracking-tight text-slate-900 sm:text-5xl">
+                {workflowDefinition.workflow.title}
+              </h1>
+              <p className="mt-3 max-w-3xl text-base leading-7 text-slate-600">
+                Select an activity or step, edit its configuration, and save directly to Firestore.
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700">
+                {saveStatus === 'saving'
+                  ? 'Saving...'
+                  : saveStatus === 'saved'
+                    ? 'Saved'
+                    : saveStatus === 'error'
+                      ? 'Save error'
+                      : 'Ready'}
+              </span>
+              <a href="/admin" className={gradientButtonMediumClass}>
+                Back to admin
+              </a>
+            </div>
+          </div>
+          <div className="mt-6 grid gap-4">
+            <label className="grid gap-2 text-sm font-medium text-slate-800">
+              Workflow Title
+              <input
+                type="text"
+                value={workflowDefinition.workflow.title}
+                onChange={(event) => updateWorkflowMeta('title', event.target.value)}
+                className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+              />
+            </label>
+            <label className="grid gap-2 text-sm font-medium text-slate-800">
+              Workflow Description
+              <textarea
+                value={workflowDefinition.workflow.description}
+                onChange={(event) => updateWorkflowMeta('description', event.target.value)}
+                className="min-h-24 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+              />
+            </label>
+            <label className="grid gap-2 text-sm font-medium text-slate-800">
+              Workflow State
+              <textarea
+                value={workflowStateDraft}
+                onChange={(event) => {
+                  const nextValue = event.target.value
+                  setWorkflowStateDraft(nextValue)
+
+                  try {
+                    const parsed = JSON.parse(nextValue || '{}')
+                    setWorkflowStateError('')
+                    updateWorkflowMeta('state', parsed)
+                  } catch {
+                    setWorkflowStateError('Enter valid JSON to save workflow state.')
+                  }
+                }}
+                className="min-h-36 rounded-2xl border border-slate-300 bg-white px-4 py-3 font-mono text-sm text-slate-900 outline-none transition focus:border-slate-500"
+              />
+              {workflowStateError ? (
+                <p className="text-sm font-medium text-rose-700">{workflowStateError}</p>
+              ) : (
+                <p className="text-xs text-slate-500">
+                  Define the global state shape that rooms will persist for this workflow.
+                </p>
+              )}
+            </label>
+          </div>
+        </section>
+
+        <section className="grid gap-6 xl:grid-cols-[24rem_minmax(0,1fr)]">
+          <aside className="max-h-[calc(100vh-16rem)] overflow-y-auto rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 shadow-[var(--theme-shadow-soft)]">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Activities</p>
+                <p className="mt-1 text-sm text-slate-500">Select an activity or step to edit it.</p>
+              </div>
+              <button type="button" onClick={addActivity} className={gradientButtonCompactClass}>
+                + Activity
+              </button>
+            </div>
+
+            <div className="mt-5 space-y-4">
+              {workflowDefinition.workflow.activities.map((activity, activityIndex) => {
+                const isSelectedActivity =
+                  selectedNode.type === 'activity' && selectedNode.activityIndex === activityIndex
+
+                return (
+                  <section
+                    key={activity.id || `activity-${activityIndex + 1}`}
+                    draggable
+                    onDragStart={() =>
+                      setDragState({ type: 'activity', activityIndex })
+                    }
+                    onDragEnd={() => setDragState(null)}
+                    onDragOver={(event) => {
+                      if (dragState?.type === 'activity') {
+                        event.preventDefault()
+                      }
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault()
+                      event.stopPropagation()
+
+                      if (dragState?.type === 'activity') {
+                        moveActivity(dragState.activityIndex, activityIndex)
+                        setDragState(null)
+                      }
+
+                      if (dragState?.type === 'step') {
+                        moveStep(
+                          dragState.activityIndex,
+                          dragState.stepIndex,
+                          activityIndex,
+                          activity.steps.length,
+                        )
+                        setDragState(null)
+                      }
+                    }}
+                    onClick={() =>
+                      setSelectedNode({ type: 'activity', activityIndex, stepIndex: null })
+                    }
+                    className={`rounded-[1.5rem] border px-4 py-4 transition ${
+                      isSelectedActivity
+                        ? 'border-slate-950 bg-slate-950 text-white shadow-[var(--theme-shadow-strong)]'
+                        : 'border-slate-900/10 bg-white text-slate-900 shadow-sm'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0 flex-1 cursor-pointer text-left">
+                        <p className={`text-xs uppercase tracking-[0.18em] ${
+                          isSelectedActivity ? 'text-slate-300' : 'text-slate-500'
+                        }`}>
+                          Activity {activityIndex + 1}
+                        </p>
+                        <h3 className={`mt-1 truncate text-base font-semibold ${
+                          isSelectedActivity ? 'text-white' : 'text-slate-900'
+                        }`}>
+                          {activity.title}
+                        </h3>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            addStepToActivity(activityIndex)
+                          }}
+                          className={`rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                            isSelectedActivity
+                              ? 'border border-white/20 text-white hover:bg-white/10'
+                              : 'border border-slate-300 text-slate-700 hover:bg-slate-100'
+                          }`}
+                        >
+                          + Step
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            removeActivity(activityIndex)
+                          }}
+                          className={`rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                            isSelectedActivity
+                              ? 'border border-white/20 text-white hover:bg-white/10'
+                              : 'border border-rose-200 text-rose-700 hover:bg-rose-50'
+                          }`}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
+
+                    <div
+                      className="mt-4 space-y-2"
+                      onDragOver={(event) => {
+                        if (dragState?.type === 'step') {
+                          event.preventDefault()
+                        }
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+
+                        if (dragState?.type === 'step') {
+                          moveStep(
+                            dragState.activityIndex,
+                            dragState.stepIndex,
+                            activityIndex,
+                            activity.steps.length,
+                          )
+                          setDragState(null)
+                        }
+                      }}
+                    >
+                      {activity.steps.length > 0 ? (
+                        activity.steps.map((step, stepIndex) => {
+                          const isSelectedStep =
+                            selectedNode.type === 'step' &&
+                            selectedNode.activityIndex === activityIndex &&
+                            selectedNode.stepIndex === stepIndex
+
+                          return (
+                            <div
+                              key={step.id || `${activityIndex}-${stepIndex}`}
+                              draggable
+                              onDragStart={(event) => {
+                                event.stopPropagation()
+                                setDragState({ type: 'step', activityIndex, stepIndex })
+                              }}
+                              onDragEnd={() => setDragState(null)}
+                              onDragOver={(event) => {
+                                if (dragState?.type === 'step') {
+                                  event.preventDefault()
+                                  event.stopPropagation()
+                                }
+                              }}
+                              onDrop={(event) => {
+                                event.preventDefault()
+                                event.stopPropagation()
+
+                                if (dragState?.type === 'step') {
+                                  moveStep(
+                                    dragState.activityIndex,
+                                    dragState.stepIndex,
+                                    activityIndex,
+                                    stepIndex,
+                                  )
+                                  setDragState(null)
+                                }
+                              }}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                setSelectedNode({ type: 'step', activityIndex, stepIndex })
+                              }}
+                              className={`rounded-2xl px-3 py-3 text-sm ${
+                                isSelectedStep
+                                  ? 'bg-slate-950 text-white'
+                                  : 'bg-slate-50 text-slate-600'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="min-w-0 flex-1 cursor-pointer text-left">
+                                  <p className="truncate font-medium">{step.title || `Step ${stepIndex + 1}`}</p>
+                                  <p className={`mt-1 text-xs ${isSelectedStep ? 'text-slate-300' : 'text-slate-500'}`}>
+                                    {step.activityType || 'Step'}
+                                  </p>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation()
+                                    removeStep(activityIndex, stepIndex)
+                                  }}
+                                  className={`rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                                    isSelectedStep
+                                      ? 'border border-white/20 text-white hover:bg-white/10'
+                                      : 'border border-rose-200 text-rose-700 hover:bg-rose-50'
+                                  }`}
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            </div>
+                          )
+                        })
+                      ) : (
+                        <div className="rounded-2xl bg-slate-50 px-3 py-4 text-sm text-slate-500">
+                          No steps yet.
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                )
+              })}
+            </div>
+          </aside>
+
+          <div className="max-h-[calc(100vh-16rem)] overflow-y-auto space-y-5">
+            {selectedActivity ? (
+                <section className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 shadow-[var(--theme-shadow-soft)]">
+                  <p className="text-sm uppercase tracking-[0.18em] text-slate-700">
+                    {selectedNode.type === 'activity' ? 'Activity Configuration' : 'Step Configuration'}
+                  </p>
+                  {selectedNode.type === 'activity' ? (
+                    <div className="mt-4 grid gap-4">
+                      <label className="grid gap-2 text-sm font-medium text-slate-800">
+                        Activity Title
+                        <input
+                          type="text"
+                          value={selectedActivity.title}
+                          onChange={(event) =>
+                            updateActivity(selectedNode.activityIndex, 'title', event.target.value)
+                          }
+                          className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800">
+                        Activity Description
+                        <textarea
+                          value={selectedActivity.description || ''}
+                          onChange={(event) =>
+                            updateActivity(selectedNode.activityIndex, 'description', event.target.value)
+                          }
+                          className="min-h-24 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                      </label>
+                    </div>
+                  ) : selectedStep ? (
+                    <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
+                        State Paths
+                        <textarea
+                          value={(selectedStep.statePaths ?? []).join('\n')}
+                          onChange={(event) =>
+                            updateStep(
+                              selectedNode.activityIndex,
+                              selectedNode.stepIndex,
+                              'statePaths',
+                              event.target.value
+                                .split('\n')
+                                .map((path) => path.trim())
+                                .filter(Boolean),
+                            )
+                          }
+                          placeholder={'problem.cards\nproblem.topChoice\nsolution.statement'}
+                          className="min-h-24 rounded-2xl border border-slate-300 bg-white px-4 py-3 font-mono text-sm text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                        <p className="text-xs text-slate-500">
+                          One state path per line. These are the workflow state values this step reads.
+                        </p>
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800">
+                        Step Title
+                        <input
+                          type="text"
+                          value={selectedStep.title || ''}
+                          onChange={(event) =>
+                            updateStep(selectedNode.activityIndex, selectedNode.stepIndex, 'title', event.target.value)
+                          }
+                          className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800">
+                        Step Type
+                        <select
+                          value={selectedStep.activityType || ''}
+                          onChange={(event) =>
+                            updateStep(
+                              selectedNode.activityIndex,
+                              selectedNode.stepIndex,
+                              'activityType',
+                              event.target.value,
+                            )
+                          }
+                          className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        >
+                          {workflowStepPalette.map((paletteItem) => (
+                            <option key={paletteItem.id} value={paletteItem.type}>
+                              {paletteItem.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      {selectedStepTypeDefinition ? (
+                        <div className="grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 lg:col-span-2">
+                          <div>
+                            <p className="text-sm font-medium text-slate-900">Type Instructions</p>
+                            <p className="mt-1 text-sm leading-6 text-slate-600">
+                              {selectedStepTypeDefinition.instructions}
+                            </p>
+                          </div>
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            <div>
+                              <p className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500">
+                                Input Types
+                              </p>
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {selectedStepTypeDefinition.input.length ? (
+                                  selectedStepTypeDefinition.input.map((inputType) => (
+                                    <span
+                                      key={inputType}
+                                      className="rounded-full bg-white px-2.5 py-1 text-xs font-medium text-slate-700"
+                                    >
+                                      {inputType}
+                                    </span>
+                                  ))
+                                ) : (
+                                  <span className="text-sm text-slate-500">None</span>
+                                )}
+                              </div>
+                            </div>
+                            <div>
+                              <p className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500">
+                                Output Types
+                              </p>
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {selectedStepTypeDefinition.outputs.length ? (
+                                  selectedStepTypeDefinition.outputs.map((outputType) => (
+                                    <span
+                                      key={outputType}
+                                      className="rounded-full bg-white px-2.5 py-1 text-xs font-medium text-slate-700"
+                                    >
+                                      {outputType}
+                                    </span>
+                                  ))
+                                ) : (
+                                  <span className="text-sm text-slate-500">None</span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
+                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
+                        Prompt
+                        <textarea
+                          value={selectedStep.prompt || ''}
+                          onChange={(event) =>
+                            updateStep(selectedNode.activityIndex, selectedNode.stepIndex, 'prompt', event.target.value)
+                          }
+                          className="min-h-20 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800 lg:col-span-2">
+                        Description
+                        <textarea
+                          value={selectedStep.description || ''}
+                          onChange={(event) =>
+                            updateStep(
+                              selectedNode.activityIndex,
+                              selectedNode.stepIndex,
+                              'description',
+                              event.target.value,
+                            )
+                          }
+                          className="min-h-20 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                      </label>
+                      <label className="grid gap-2 text-sm font-medium text-slate-800">
+                        Duration Minutes
+                        <input
+                          type="number"
+                          min="0"
+                          value={selectedStep.durationMinutes ?? 0}
+                          onChange={(event) =>
+                            updateStep(
+                              selectedNode.activityIndex,
+                              selectedNode.stepIndex,
+                              'durationMinutes',
+                              Number(event.target.value) || 0,
+                            )
+                          }
+                          className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                        />
+                      </label>
+                      {selectedStepTypeDefinition && Object.keys(selectedStepTypeDefinition.data).length > 0 ? (
+                        <div className="grid gap-4 lg:col-span-2">
+                          {Object.entries(selectedStepTypeDefinition.data).map(([dataKey, valueType]) => (
+                            <label key={dataKey} className="grid gap-2 text-sm font-medium text-slate-800">
+                              {dataKey}
+                              {valueType === 'number' ? (
+                                <input
+                                  type="number"
+                                  value={selectedStep.data?.[dataKey] ?? 0}
+                                  onChange={(event) =>
+                                    updateStep(
+                                      selectedNode.activityIndex,
+                                      selectedNode.stepIndex,
+                                      'data',
+                                      {
+                                        ...(selectedStep.data ?? {}),
+                                        [dataKey]: Number(event.target.value) || 0,
+                                      },
+                                    )
+                                  }
+                                  className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                                />
+                              ) : valueType === 'boolean' ? (
+                                <select
+                                  value={selectedStep.data?.[dataKey] ? 'true' : 'false'}
+                                  onChange={(event) =>
+                                    updateStep(
+                                      selectedNode.activityIndex,
+                                      selectedNode.stepIndex,
+                                      'data',
+                                      {
+                                        ...(selectedStep.data ?? {}),
+                                        [dataKey]: event.target.value === 'true',
+                                      },
+                                    )
+                                  }
+                                  className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                                >
+                                  <option value="true">True</option>
+                                  <option value="false">False</option>
+                                </select>
+                              ) : (
+                                <input
+                                  type="text"
+                                  value={selectedStep.data?.[dataKey] ?? ''}
+                                  onChange={(event) =>
+                                    updateStep(
+                                      selectedNode.activityIndex,
+                                      selectedNode.stepIndex,
+                                      'data',
+                                      {
+                                        ...(selectedStep.data ?? {}),
+                                        [dataKey]: event.target.value,
+                                      },
+                                    )
+                                  }
+                                  className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-base text-slate-900 outline-none transition focus:border-slate-500"
+                                />
+                              )}
+                            </label>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </section>
+            ) : null}
+          </div>
+        </section>
+      </div>
+    </main>
+  )
+}
+
 function RoomPage({ roomId }) {
   const [room, setRoom] = useState(null)
+  const [workflowDefinition, setWorkflowDefinition] = useState(null)
   const [persistedMembers, setPersistedMembers] = useState([])
+  const [brainstormCards, setBrainstormCards] = useState([])
+  const [brainstormDraft, setBrainstormDraft] = useState('')
+  const [isSubmittingBrainstormCard, setIsSubmittingBrainstormCard] = useState(false)
+  const [roomIdentityForm, setRoomIdentityForm] = useState(() => ({
+    name: '',
+    email: window.localStorage.getItem(EMAIL_STORAGE_KEY) || '',
+  }))
+  const [roomIdentityError, setRoomIdentityError] = useState('')
+  const [roomIdentityLoading, setRoomIdentityLoading] = useState(false)
   const [status, setStatus] = useState('loading')
   const [banner, setBanner] = useState(() => readRoomBanner(roomId))
   const [currentStepIndex, setCurrentStepIndex] = useState(0)
@@ -1871,6 +3057,30 @@ function RoomPage({ roomId }) {
 
     return unsubscribe
   }, [roomId])
+
+  useEffect(() => {
+    if (!room?.workflowId) {
+      setWorkflowDefinition(null)
+      return undefined
+    }
+
+    const unsubscribe = onSnapshot(
+      doc(db, 'workflows', room.workflowId),
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          setWorkflowDefinition(null)
+          return
+        }
+
+        setWorkflowDefinition(normalizeRoomTemplate(snapshot.id, snapshot.data()))
+      },
+      () => {
+        setWorkflowDefinition(null)
+      },
+    )
+
+    return unsubscribe
+  }, [room?.workflowId])
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
@@ -1925,8 +3135,15 @@ function RoomPage({ roomId }) {
   const isDemoRoom = roomId.trim().toLowerCase() === 'demo-room'
   const demoTemplate =
     normalizedFallbackRoomTemplates.find((template) => template.id === 'hackathon') ?? null
-  const roomWorkflow = room?.roomTemplate?.workflow ?? (isDemoRoom ? demoTemplate?.workflow : null)
-  const roomTypeName = room?.roomTypeName ?? (isDemoRoom ? demoTemplate?.name : null)
+  const roomWorkflow =
+    workflowDefinition?.workflow ??
+    room?.roomTemplate?.workflow ??
+    (isDemoRoom ? demoTemplate?.workflow : null)
+  const workflowTitle =
+    room?.workflowTitle ??
+    workflowDefinition?.workflow?.title ??
+    room?.roomTemplate?.workflow?.title ??
+    (isDemoRoom ? demoTemplate?.workflow?.title : null)
   const members = normalizeMembers(room, persistedMembers)
     .sort((left, right) =>
       getMemberDisplayName(left).localeCompare(getMemberDisplayName(right)),
@@ -1968,6 +3185,8 @@ function RoomPage({ roomId }) {
   const hasWorkflowStarted = Boolean(room?.workflowStartedAt)
   const currentActivityIndex = currentStep?.activityIndex ?? 0
   const isRoundRobinStep = currentStep?.activityType === 'roundrobin'
+  const isIndividualBrainstormStep = currentStep?.activityType === 'individual stickies'
+  const isGroupBrainstormStep = currentStep?.activityType === 'group stickies'
   const currentStepDurationSeconds = (currentStep?.durationMinutes ?? 0) * 60
   const roundRobinMembers = roundRobinOrder
     .map((memberId) => members.find((member) => member.id === memberId))
@@ -2029,6 +3248,16 @@ function RoomPage({ roomId }) {
   const stepProgressPercent =
     workflowSequence.length > 0 ? (displayedCompletedSteps / workflowSequence.length) * 100 : 0
   const compactRadialCircumference = 2 * Math.PI * 18
+  const currentSectionId = currentStep?.activityId ?? null
+  const currentActivityCards = brainstormCards.filter(
+    (card) => card.activityId === currentStep?.activityId,
+  )
+  const shouldRevealAllBrainstormCards = isGroupBrainstormStep
+  const shouldPromptForRoomIdentity = !currentMember?.id && (status === 'ready' || isDemoRoom)
+  const visibleBrainstormCardCount = currentActivityCards.filter(
+    (card) => shouldRevealAllBrainstormCards || card.authorId === currentMember?.id,
+  ).length
+  const hiddenBrainstormCardCount = currentActivityCards.length - visibleBrainstormCardCount
   const moveToStep = (stepIndex) => {
     const nextIndex = Math.max(0, Math.min(stepIndex, workflowSequence.length - 1))
     const nextStep = workflowSequence[nextIndex]
@@ -2060,6 +3289,174 @@ function RoomPage({ roomId }) {
 
     setRemainingSeconds(0)
     setIsPaused(false)
+  }
+
+  useEffect(() => {
+    if (!currentSectionId || !currentStep) {
+      return undefined
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void setDoc(
+        doc(db, 'rooms', roomId, 'sections', currentSectionId),
+        {
+          id: currentSectionId,
+          activityId: currentStep.activityId,
+          activityTitle: currentStep.activityTitle ?? '',
+          activityDescription: currentStep.activityDescription ?? '',
+          activityIndex: currentStep.activityIndex ?? 0,
+          workflowId: room?.workflowId ?? demoTemplate?.id ?? null,
+          workflowTitle: workflowTitle ?? '',
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      )
+    }, 0)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [
+    currentSectionId,
+    currentStep?.activityDescription,
+    currentStep?.activityId,
+    currentStep?.activityIndex,
+    currentStep?.activityTitle,
+    demoTemplate?.id,
+    room?.workflowId,
+    roomId,
+    workflowTitle,
+  ])
+
+  useEffect(() => {
+    if (!currentSectionId) {
+      setBrainstormCards([])
+      return undefined
+    }
+
+    const unsubscribe = onSnapshot(
+      collection(db, 'rooms', roomId, 'sections', currentSectionId, 'cards'),
+      (snapshot) => {
+        const nextCards = snapshot.docs
+          .map((cardDoc) => ({
+            id: cardDoc.id,
+            ...cardDoc.data(),
+          }))
+          .sort((left, right) => {
+            const leftSeconds = left.createdAt?.seconds ?? 0
+            const rightSeconds = right.createdAt?.seconds ?? 0
+
+            if (leftSeconds !== rightSeconds) {
+              return leftSeconds - rightSeconds
+            }
+
+            return left.id.localeCompare(right.id)
+          })
+
+        setBrainstormCards(nextCards)
+      },
+      () => {
+        setBrainstormCards([])
+      },
+    )
+
+    return unsubscribe
+  }, [currentSectionId, roomId])
+  const submitBrainstormCard = async (event) => {
+    event.preventDefault()
+
+    const trimmedDraft = brainstormDraft.trim()
+
+    if (!trimmedDraft || !currentMember?.id || !currentStep?.activityId || !isIndividualBrainstormStep) {
+      return
+    }
+
+    setIsSubmittingBrainstormCard(true)
+
+    try {
+      await setDoc(
+        doc(db, 'rooms', roomId, 'sections', currentSectionId),
+        {
+          id: currentSectionId,
+          activityId: currentStep.activityId,
+          activityTitle: currentStep.activityTitle ?? '',
+          activityDescription: currentStep.activityDescription ?? '',
+          activityIndex: currentStep.activityIndex ?? 0,
+          workflowId: room?.workflowId ?? demoTemplate?.id ?? null,
+          workflowTitle: workflowTitle ?? '',
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      )
+
+      await addDoc(collection(db, 'rooms', roomId, 'sections', currentSectionId, 'cards'), {
+        activityId: currentStep.activityId,
+        activityTitle: currentStep.activityTitle ?? '',
+        activityIndex: currentStep.activityIndex ?? 0,
+        sectionId: currentSectionId,
+        authorId: currentMember.id,
+        authorName: getMemberDisplayName(currentMember),
+        text: trimmedDraft,
+        createdAt: serverTimestamp(),
+      })
+      setBrainstormDraft('')
+    } finally {
+      setIsSubmittingBrainstormCard(false)
+    }
+  }
+  const handleRoomIdentitySubmit = async (event) => {
+    event.preventDefault()
+    setRoomIdentityError('')
+
+    const name = roomIdentityForm.name.trim()
+    const email = roomIdentityForm.email.trim().toLowerCase()
+
+    if (!name || !email) {
+      setRoomIdentityError('Enter your name and email to continue in this room.')
+      return
+    }
+
+    setRoomIdentityLoading(true)
+
+    try {
+      const activeUser = await ensureActiveUser()
+      const roomTypeId = room?.roomTypeId ?? (isDemoRoom ? demoTemplate?.id ?? 'hackathon' : 'custom')
+      const roomTemplate = workflowDefinition ?? (isDemoRoom ? demoTemplate : null)
+      const flow = {
+        roomId,
+        roomTypeId,
+        name,
+        email,
+        created: false,
+      }
+
+      writePendingAuthContext(flow)
+
+      try {
+        await sendSignInLinkToEmail(auth, email, getActionCodeSettings(roomId))
+        writeRoomBanner(roomId, {
+          tone: 'sky',
+          text: `A one-time verification link was sent to ${email}. Verify your email whenever you are ready to recover this brainstorm later.`,
+        })
+      } catch {
+        clearPendingAuthContext()
+        writeRoomBanner(roomId, {
+          tone: 'slate',
+          text: 'We could not send the verification email right now, but you have still entered anonymously and can keep working.',
+        })
+      }
+
+      await upsertRoomMembership({
+        roomId,
+        roomTypeId,
+        roomTemplate,
+        name,
+        email,
+        authUser: activeUser,
+      })
+    } catch {
+      setRoomIdentityError('Unable to join this room right now. Check Firebase setup and try again.')
+    } finally {
+      setRoomIdentityLoading(false)
+    }
   }
 
   useEffect(() => {
@@ -2206,6 +3603,84 @@ function RoomPage({ roomId }) {
 
   return (
     <main className="min-h-screen bg-[image:var(--theme-bg-room)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
+      {shouldPromptForRoomIdentity ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 px-5 py-6 backdrop-blur-sm">
+          <div className="w-full max-w-3xl rounded-[2rem] border border-slate-900/20 bg-[image:var(--theme-panel-gradient)] p-6 shadow-[var(--theme-shadow-modal)] sm:p-8">
+            <form onSubmit={handleRoomIdentitySubmit} className="space-y-5">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <div className="max-w-2xl">
+                  <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+                    Join this room
+                  </p>
+                  <h2 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900">
+                    Enter your details to continue.
+                  </h2>
+                  <p className="mt-3 text-sm leading-6 text-slate-700">
+                    We could not find your saved room identity on this device, so add it again to keep collaborating in {roomCode}.
+                  </p>
+                </div>
+                <button
+                  type="submit"
+                  disabled={roomIdentityLoading}
+                  className={`${gradientButtonMediumClass} shrink-0`}
+                >
+                  {roomIdentityLoading ? 'Joining...' : 'Continue'}
+                </button>
+              </div>
+
+              <div className="grid gap-4 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+                <label className="grid gap-2 text-sm font-medium text-slate-50">
+                  Room Number
+                  <input
+                    type="text"
+                    value={roomCode}
+                    readOnly
+                    className="min-h-28 rounded-[1.75rem] border border-white/10 bg-white/10 px-5 text-3xl font-semibold uppercase tracking-[0.24em] text-white outline-none sm:min-h-32 sm:text-4xl"
+                  />
+                </label>
+                <div className="grid gap-4 self-end">
+                  <label className="grid gap-2 text-sm font-medium text-slate-50">
+                    Your Name
+                    <input
+                      type="text"
+                      value={roomIdentityForm.name}
+                      onChange={(event) =>
+                        setRoomIdentityForm((current) => ({
+                          ...current,
+                          name: event.target.value,
+                        }))
+                      }
+                      placeholder="Enter your name"
+                      className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-slate-50/45 focus:border-slate-200 focus:ring-2 focus:ring-slate-100/20"
+                    />
+                  </label>
+                  <label className="grid gap-2 text-sm font-medium text-slate-50">
+                    Email
+                    <input
+                      type="email"
+                      value={roomIdentityForm.email}
+                      onChange={(event) =>
+                        setRoomIdentityForm((current) => ({
+                          ...current,
+                          email: event.target.value,
+                        }))
+                      }
+                      placeholder="Enter your email"
+                      className="min-h-14 rounded-2xl border border-white/10 bg-white/10 px-4 text-base text-white outline-none transition placeholder:text-slate-50/45 focus:border-slate-200 focus:ring-2 focus:ring-slate-100/20"
+                    />
+                  </label>
+                </div>
+                {roomIdentityError ? (
+                  <p className="text-sm font-medium text-rose-300 lg:col-span-2">
+                    {roomIdentityError}
+                  </p>
+                ) : null}
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
       <div className="mx-auto grid max-w-7xl gap-6">
         <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-5 py-4 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-6 md:py-4">
           <div className="absolute -right-12 top-0 h-56 w-56 rounded-full bg-[image:var(--theme-orb-room)]" />
@@ -2215,7 +3690,7 @@ function RoomPage({ roomId }) {
                 Join with Room Code: {roomCode}
               </p>
               <h1 className="font-serif text-3xl leading-tight tracking-tight text-slate-900 sm:text-4xl">
-                {roomTypeName ?? room?.roomTemplate?.name ?? `Room ${roomId}`}
+                {workflowTitle ?? `Room ${roomId}`}
               </h1>
               <p className="mt-1 text-sm leading-5 text-slate-600 sm:text-base">
                 {!hasWorkflowStarted
@@ -2395,38 +3870,24 @@ function RoomPage({ roomId }) {
                   return (
                     <section
                       key={activity.id || `activity-${activityIndex + 1}`}
-                      className={`rounded-[1.5rem] border px-4 py-4 transition ${
+                      className={`rounded-[1.5rem] border bg-white px-4 py-4 text-slate-900 transition ${
                         isCurrentActivity
-                          ? 'border-slate-900/90 bg-slate-950 text-white shadow-[var(--theme-shadow-dark-panel)]'
-                          : 'border-slate-900/10 bg-white text-slate-900 shadow-sm'
+                          ? 'border-slate-900/20 shadow-[var(--theme-shadow-soft)]'
+                          : 'border-slate-900/10 shadow-sm'
                       }`}
                     >
                       <div className="flex items-center justify-between gap-3">
                         <div>
-                          <p
-                            className={`text-xs uppercase tracking-[0.18em] ${
-                              isCurrentActivity ? 'text-slate-300/80' : 'text-slate-500'
-                            }`}
-                          >
+                          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">
                             Activity {activityIndex + 1}
                           </p>
-                          <h3
-                            className={`mt-1 text-base font-semibold ${
-                              isCurrentActivity ? 'text-white' : 'text-slate-900'
-                            }`}
-                          >
+                          <h3 className="mt-1 text-base font-semibold text-slate-900">
                             {activity.title}
                           </h3>
                         </div>
                         <div className="flex items-center gap-2">
                           {isCompletedActivity ? (
-                            <span
-                              className={`inline-flex h-6 w-6 items-center justify-center rounded-full ${
-                                isCurrentActivity
-                                  ? 'bg-emerald-400/20 text-emerald-100'
-                                  : 'bg-emerald-100 text-emerald-700'
-                              }`}
-                            >
+                            <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
                               <svg
                                 viewBox="0 0 16 16"
                                 fill="none"
@@ -2443,29 +3904,13 @@ function RoomPage({ roomId }) {
                               </svg>
                             </span>
                           ) : null}
-                          <span
-                            className={`rounded-full px-2.5 py-1 text-xs ${
-                              isCurrentActivity
-                                ? 'bg-white/10 text-slate-100'
-                                : 'bg-slate-100 text-slate-700'
-                            }`}
-                          >
+                          <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-700">
                             {activityProgressLabel}
                           </span>
                         </div>
                       </div>
                       {isCollapsed ? (
-                        <p
-                          className={`mt-4 text-sm ${
-                            isCompletedActivity
-                              ? isCurrentActivity
-                                ? 'text-emerald-100/80'
-                                : 'text-emerald-700'
-                              : isCurrentActivity
-                                ? 'text-slate-100/65'
-                                : 'text-slate-500'
-                          }`}
-                        >
+                        <p className={`mt-4 text-sm ${isCompletedActivity ? 'text-emerald-700' : 'text-slate-500'}`}>
                           {isCompletedActivity ? 'Activity complete' : 'Starts later'}
                         </p>
                       ) : (
@@ -2484,26 +3929,16 @@ function RoomPage({ roomId }) {
                                 key={`${activity.id || activityIndex}-${step.id}-${stepIndex}`}
                                 className={`rounded-2xl px-3 py-3 text-sm ${
                                   isCurrentStep
-                                    ? 'bg-white text-slate-900'
+                                    ? 'bg-slate-950 text-white'
                                     : isPastStep
-                                      ? isCurrentActivity
-                                        ? 'bg-emerald-400/10 text-emerald-100'
-                                        : 'bg-emerald-50 text-emerald-700'
-                                      : isCurrentActivity
-                                        ? 'bg-white/5 text-slate-100/75'
-                                        : 'bg-slate-50 text-slate-600'
+                                      ? 'bg-emerald-50 text-emerald-700'
+                                      : 'bg-slate-50 text-slate-600'
                                 }`}
                               >
                                 <div className="flex items-center justify-between gap-3">
                                   <div className="flex min-w-0 items-center gap-2">
                                     {isPastStep ? (
-                                      <span
-                                        className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${
-                                          isCurrentActivity
-                                            ? 'bg-emerald-400/20 text-emerald-100'
-                                            : 'bg-emerald-100 text-emerald-700'
-                                        }`}
-                                      >
+                                      <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
                                         <svg
                                           viewBox="0 0 16 16"
                                           fill="none"
@@ -2523,10 +3958,8 @@ function RoomPage({ roomId }) {
                                       <span
                                         className={`inline-flex h-5 w-5 shrink-0 rounded-full border ${
                                           isCurrentStep
-                                            ? 'border-slate-900 bg-slate-900'
-                                            : isCurrentActivity
-                                              ? 'border-current/40'
-                                              : 'border-slate-300'
+                                            ? 'border-white bg-white'
+                                            : 'border-slate-300'
                                         }`}
                                       />
                                     )}
@@ -2646,28 +4079,27 @@ function RoomPage({ roomId }) {
             ) : null}
 
             <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-6 shadow-[var(--theme-shadow-soft)] backdrop-blur">
-              <div className="flex flex-col gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-start sm:justify-between">
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                  <p className="text-sm uppercase tracking-[0.2em] text-slate-700">Current Step</p>
-                  <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">
+                  <p className="text-sm uppercase tracking-[0.2em] text-slate-700">
                     {hasWorkflowStarted
                       ? currentStep?.title ?? 'Waiting for workflow'
                       : 'Ready to start'}
-                  </h2>
-                  <p className="mt-2 text-base text-slate-600">
-                    {hasWorkflowStarted && currentStep
-                      ? `${currentStep.activityTitle} • Step ${currentStep.stepIndex + 1} of ${workflowActivities[currentActivityIndex]?.steps.length ?? 0}`
-                      : 'Review who is in the room, then start the session when everyone is ready.'}
                   </p>
+                  <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">
+                    {hasWorkflowStarted
+                      ? currentStep?.description || currentStep?.title || 'Waiting for workflow'
+                      : 'Ready to start'}
+                  </h2>
                 </div>
               </div>
 
               {!hasWorkflowStarted ? (
-                <div className="mt-5 rounded-[1.5rem] border border-slate-900/10 bg-slate-50/70 p-5">
+                <div className="mt-5 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
                   <div className="flex flex-wrap items-center justify-between gap-4">
                     <div>
-                      <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Room Members</p>
-                      <p className="mt-2 text-sm text-slate-600">
+                      <p className="text-sm uppercase tracking-[0.18em] text-slate-300">Room Members</p>
+                      <p className="mt-2 text-sm text-slate-100/70">
                         {members.length > 0
                           ? `${members.length} member${members.length === 1 ? '' : 's'} ready to begin this session.`
                           : 'No members are in this room yet.'}
@@ -2691,7 +4123,7 @@ function RoomPage({ roomId }) {
                       return (
                         <div
                           key={member.id || member.email || displayName}
-                          className="flex items-center gap-3 rounded-full border border-slate-200 bg-white px-3 py-2"
+                          className="flex items-center gap-3 rounded-full border border-white/10 bg-white/5 px-3 py-2"
                         >
                           <img
                             src={createAvatarUrl(member.email, member.name)}
@@ -2699,10 +4131,10 @@ function RoomPage({ roomId }) {
                             className="h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover"
                           />
                           <div className="min-w-0">
-                            <p className="max-w-[10rem] truncate text-sm font-medium text-slate-900">
+                            <p className="max-w-[10rem] truncate text-sm font-medium text-white">
                               {displayName}
                             </p>
-                            <p className="text-xs text-slate-500">
+                            <p className="text-xs text-slate-300">
                               {member.isOnline ? 'Online' : 'In room'}
                             </p>
                           </div>
@@ -2713,17 +4145,11 @@ function RoomPage({ roomId }) {
                 </div>
               ) : null}
 
-              {currentStep?.description ? (
-                <p className="mt-5 max-w-3xl text-lg leading-8 text-slate-600">
-                  {currentStep.description}
-                </p>
-              ) : null}
-
               {hasWorkflowStarted && isRoundRobinStep ? (
-                <div className="mt-6 rounded-[1.5rem] bg-slate-50/70 p-5">
-                  <p className="text-sm uppercase tracking-[0.18em] text-slate-700">Round Robin</p>
+                <div className="mt-6 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                  <p className="text-sm uppercase tracking-[0.18em] text-slate-300">Round Robin</p>
                   {activeRoundRobinMember ? (
-                    <div className="mt-4 rounded-[1.5rem] border border-slate-200 bg-white p-4 shadow-[var(--theme-shadow-soft)]">
+                    <div className="mt-4 rounded-[1.5rem] border border-white/10 bg-white/5 p-4 shadow-[var(--theme-shadow-soft)]">
                       <div className="flex items-center gap-4">
                         <img
                           src={createAvatarUrl(
@@ -2731,18 +4157,18 @@ function RoomPage({ roomId }) {
                             activeRoundRobinMember.name,
                           )}
                           alt={`${getMemberDisplayName(activeRoundRobinMember)} avatar`}
-                          className="h-16 w-16 rounded-full border border-slate-300 bg-slate-200 object-cover"
+                          className="h-16 w-16 rounded-full border border-white/10 bg-slate-200 object-cover"
                         />
                         <div>
-                          <p className="text-sm text-slate-500">Now speaking</p>
-                          <p className="mt-1 text-2xl font-semibold text-slate-900">
+                          <p className="text-sm text-slate-300">Now speaking</p>
+                          <p className="mt-1 text-2xl font-semibold text-white">
                             {getMemberDisplayName(activeRoundRobinMember)}
                           </p>
                         </div>
                       </div>
                     </div>
                   ) : (
-                    <div className="mt-4 rounded-[1.5rem] border border-emerald-200 bg-emerald-50 px-4 py-4 text-sm font-medium text-emerald-900">
+                    <div className="mt-4 rounded-[1.5rem] border border-emerald-500/30 bg-emerald-500/10 px-4 py-4 text-sm font-medium text-emerald-100">
                       {roundRobinMembers.length > 0
                         ? 'Everyone in the room has had a turn.'
                         : 'No room members are available for this round robin yet.'}
@@ -2757,19 +4183,19 @@ function RoomPage({ roomId }) {
                       return (
                         <div
                           key={member.id || member.email || displayName}
-                          className={`relative flex items-center gap-3 rounded-full border bg-white px-3 py-2 transition ${
+                          className={`relative flex items-center gap-3 rounded-full border bg-white/5 px-3 py-2 transition ${
                             isCompletedSpeaker
-                              ? 'border-emerald-500 ring-2 ring-emerald-200'
+                              ? 'border-emerald-400/60 ring-2 ring-emerald-400/20'
                               : isActiveSpeaker
-                                ? 'border-slate-400 ring-2 ring-slate-200'
-                                : 'border-slate-200'
+                                ? 'border-slate-200/70 ring-2 ring-slate-100/15'
+                                : 'border-white/10'
                           }`}
                         >
                           <div className="relative">
                             <img
                               src={createAvatarUrl(member.email, member.name)}
                               alt={`${displayName} avatar`}
-                              className="h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover"
+                              className="h-11 w-11 rounded-full border border-white/10 bg-slate-200 object-cover"
                             />
                             {isCompletedSpeaker ? (
                               <span className="absolute -bottom-1 -right-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-white">
@@ -2791,10 +4217,10 @@ function RoomPage({ roomId }) {
                             ) : null}
                           </div>
                           <div className="min-w-0">
-                            <p className="max-w-[10rem] truncate text-sm font-medium text-slate-900">
+                            <p className="max-w-[10rem] truncate text-sm font-medium text-white">
                               {displayName}
                             </p>
-                            <p className="text-xs text-slate-500">
+                            <p className="text-xs text-slate-300">
                               {isCompletedSpeaker
                                 ? 'Done'
                                 : isActiveSpeaker
@@ -2807,24 +4233,111 @@ function RoomPage({ roomId }) {
                     })}
                   </div>
                 </div>
-              ) : hasWorkflowStarted ? (
-                <div className="mt-6 rounded-[1.5rem] bg-slate-50/70 p-5">
-                  <p className="text-sm uppercase tracking-[0.18em] text-slate-700">
-                    Facilitation cues
-                  </p>
-                  <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
-                      <p className="text-sm text-slate-500">Activity</p>
-                      <p className="mt-1 text-lg font-semibold text-slate-900">
-                        {currentStep?.activityTitle ?? 'N/A'}
+              ) : null}
+              {hasWorkflowStarted && (isIndividualBrainstormStep || isGroupBrainstormStep) ? (
+                <div className="mt-6 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div>
+                      <p className="text-sm uppercase tracking-[0.18em] text-slate-300">
+                        {isIndividualBrainstormStep ? 'Individual brainstorm' : 'Shared board'}
+                      </p>
+                      <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-100/70">
+                        {isIndividualBrainstormStep
+                          ? 'Add one idea at a time. You can read your own cards now, while everyone else stays hidden until the next step.'
+                          : 'All cards are now visible so the group can read, discuss, and organize them together.'}
                       </p>
                     </div>
-                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
-                      <p className="text-sm text-slate-500">Format</p>
-                      <p className="mt-1 text-lg font-semibold capitalize text-slate-900">
-                        {currentStep?.activityType || 'Open discussion'}
+                    <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-100/70">
+                      <p>
+                        {currentActivityCards.length} card{currentActivityCards.length === 1 ? '' : 's'}
                       </p>
+                      {hiddenBrainstormCardCount > 0 ? (
+                        <p className="mt-1 text-xs uppercase tracking-[0.14em] text-slate-500">
+                          {hiddenBrainstormCardCount} hidden from you
+                        </p>
+                      ) : null}
                     </div>
+                  </div>
+
+                  {isIndividualBrainstormStep ? (
+                    <form
+                      onSubmit={(event) => {
+                        void submitBrainstormCard(event)
+                      }}
+                      className="mt-5 rounded-[1.5rem] border border-white/10 bg-white/5 p-4 shadow-[var(--theme-shadow-soft)]"
+                    >
+                      <label className="block text-sm font-medium text-white" htmlFor="brainstorm-card-input">
+                        Add a card
+                      </label>
+                      <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+                        <input
+                          id="brainstorm-card-input"
+                          type="text"
+                          value={brainstormDraft}
+                          onChange={(event) => setBrainstormDraft(event.target.value)}
+                          placeholder="Type one problem or idea"
+                          className="min-w-0 flex-1 rounded-2xl border border-white/10 bg-white/10 px-4 py-3 text-base text-white outline-none transition placeholder:text-slate-300/45 focus:border-slate-200 focus:bg-white/15"
+                          maxLength={180}
+                          disabled={!currentMember?.id || isSubmittingBrainstormCard}
+                        />
+                        <button
+                          type="submit"
+                          disabled={
+                            !currentMember?.id ||
+                            !brainstormDraft.trim() ||
+                            isSubmittingBrainstormCard
+                          }
+                          className={gradientButtonCompactClass}
+                        >
+                          {isSubmittingBrainstormCard ? 'Adding…' : 'Add card'}
+                        </button>
+                      </div>
+                    </form>
+                  ) : null}
+
+                  <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                    {currentActivityCards.length > 0 ? (
+                      currentActivityCards.map((card) => {
+                        const isCurrentUsersCard = card.authorId === currentMember?.id
+                        const isHiddenCard = !shouldRevealAllBrainstormCards && !isCurrentUsersCard
+
+                        return (
+                          <article
+                            key={card.id}
+                            className={`relative min-h-40 rounded-[1.5rem] border p-4 shadow-[var(--theme-shadow-soft)] transition ${
+                              isHiddenCard
+                                ? 'border-white/10 bg-white/10'
+                                : 'border-amber-300/20 bg-amber-300/10'
+                            }`}
+                          >
+                            <p className="text-xs uppercase tracking-[0.16em] text-slate-300">
+                              {isCurrentUsersCard ? 'You' : card.authorName || 'Room member'}
+                            </p>
+                            <p
+                              className={`mt-3 text-lg leading-7 text-white ${
+                                isHiddenCard ? 'select-none blur-md' : ''
+                              }`}
+                              aria-hidden={isHiddenCard}
+                            >
+                              {card.text}
+                            </p>
+                            {isHiddenCard ? (
+                              <div className="absolute inset-4 flex items-end">
+                                <p className="rounded-full bg-slate-900/90 px-3 py-1 text-xs font-medium uppercase tracking-[0.14em] text-slate-200 shadow-sm">
+                                  Reveals next step
+                                </p>
+                              </div>
+                            ) : null}
+                          </article>
+                        )
+                      })
+                    ) : (
+                      <div className="rounded-[1.5rem] border border-dashed border-white/15 bg-white/5 px-5 py-10 text-sm text-slate-300 md:col-span-2 xl:col-span-3">
+                        {isIndividualBrainstormStep
+                          ? 'No cards yet. Add the first idea for this activity.'
+                          : 'No cards were added during the individual brainstorm.'}
+                      </div>
+                    )}
                   </div>
                 </div>
               ) : null}
@@ -2858,6 +4371,7 @@ function App() {
   const [authReady, setAuthReady] = useState(!isSignInWithEmailLink(auth, window.location.href))
   const { pathname } = window.location
   const roomMatch = pathname.match(/^\/room\/([^/]+)\/?$/)
+  const workflowAdminMatch = pathname.match(/^\/admin\/workflows\/([^/]+)\/?$/)
 
   useEffect(() => {
     let cancelled = false
@@ -2959,6 +4473,10 @@ function App() {
 
   if (pathname === '/admin') {
     return <AdminPage />
+  }
+
+  if (workflowAdminMatch) {
+    return <WorkflowEditorPage workflowId={decodeURIComponent(workflowAdminMatch[1])} />
   }
 
   if (pathname === '/') {
