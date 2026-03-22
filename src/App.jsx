@@ -1,12 +1,20 @@
 import { useEffect, useState } from 'react'
 import {
+  EmailAuthProvider,
+  isSignInWithEmailLink,
+  linkWithCredential,
+  sendSignInLinkToEmail,
+  signInAnonymously,
+  signInWithEmailLink,
+} from 'firebase/auth'
+import {
   collection,
   doc,
   onSnapshot,
   serverTimestamp,
   setDoc,
 } from 'firebase/firestore'
-import { db } from './firebase.js'
+import { auth, db } from './firebase.js'
 
 const fallbackRoomTemplates = [
   {
@@ -296,6 +304,9 @@ function normalizeRoomTemplate(id, template) {
   }
 }
 
+const EMAIL_STORAGE_KEY = 'innovationery:email-link-email'
+const PENDING_AUTH_KEY = 'innovationery:pending-auth'
+
 function createRoomId() {
   return Math.random().toString(36).slice(2, 8).toUpperCase()
 }
@@ -303,6 +314,12 @@ function createRoomId() {
 function createMemberKey(email, name) {
   const source = (email || name).trim().toLowerCase()
   return source.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'guest'
+}
+
+function createAvatarUrl(email, name) {
+  const seedSource = email ?? name ?? 'guest'
+  const seed = String(seedSource).trim().toLowerCase() || 'guest'
+  return `https://robohash.org/${encodeURIComponent(seed)}?set=set3`
 }
 
 function navigateToRoom(roomId) {
@@ -328,23 +345,107 @@ function normalizeMembers(room, persistedMembers) {
     .map(([, value]) => value)
 }
 
+function getMemberDisplayName(member) {
+  return member?.name?.trim() || member?.email?.trim() || 'Guest'
+}
+
+function readPendingAuthContext() {
+  try {
+    return JSON.parse(window.localStorage.getItem(PENDING_AUTH_KEY) || 'null')
+  } catch {
+    return null
+  }
+}
+
+function writePendingAuthContext(context) {
+  window.localStorage.setItem(PENDING_AUTH_KEY, JSON.stringify(context))
+  window.localStorage.setItem(EMAIL_STORAGE_KEY, context.email)
+}
+
+function clearPendingAuthContext() {
+  window.localStorage.removeItem(PENDING_AUTH_KEY)
+  window.localStorage.removeItem(EMAIL_STORAGE_KEY)
+}
+
+function getRoomBannerKey(roomId) {
+  return `innovationery:room-banner:${roomId}`
+}
+
+function writeRoomBanner(roomId, banner) {
+  window.localStorage.setItem(getRoomBannerKey(roomId), JSON.stringify(banner))
+}
+
+function readRoomBanner(roomId) {
+  try {
+    return JSON.parse(window.localStorage.getItem(getRoomBannerKey(roomId)) || 'null')
+  } catch {
+    return null
+  }
+}
+
+function clearRoomBanner(roomId) {
+  window.localStorage.removeItem(getRoomBannerKey(roomId))
+}
+
+function getActionCodeSettings(roomId) {
+  return {
+    url: `${window.location.origin}/room/${encodeURIComponent(roomId)}`,
+    handleCodeInApp: true,
+  }
+}
+
+async function ensureActiveUser() {
+  if (auth.currentUser) {
+    return auth.currentUser
+  }
+
+  const credentials = await signInAnonymously(auth)
+  return credentials.user
+}
+
 async function upsertRoomMembership({
   roomId,
   roomTypeId,
   roomTemplate,
   name,
   email,
+  authUser,
   created = false,
 }) {
-  const memberKey = createMemberKey(email, name)
+  const normalizedName = name.trim()
+  const normalizedEmail = email.trim().toLowerCase()
+  const resolvedUser = authUser ?? auth.currentUser
+  const memberKey = resolvedUser?.uid ?? createMemberKey(email, name)
+  const isVerified = Boolean(resolvedUser && !resolvedUser.isAnonymous && resolvedUser.emailVerified)
   const member = {
     id: memberKey,
-    name: name.trim(),
-    email: email.trim().toLowerCase(),
+    authUid: resolvedUser?.uid ?? null,
+    name: normalizedName,
+    email: normalizedEmail,
+    isOnline: true,
+    isVerified,
     joinedAt: new Date().toISOString(),
   }
   const roomRef = doc(db, 'rooms', roomId)
   const memberRef = doc(db, 'rooms', roomId, 'members', memberKey)
+  const userRef = doc(db, 'users', memberKey)
+
+  await setDoc(
+    userRef,
+    {
+      id: memberKey,
+      authUid: resolvedUser?.uid ?? null,
+      name: normalizedName,
+      email: normalizedEmail,
+      isAnonymous: resolvedUser?.isAnonymous ?? false,
+      isVerified,
+      lastJoinedRoomId: roomId,
+      updatedAt: serverTimestamp(),
+      lastSeenAt: serverTimestamp(),
+      createdAt: serverTimestamp(),
+    },
+    { merge: true },
+  )
 
   await setDoc(
     roomRef,
@@ -376,12 +477,22 @@ async function upsertRoomMembership({
     },
     { merge: true },
   )
-  await setDoc(memberRef, member, { merge: true })
+  await setDoc(
+    memberRef,
+    {
+      ...member,
+      lastSeenAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    },
+    { merge: true },
+  )
 
   window.localStorage.setItem(
     `innovationery:room-member:${roomId}`,
     JSON.stringify(member),
   )
+
+  return member
 }
 
 function HomePage() {
@@ -464,7 +575,7 @@ function HomePage() {
 
     const roomId = joinForm.roomId.trim().toUpperCase()
     const name = joinForm.name.trim()
-    const email = joinForm.email.trim()
+    const email = joinForm.email.trim().toLowerCase()
 
     if (!roomId || !name || !email) {
       setJoinError('Enter a room id, name, and email to join.')
@@ -474,15 +585,41 @@ function HomePage() {
     setJoinLoading(true)
 
     try {
+      const activeUser = await ensureActiveUser()
+      const flow = {
+        roomId,
+        roomTypeId: 'custom',
+        name,
+        email,
+        created: false,
+      }
+
+      writePendingAuthContext(flow)
+
+      try {
+        await sendSignInLinkToEmail(auth, email, getActionCodeSettings(roomId))
+        writeRoomBanner(roomId, {
+          tone: 'sky',
+          text: `A one-time verification link was sent to ${email}. Verify your email whenever you are ready to recover this brainstorm later.`,
+        })
+      } catch {
+        clearPendingAuthContext()
+        writeRoomBanner(roomId, {
+          tone: 'slate',
+          text: 'We could not send the verification email right now, but you have still entered anonymously and can keep working.',
+        })
+      }
+
       await upsertRoomMembership({
         roomId,
         roomTypeId: 'custom',
         name,
         email,
+        authUser: activeUser,
       })
       navigateToRoom(roomId)
     } catch {
-      setJoinError('Unable to join the room right now. Check Firestore setup and try again.')
+      setJoinError('Unable to join the room right now. Check Firebase setup and try again.')
     } finally {
       setJoinLoading(false)
     }
@@ -493,7 +630,7 @@ function HomePage() {
     setCreateError('')
 
     const name = createForm.name.trim()
-    const email = createForm.email.trim()
+    const email = createForm.email.trim().toLowerCase()
 
     if (!name || !email) {
       setCreateError('Enter your name and email to create a room.')
@@ -509,17 +646,44 @@ function HomePage() {
     setCreateLoading(true)
 
     try {
-      await upsertRoomMembership({
+      const activeUser = await ensureActiveUser()
+      const flow = {
         roomId,
         roomTypeId: selectedTemplate.id,
         roomTemplate: selectedTemplate,
         name,
         email,
         created: true,
+      }
+
+      writePendingAuthContext(flow)
+
+      try {
+        await sendSignInLinkToEmail(auth, email, getActionCodeSettings(roomId))
+        writeRoomBanner(roomId, {
+          tone: 'sky',
+          text: `A one-time verification link was sent to ${email}. Verify your email whenever you are ready to recover this brainstorm later.`,
+        })
+      } catch {
+        clearPendingAuthContext()
+        writeRoomBanner(roomId, {
+          tone: 'slate',
+          text: 'We could not send the verification email right now, but your room was still created and you entered anonymously.',
+        })
+      }
+
+      await upsertRoomMembership({
+        roomId,
+        roomTypeId: selectedTemplate.id,
+        roomTemplate: selectedTemplate,
+        name,
+        email,
+        authUser: activeUser,
+        created: true,
       })
       navigateToRoom(roomId)
     } catch {
-      setCreateError('Unable to create the room right now. Check Firestore setup and try again.')
+      setCreateError('Unable to create the room right now. Check Firebase setup and try again.')
     } finally {
       setCreateLoading(false)
     }
@@ -831,7 +995,7 @@ function HomePage() {
                       />
                     </label>
                     <div className="rounded-[1.25rem] border border-white/10 bg-white/5 px-4 py-3 text-sm text-orange-100/80">
-                      Creating a room stores the room id in Firestore and adds you as the first member.
+                      Creating a room stores the room id in Firestore, enters you anonymously right away, and sends a one-time verification link in parallel.
                     </div>
                     {createError ? (
                       <p className="text-sm font-medium text-rose-300">{createError}</p>
@@ -841,7 +1005,7 @@ function HomePage() {
                       disabled={createLoading || !selectedTemplate}
                       className="inline-flex min-h-14 items-center justify-center rounded-full bg-orange-100 px-7 text-base font-medium text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
                     >
-                      {createLoading ? 'Creating room...' : 'Create Room'}
+                      {createLoading ? 'Preparing...' : 'Create Room'}
                     </button>
                   </form>
                 </div>
@@ -896,6 +1060,10 @@ function RoomPage({ roomId }) {
   const [persistedMembers, setPersistedMembers] = useState([])
   const [status, setStatus] = useState('loading')
   const [memberStatus, setMemberStatus] = useState('loading')
+  const [banner, setBanner] = useState(() => readRoomBanner(roomId))
+  const currentMember = JSON.parse(
+    window.localStorage.getItem(`innovationery:room-member:${roomId}`) || 'null',
+  )
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
@@ -935,11 +1103,47 @@ function RoomPage({ roomId }) {
     return unsubscribe
   }, [roomId])
 
-  const currentMember = JSON.parse(
-    window.localStorage.getItem(`innovationery:room-member:${roomId}`) || 'null',
-  )
+  useEffect(() => {
+    if (!currentMember?.id) {
+      return undefined
+    }
+
+    const memberRef = doc(db, 'rooms', roomId, 'members', currentMember.id)
+
+    const setPresence = (isOnline) =>
+      setDoc(
+        memberRef,
+        {
+          isOnline,
+          lastSeenAt: serverTimestamp(),
+        },
+        { merge: true },
+      )
+
+    void setPresence(true)
+
+    const handleVisibilityChange = () => {
+      void setPresence(document.visibilityState === 'visible')
+    }
+
+    const handlePageHide = () => {
+      void setPresence(false)
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    window.addEventListener('pagehide', handlePageHide)
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      window.removeEventListener('pagehide', handlePageHide)
+      void setPresence(false)
+    }
+  }, [currentMember?.id, roomId])
+
   const members = normalizeMembers(room, persistedMembers)
-    .sort((left, right) => left.name.localeCompare(right.name))
+    .sort((left, right) =>
+      getMemberDisplayName(left).localeCompare(getMemberDisplayName(right)),
+    )
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.14),_transparent_30%),linear-gradient(180deg,_#f8fbff_0%,_#eef4ff_100%)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
@@ -974,6 +1178,30 @@ function RoomPage({ roomId }) {
             </a>
           </div>
         </section>
+
+        {banner ? (
+          <section
+            className={`rounded-[1.5rem] border px-5 py-4 text-sm leading-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] ${
+              banner.tone === 'sky'
+                ? 'border-sky-200 bg-sky-50 text-sky-900'
+                : 'border-slate-200 bg-slate-50 text-slate-700'
+            }`}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p>{banner.text}</p>
+              <button
+                type="button"
+                onClick={() => {
+                  clearRoomBanner(roomId)
+                  setBanner(null)
+                }}
+                className="text-sm font-medium text-slate-500 transition hover:text-slate-700"
+              >
+                Dismiss
+              </button>
+            </div>
+          </section>
+        ) : null}
 
         <section className="grid gap-5 lg:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]">
           <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/85 p-6 shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
@@ -1011,29 +1239,27 @@ function RoomPage({ roomId }) {
             {status === 'ready' && members.length > 0 ? (
               <div className="mt-6 grid gap-3">
                 {members.map((member) => {
-                  const initials = member.name
-                    .split(/\s+/)
-                    .filter(Boolean)
-                    .slice(0, 2)
-                    .map((part) => part[0]?.toUpperCase())
-                    .join('')
-
                   const isCurrentMember = currentMember?.id === member.id
+                  const displayName = getMemberDisplayName(member)
 
                   return (
                     <div
-                      key={member.id}
+                      key={member.id || member.email || displayName}
                       className="flex items-center justify-between gap-4 rounded-[1.25rem] border border-slate-900/10 bg-slate-50 px-4 py-4"
                     >
                       <div className="flex items-center gap-4">
-                        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-sky-900 text-sm font-semibold text-white">
-                          {initials || '??'}
-                        </div>
+                        <img
+                          src={createAvatarUrl(member.email, member.name)}
+                          alt={`${displayName} avatar`}
+                          className="h-12 w-12 rounded-full border border-slate-900/10 bg-slate-200 object-cover"
+                        />
                         <div>
                           <p className="text-base font-semibold text-slate-900">
-                            {member.name}
+                            {displayName}
                           </p>
-                          <p className="text-sm text-slate-600">{member.email}</p>
+                          <p className="text-sm text-slate-600">
+                            {member.email || 'No email provided'}
+                          </p>
                         </div>
                       </div>
                       <div className="flex flex-wrap items-center justify-end gap-2">
@@ -1042,8 +1268,23 @@ function RoomPage({ roomId }) {
                             You
                           </span>
                         ) : null}
-                        <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
-                          Active member
+                        <span
+                          className={`rounded-full px-3 py-1 text-xs font-medium ${
+                            member.isOnline
+                              ? 'bg-emerald-50 text-emerald-700'
+                              : 'bg-slate-200 text-slate-600'
+                          }`}
+                        >
+                          {member.isOnline ? 'Online' : 'Offline'}
+                        </span>
+                        <span
+                          className={`rounded-full px-3 py-1 text-xs font-medium ${
+                            member.isVerified
+                              ? 'bg-sky-100 text-sky-800'
+                              : 'bg-amber-50 text-amber-700'
+                          }`}
+                        >
+                          {member.isVerified ? 'Verified' : 'Anonymous'}
                         </span>
                       </div>
                     </div>
@@ -1113,8 +1354,102 @@ function NotFoundPage() {
 }
 
 function App() {
+  const [authReady, setAuthReady] = useState(!isSignInWithEmailLink(auth, window.location.href))
   const { pathname } = window.location
   const roomMatch = pathname.match(/^\/room\/([^/]+)\/?$/)
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function resolveEmailLink() {
+      if (!isSignInWithEmailLink(auth, window.location.href)) {
+        if (!cancelled) {
+          setAuthReady(true)
+        }
+        return
+      }
+
+      const pendingContext = readPendingAuthContext()
+      const storedEmail = window.localStorage.getItem(EMAIL_STORAGE_KEY)
+      const email = storedEmail || pendingContext?.email
+
+      if (!email) {
+        if (pendingContext?.roomId) {
+          writeRoomBanner(pendingContext.roomId, {
+            tone: 'slate',
+            text: 'We could not finish email verification on this device because the original email address was not available.',
+          })
+        }
+
+        if (!cancelled) {
+          setAuthReady(true)
+        }
+        return
+      }
+
+      try {
+        if (auth.currentUser?.isAnonymous) {
+          const credential = EmailAuthProvider.credentialWithLink(email, window.location.href)
+          await linkWithCredential(auth.currentUser, credential)
+        } else {
+          await signInWithEmailLink(auth, email, window.location.href)
+        }
+
+        if (pendingContext && auth.currentUser) {
+          await upsertRoomMembership({
+            roomId: pendingContext.roomId,
+            roomTypeId: pendingContext.roomTypeId,
+            roomTemplate: pendingContext.roomTemplate,
+            name: pendingContext.name,
+            email: pendingContext.email,
+            authUser: auth.currentUser,
+            created: false,
+          })
+
+          writeRoomBanner(pendingContext.roomId, {
+            tone: 'sky',
+            text: 'Email verified. This brainstorm is now linked to your verified sign-in.',
+          })
+        }
+
+        clearPendingAuthContext()
+
+        if (pendingContext?.roomId) {
+          window.history.replaceState({}, '', `/room/${encodeURIComponent(pendingContext.roomId)}`)
+        } else {
+          window.history.replaceState({}, '', '/')
+        }
+      } catch {
+        if (pendingContext?.roomId) {
+          writeRoomBanner(pendingContext.roomId, {
+            tone: 'slate',
+            text: 'We could not complete email verification. You can keep working anonymously and try again later.',
+          })
+        }
+      } finally {
+        if (!cancelled) {
+          setAuthReady(true)
+        }
+      }
+    }
+
+    void resolveEmailLink()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  if (!authReady) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[linear-gradient(180deg,_#fff8ef_0%,_#f5efe6_100%)] px-5 py-6 text-slate-800">
+        <div className="rounded-[2rem] border border-slate-900/10 bg-white/85 px-8 py-10 text-center shadow-[0_24px_80px_rgba(10,34,51,0.08)] backdrop-blur">
+          <p className="text-sm uppercase tracking-[0.24em] text-sky-700">Finishing sign-in</p>
+          <h1 className="mt-4 font-serif text-4xl text-slate-900">Verifying your email link...</h1>
+        </div>
+      </main>
+    )
+  }
 
   if (roomMatch) {
     const roomId = decodeURIComponent(roomMatch[1])
