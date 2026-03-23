@@ -609,6 +609,7 @@ function getDefaultStepStatePaths(step, index = 0) {
     `steps.${stepKey}.startTime`,
     `steps.${stepKey}.pauseTime`,
     `steps.${stepKey}.cards`,
+    `steps.${stepKey}.fillInBlankInputs`,
   ]
 }
 
@@ -618,6 +619,10 @@ function getWorkflowStateValueForPath(path) {
   }
 
   if (path.endsWith('.cards')) {
+    return []
+  }
+
+  if (path.endsWith('.fillInBlankInputs')) {
     return []
   }
 
@@ -693,6 +698,41 @@ function normalizeWorkflowCardMetadata(card) {
       : typeof card?.groupId === 'string'
         ? card.groupId
         : null
+  const votesSource =
+    metadataSource.votes && typeof metadataSource.votes === 'object' && !Array.isArray(metadataSource.votes)
+      ? metadataSource.votes
+      : card?.votes && typeof card.votes === 'object' && !Array.isArray(card.votes)
+        ? card.votes
+        : {}
+  const votes = Object.entries(votesSource).reduce((accumulator, [memberId, count]) => {
+    if (typeof memberId !== 'string' || !memberId.trim()) {
+      return accumulator
+    }
+
+    const normalizedCount = Math.max(0, Math.floor(toNumber(count) ?? 0))
+
+    if (normalizedCount > 0) {
+      accumulator[memberId.trim()] = normalizedCount
+    }
+
+    return accumulator
+  }, {})
+  const selectedSource =
+    typeof metadataSource.selected === 'boolean'
+      ? metadataSource.selected
+      : typeof card?.selected === 'boolean'
+        ? card.selected
+        : false
+  const sourceCardsSource =
+    Array.isArray(metadataSource.sourceCards)
+      ? metadataSource.sourceCards
+      : Array.isArray(card?.sourceCards)
+        ? card.sourceCards
+        : []
+  const sourceCards = sourceCardsSource
+    .filter((value) => value && typeof value === 'object' && !Array.isArray(value))
+    .map((value, index) => normalizeWorkflowCard(value, index))
+    .filter(Boolean)
   const metadata = {}
 
   if (variables.length > 0) {
@@ -701,6 +741,18 @@ function normalizeWorkflowCardMetadata(card) {
 
   if (groupIdSource && groupIdSource.trim()) {
     metadata.groupId = groupIdSource.trim()
+  }
+
+  if (Object.keys(votes).length > 0) {
+    metadata.votes = votes
+  }
+
+  if (selectedSource) {
+    metadata.selected = true
+  }
+
+  if (sourceCards.length > 0) {
+    metadata.sourceCards = sourceCards
   }
 
   return Object.keys(metadata).length > 0 ? metadata : undefined
@@ -817,6 +869,11 @@ function normalizeWorkflowRuntime(runtime, steps, legacyStepCardsByKey = {}) {
             .map((card, cardIndex) => normalizeWorkflowCard(card, cardIndex))
             .filter(Boolean)
         : [...(legacyStepCardsByKey[stepKey] ?? [])],
+      fillInBlankInputs: Array.isArray(persistedStepState?.fillInBlankInputs)
+        ? persistedStepState.fillInBlankInputs
+            .filter((value) => typeof value === 'string')
+            .map((value) => value.trim())
+        : [],
     }
 
     return accumulator
@@ -826,6 +883,268 @@ function normalizeWorkflowRuntime(runtime, steps, legacyStepCardsByKey = {}) {
     currentStepIndex: toNumber(runtime?.currentStepIndex) ?? 0,
     steps: normalizedSteps,
   }
+}
+
+function getWorkflowCardVoteCount(card) {
+  return Object.values(card?.metadata?.votes ?? {}).reduce(
+    (total, count) => total + Math.max(0, Math.floor(toNumber(count) ?? 0)),
+    0,
+  )
+}
+
+function buildCardOptions(cards) {
+  return (Array.isArray(cards) ? cards : []).reduce((accumulator, card) => {
+    const groupLabel = card.metadata?.groupId?.trim()
+
+    if (groupLabel) {
+      const existingOption = accumulator.find(
+        (option) => option.type === 'group' && option.groupLabel === groupLabel,
+      )
+
+      if (existingOption) {
+        existingOption.cards.push(card)
+        return accumulator
+      }
+
+      accumulator.push({
+        id: `group:${groupLabel}`,
+        type: 'group',
+        groupLabel,
+        title: groupLabel,
+        cards: [card],
+        representativeCardId: card.id,
+      })
+      return accumulator
+    }
+
+    accumulator.push({
+      id: `card:${card.id}`,
+      type: 'card',
+      title: card.authorName || 'Room member',
+      cards: [card],
+      representativeCardId: card.id,
+    })
+    return accumulator
+  }, [])
+}
+
+function getStepOutputCards(step, cards) {
+  const normalizedCards = Array.isArray(cards) ? cards : []
+  const normalizedActivityType = normalizeActivityType(step?.activityType)
+
+  if (normalizedActivityType === 'group stickies') {
+    const groupedCards = normalizedCards.reduce(
+      (accumulator, card) => {
+        const groupLabel = card.metadata?.groupId?.trim()
+
+        if (!groupLabel) {
+          accumulator.ungrouped.push({ ...card })
+          return accumulator
+        }
+
+        accumulator.groups[groupLabel] = [...(accumulator.groups[groupLabel] ?? []), { ...card }]
+        return accumulator
+      },
+      { groups: {}, ungrouped: [] },
+    )
+
+    const collapsedGroupCards = Object.entries(groupedCards.groups).map(
+      ([groupLabel, groupCards], groupIndex) => ({
+        id: `group-output-${groupIndex + 1}-${groupLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'group'}`,
+        authorId: '',
+        authorName: '',
+        text: groupLabel,
+        createdAt: groupCards[0]?.createdAt ?? new Date(0).toISOString(),
+        metadata: {
+          sourceCards: groupCards.map((card) => ({ ...card })),
+        },
+      }),
+    )
+
+    return [...collapsedGroupCards, ...groupedCards.ungrouped].sort((leftCard, rightCard) => {
+      const voteDifference = getWorkflowCardVoteCount(rightCard) - getWorkflowCardVoteCount(leftCard)
+
+      if (voteDifference !== 0) {
+        return voteDifference
+      }
+
+      return leftCard.createdAt.localeCompare(rightCard.createdAt)
+    })
+  }
+
+  const clonedCards =
+    normalizedActivityType === 'card selection'
+      ? normalizedCards
+          .filter((card) => card?.metadata?.selected)
+          .map((card) => ({ ...card }))
+      : normalizedCards.map((card) => ({ ...card }))
+
+  return clonedCards.sort((leftCard, rightCard) => {
+    const voteDifference = getWorkflowCardVoteCount(rightCard) - getWorkflowCardVoteCount(leftCard)
+
+    if (voteDifference !== 0) {
+      return voteDifference
+    }
+
+    return leftCard.createdAt.localeCompare(rightCard.createdAt)
+  })
+}
+
+function prepareCardsForStep(step, cards) {
+  const normalizedCards = Array.isArray(cards) ? cards.map((card) => ({ ...card })) : []
+
+  if (!['voting', 'card selection'].includes(normalizeActivityType(step?.activityType))) {
+    return normalizedCards
+  }
+
+  return normalizedCards.map((card) => {
+    const nextMetadata =
+      card.metadata && typeof card.metadata === 'object' ? { ...card.metadata } : {}
+
+    if (normalizeActivityType(step?.activityType) === 'voting') {
+      delete nextMetadata.votes
+    }
+
+    if (normalizeActivityType(step?.activityType) === 'card selection') {
+      delete nextMetadata.selected
+    }
+
+    if (Object.keys(nextMetadata).length === 0) {
+      const { metadata, ...cardWithoutMetadata } = card
+      return cardWithoutMetadata
+    }
+
+    return {
+      ...card,
+      metadata: nextMetadata,
+    }
+  })
+}
+
+function parseFillInBlankTemplate(template) {
+  const fallbackTemplate = 'We will focus on _ for _ so that _.'
+  const normalizedTemplate =
+    typeof template === 'string' && template.trim() ? template.trim() : fallbackTemplate
+  let blankIndex = 0
+  const parts = []
+  let cursor = 0
+
+  while (cursor < normalizedTemplate.length) {
+    const hintMatch = normalizedTemplate.slice(cursor).match(/^_\(([^)]*)\)_/)
+
+    if (hintMatch) {
+      blankIndex += 1
+      parts.push({
+        type: 'blank',
+        label: hintMatch[1].trim() || `Blank ${blankIndex}`,
+      })
+      cursor += hintMatch[0].length
+      continue
+    }
+
+    if (normalizedTemplate[cursor] === '_') {
+      blankIndex += 1
+      parts.push({
+        type: 'blank',
+        label: `Blank ${blankIndex}`,
+      })
+      cursor += 1
+      continue
+    }
+
+    let nextCursor = cursor
+
+    while (
+      nextCursor < normalizedTemplate.length &&
+      normalizedTemplate[nextCursor] !== '_'
+    ) {
+      nextCursor += 1
+    }
+
+    parts.push({
+      type: 'text',
+      value: normalizedTemplate.slice(cursor, nextCursor),
+    })
+    cursor = nextCursor
+  }
+
+  return parts
+}
+
+function createFillInBlankCard(step) {
+  const templateText =
+    typeof step?.data?.text === 'string' && step.data.text.trim()
+      ? step.data.text.trim()
+      : 'We will focus on _ for _ so that _.'
+
+  return {
+    id: createEditorId('fill-card'),
+    authorId: '',
+    authorName: '',
+    text: templateText,
+    createdAt: new Date(0).toISOString(),
+  }
+}
+
+function fillInBlankTextFromInputs(template, inputs) {
+  let blankIndex = 0
+
+  return parseFillInBlankTemplate(template)
+    .map((part) => {
+      if (part.type === 'text') {
+        return part.value
+      }
+
+      const nextValue = inputs?.[blankIndex] ?? ''
+      blankIndex += 1
+      return nextValue.trim() ? nextValue.trim() : `[${part.label}]`
+    })
+    .join('')
+}
+
+function getCardSourcePrompts(steps, stepIndex, visited = new Set()) {
+  const step = steps[stepIndex]
+
+  if (!step) {
+    return []
+  }
+
+  const stepKey = getWorkflowStepStateKey(step, stepIndex)
+
+  if (visited.has(stepKey)) {
+    return []
+  }
+
+  const nextVisited = new Set(visited)
+  nextVisited.add(stepKey)
+
+  const referencedStepIds = normalizeStepInputIds(step.inputStepIds)
+  const sourceStepIndices =
+    referencedStepIds.length > 0
+      ? referencedStepIds
+          .map((sourceStepId) => steps.findIndex((candidateStep) => candidateStep.id === sourceStepId))
+          .filter((index) => index >= 0)
+      : stepIndex > 0 &&
+          ['group stickies', 'voting', 'card selection', 'group fill in the blank'].includes(
+            normalizeActivityType(step.activityType),
+          )
+        ? [stepIndex - 1]
+        : []
+
+  const prompts = sourceStepIndices.flatMap((sourceStepIndex) => {
+    const upstreamPrompts = getCardSourcePrompts(steps, sourceStepIndex, nextVisited)
+
+    if (upstreamPrompts.length > 0) {
+      return upstreamPrompts
+    }
+
+    const sourceStep = steps[sourceStepIndex]
+    const prompt = sourceStep?.prompt?.trim() || sourceStep?.title?.trim() || ''
+
+    return prompt ? [prompt] : []
+  })
+
+  return [...new Set(prompts)]
 }
 
 function getSeedCardsForStep(steps, stepIndex, runtime) {
@@ -849,14 +1168,17 @@ function getSeedCardsForStep(steps, stepIndex, runtime) {
       }
 
       const sourceStepKey = getWorkflowStepStateKey(steps[sourceStepIndex], sourceStepIndex)
-      const sourceCards = normalizedRuntime.steps[sourceStepKey]?.cards ?? []
+      const sourceCards = getStepOutputCards(
+        steps[sourceStepIndex],
+        normalizedRuntime.steps[sourceStepKey]?.cards ?? [],
+      )
 
       sourceCards.forEach((card) => {
         combinedCards.push({ ...card })
       })
     })
 
-    return combinedCards
+    return prepareCardsForStep(step, combinedCards)
   }
 
   const previousStepKey =
@@ -870,7 +1192,13 @@ function getSeedCardsForStep(steps, stepIndex, runtime) {
       normalizeActivityType(step.activityType),
     )
   ) {
-    return (normalizedRuntime.steps[previousStepKey]?.cards ?? []).map((card) => ({ ...card }))
+    return prepareCardsForStep(
+      step,
+      getStepOutputCards(
+      steps[stepIndex - 1],
+      normalizedRuntime.steps[previousStepKey]?.cards ?? [],
+      ),
+    )
   }
 
   return []
@@ -880,12 +1208,23 @@ function createWorkflowRuntimeForStep(steps, stepIndex, runtime, timestamp = new
   const normalizedRuntime = normalizeWorkflowRuntime(runtime, steps)
   const boundedStepIndex =
     steps.length > 0 ? Math.max(0, Math.min(stepIndex, steps.length - 1)) : 0
-  const stepKey = getWorkflowStepStateKey(steps[boundedStepIndex], boundedStepIndex)
+  const targetStep = steps[boundedStepIndex]
+  const stepKey = getWorkflowStepStateKey(targetStep, boundedStepIndex)
   const existingCards = stepKey ? normalizedRuntime.steps[stepKey]?.cards ?? [] : []
+  const existingFillInBlankInputs = stepKey
+    ? normalizedRuntime.steps[stepKey]?.fillInBlankInputs ?? []
+    : []
   const seededCards = getSeedCardsForStep(steps, boundedStepIndex, normalizedRuntime)
+  const isFillInBlankStep = normalizeActivityType(targetStep?.activityType) === 'group fill in the blank'
+  const shouldResetCardsFromInputs =
+    !isFillInBlankStep && normalizeStepInputIds(targetStep?.inputStepIds).length > 0
+  const shouldResetFillInBlankInputs =
+    normalizeActivityType(targetStep?.activityType) === 'group fill in the blank'
+  const startedAt = typeof runtime?.startedAt === 'string' ? runtime.startedAt : null
 
   return {
     ...normalizedRuntime,
+    startedAt,
     currentStepIndex: boundedStepIndex,
     steps: {
       ...normalizedRuntime.steps,
@@ -895,10 +1234,16 @@ function createWorkflowRuntimeForStep(steps, stepIndex, runtime, timestamp = new
               ...(normalizedRuntime.steps[stepKey] ?? {}),
               startTime: timestamp.toISOString(),
               pauseTime: null,
-              cards:
-                existingCards.length > 0
+              cards: shouldResetCardsFromInputs
+                ? seededCards
+                : isFillInBlankStep
+                  ? existingCards.length > 0
+                    ? existingCards
+                    : [createFillInBlankCard(targetStep)]
+                : existingCards.length > 0
                   ? existingCards
                   : seededCards,
+              fillInBlankInputs: shouldResetFillInBlankInputs ? [] : existingFillInBlankInputs,
             },
           }
         : {}),
@@ -909,13 +1254,18 @@ function createWorkflowRuntimeForStep(steps, stepIndex, runtime, timestamp = new
 function completeWorkflowStepRuntime(steps, stepIndex, runtime, durationSeconds, timestamp = new Date()) {
   const normalizedRuntime = normalizeWorkflowRuntime(runtime, steps)
   const stepKey = getWorkflowStepStateKey(steps[stepIndex], stepIndex)
+  const startedAt = typeof runtime?.startedAt === 'string' ? runtime.startedAt : null
 
   if (!stepKey) {
-    return normalizedRuntime
+    return {
+      ...normalizedRuntime,
+      startedAt,
+    }
   }
 
   return {
     ...normalizedRuntime,
+    startedAt,
     currentStepIndex: stepIndex,
     steps: {
       ...normalizedRuntime.steps,
@@ -3513,6 +3863,10 @@ function RoomPage({ roomId }) {
   const [workflowDefinition, setWorkflowDefinition] = useState(null)
   const [workflowStatus, setWorkflowStatus] = useState('loading')
   const [brainstormDraft, setBrainstormDraft] = useState('')
+  const [groupLabelDrafts, setGroupLabelDrafts] = useState({})
+  const [draggedCardId, setDraggedCardId] = useState(null)
+  const [selectedGroupingCardIds, setSelectedGroupingCardIds] = useState([])
+  const [fillInBlankDrafts, setFillInBlankDrafts] = useState([])
   const [isSubmittingBrainstormCard, setIsSubmittingBrainstormCard] = useState(false)
   const [roomIdentityForm, setRoomIdentityForm] = useState(() => ({
     name: '',
@@ -3741,6 +4095,12 @@ function RoomPage({ roomId }) {
   const isRoundRobinStep = currentStep?.activityType === 'roundrobin'
   const isIndividualBrainstormStep = currentStep?.activityType === 'individual stickies'
   const isGroupBrainstormStep = currentStep?.activityType === 'group stickies'
+  const isVotingStep = currentStep?.activityType === 'voting'
+  const isCardSelectionStep = normalizeActivityType(currentStep?.activityType) === 'card selection'
+  const isGroupFillInBlankStep = currentStep?.activityType === 'group fill in the blank'
+  const shouldSeedCurrentStepCards = ['group stickies', 'voting', 'card selection'].includes(
+    normalizeActivityType(currentStep?.activityType),
+  )
   const currentStepDurationSeconds = (currentStep?.durationMinutes ?? 0) * 60
   const remainingSeconds = hasWorkflowStarted
     ? getStepRemainingSeconds(currentStepDurationSeconds, currentStepRuntime, new Date(nowMs))
@@ -3806,12 +4166,115 @@ function RoomPage({ roomId }) {
   const currentStepCards = currentStepKey
     ? roomWorkflowState.steps?.[currentStepKey]?.cards ?? []
     : []
+  const currentStepFillInBlankInputs = currentStepKey
+    ? roomWorkflowState.steps?.[currentStepKey]?.fillInBlankInputs ?? []
+    : []
+  const seededCurrentStepCards =
+    shouldSeedCurrentStepCards && currentStepCards.length === 0
+      ? getSeedCardsForStep(workflowSequence, safeCurrentStepIndex, roomWorkflowState)
+      : []
+  const displayedStepCards = currentStepCards.length > 0 ? currentStepCards : seededCurrentStepCards
+  const fillInBlankTemplateParts = parseFillInBlankTemplate(currentStep?.data?.text)
+  const fillInBlankCount = fillInBlankTemplateParts.filter((part) => part.type === 'blank').length
+  const fillInBlankReferenceCards = isGroupFillInBlankStep
+    ? getSeedCardsForStep(workflowSequence, safeCurrentStepIndex, roomWorkflowState)
+    : []
+  const fillInBlankReferencePrompts = isGroupFillInBlankStep
+    ? getCardSourcePrompts(workflowSequence, safeCurrentStepIndex)
+    : []
+  const fillInBlankReferencePromptLabel = fillInBlankReferencePrompts.join(' / ')
+  const groupedCardsByLabel = displayedStepCards.reduce((accumulator, card) => {
+    const groupLabel = card.metadata?.groupId?.trim() || 'Ungrouped'
+
+    accumulator[groupLabel] = [...(accumulator[groupLabel] ?? []), card]
+    return accumulator
+  }, {})
+  const groupedCardSections = Object.entries(groupedCardsByLabel).sort(([leftLabel], [rightLabel]) => {
+    if (leftLabel === 'Ungrouped') {
+      return -1
+    }
+
+    if (rightLabel === 'Ungrouped') {
+      return 1
+    }
+
+    return leftLabel.localeCompare(rightLabel)
+  })
   const shouldRevealAllBrainstormCards = isGroupBrainstormStep
   const shouldPromptForRoomIdentity = !currentMember?.id && (status === 'ready' || isDemoRoom)
   const visibleBrainstormCardCount = currentStepCards.filter(
     (card) => shouldRevealAllBrainstormCards || card.authorId === currentMember?.id,
   ).length
-  const hiddenBrainstormCardCount = currentStepCards.length - visibleBrainstormCardCount
+  const hiddenBrainstormCardCount = displayedStepCards.length - visibleBrainstormCardCount
+  const votingOptions = buildCardOptions(displayedStepCards)
+  const voteLimit = Math.max(0, Math.floor(toNumber(currentStep?.data?.numberOfVotes) ?? 0)) || 3
+  const currentMemberVoteCount = currentMember?.id
+    ? votingOptions.reduce((total, option) => {
+        const representativeCard = option.cards.find(
+          (card) => card.id === option.representativeCardId,
+        )
+
+        return (
+          total +
+          Math.max(
+            0,
+            Math.floor(toNumber(representativeCard?.metadata?.votes?.[currentMember.id]) ?? 0),
+          )
+        )
+      }, 0)
+    : 0
+  const remainingVotes = Math.max(0, voteLimit - currentMemberVoteCount)
+  const selectionLimit = Math.max(0, Math.floor(toNumber(currentStep?.data?.numberOfCards) ?? 0)) || 3
+  const selectedOptionIds = votingOptions.reduce((accumulator, option) => {
+    const representativeCard = option.cards.find((card) => card.id === option.representativeCardId)
+
+    if (representativeCard?.metadata?.selected) {
+      accumulator.push(option.id)
+    }
+
+    return accumulator
+  }, [])
+  const remainingSelections = Math.max(0, selectionLimit - selectedOptionIds.length)
+  const totalTeamVotesCast = votingOptions.reduce((total, option) => {
+    const representativeCard = option.cards.find((card) => card.id === option.representativeCardId)
+    return total + getWorkflowCardVoteCount(representativeCard)
+  }, 0)
+  const maxTeamVotes = voteLimit * members.length
+  const stepStatusProgressPercent = isVotingStep
+    ? maxTeamVotes > 0
+      ? Math.min(100, Math.max(0, (totalTeamVotesCast / maxTeamVotes) * 100))
+      : 0
+    : isCardSelectionStep
+      ? selectionLimit > 0
+        ? Math.min(100, Math.max(0, (selectedOptionIds.length / selectionLimit) * 100))
+        : 0
+      : currentStepProgressPercent
+  const workflowSummaryActivities = workflowActivities.map((activity, activityIndex) => ({
+    ...activity,
+    summarySteps: workflowSequence
+      .filter((step) => step.activityIndex === activityIndex)
+      .map((step) => {
+        const stepKey = getWorkflowStepStateKey(step, step.sequenceIndex)
+        const stepState = roomWorkflowState.steps?.[stepKey] ?? {
+          cards: [],
+          fillInBlankInputs: [],
+        }
+        const outputCards = getStepOutputCards(step, stepState.cards ?? [])
+        const stepOptions = buildCardOptions(stepState.cards ?? [])
+        const selectedCards = getStepOutputCards({ ...step, activityType: 'card selection' }, stepState.cards ?? [])
+
+        return {
+          ...step,
+          outputCards,
+          stepOptions,
+          selectedCards,
+          fillInBlankText: fillInBlankTextFromInputs(step.data?.text, stepState.fillInBlankInputs ?? []),
+        }
+      }),
+  }))
+  const workflowSummarySteps = workflowSummaryActivities
+    .flatMap((activity) => activity.summarySteps)
+    .filter((step) => normalizeActivityType(step.activityType) !== 'roundrobin')
   const persistWorkflowState = async (updater) => {
     await updateRoomDocument(roomId, (currentRoom) => {
       const currentWorkflowState = normalizeRoomWorkflowState(currentRoom.workflowState, workflowSequence)
@@ -3826,11 +4289,14 @@ function RoomPage({ roomId }) {
   }
 
   const startWorkflow = async () => {
-    await persistWorkflowState((currentWorkflowState) => ({
-      ...currentWorkflowState,
-      startedAt: new Date().toISOString(),
-      ...createWorkflowRuntimeForStep(workflowSequence, 0, currentWorkflowState),
-    }))
+    const timestamp = new Date().toISOString()
+
+    await persistWorkflowState((currentWorkflowState) =>
+      createWorkflowRuntimeForStep(workflowSequence, 0, {
+        ...currentWorkflowState,
+        startedAt: timestamp,
+      }),
+    )
   }
 
   const togglePauseState = async () => {
@@ -3938,7 +4404,6 @@ function RoomPage({ roomId }) {
             [currentStepKey]: {
               ...currentStepState,
               cards: [
-                ...currentStepState.cards,
                 {
                   id: createEditorId('card'),
                   authorId: currentMember.id,
@@ -3946,6 +4411,7 @@ function RoomPage({ roomId }) {
                   text: trimmedDraft,
                   createdAt: new Date().toISOString(),
                 },
+                ...currentStepState.cards,
               ],
             },
           },
@@ -3956,6 +4422,338 @@ function RoomPage({ roomId }) {
       setIsSubmittingBrainstormCard(false)
     }
   }
+
+  const updateCurrentStepCards = async (updater) => {
+    if (!currentStepKey) {
+      return
+    }
+
+    await persistWorkflowState((currentWorkflowState) => {
+      const currentStepState = currentWorkflowState.steps?.[currentStepKey] ?? {
+        startTime: null,
+        pauseTime: null,
+        cards: [],
+      }
+      const baseCards =
+        currentStepState.cards.length === 0 && shouldSeedCurrentStepCards
+          ? getSeedCardsForStep(workflowSequence, safeCurrentStepIndex, currentWorkflowState)
+          : currentStepState.cards
+
+      return {
+        ...currentWorkflowState,
+        steps: {
+          ...currentWorkflowState.steps,
+          [currentStepKey]: {
+            ...currentStepState,
+            cards: typeof updater === 'function' ? updater(baseCards) : baseCards,
+          },
+        },
+      }
+    })
+  }
+
+  const applyGroupLabelToCard = (card, groupLabel) => {
+    const normalizedGroupLabel = groupLabel.trim()
+    const nextMetadata =
+      card.metadata && typeof card.metadata === 'object' ? { ...card.metadata } : {}
+
+    if (normalizedGroupLabel) {
+      nextMetadata.groupId = normalizedGroupLabel
+    } else {
+      delete nextMetadata.groupId
+    }
+
+    if (Object.keys(nextMetadata).length === 0) {
+      const { metadata, ...cardWithoutMetadata } = card
+      return cardWithoutMetadata
+    }
+
+    return {
+      ...card,
+      metadata: nextMetadata,
+    }
+  }
+
+  const getNextGeneratedGroupLabel = (preferredLabel = '') => {
+    const existingLabels = new Set(
+      groupedCardSections
+        .map(([groupLabel]) => groupLabel)
+        .filter((groupLabel) => groupLabel !== 'Ungrouped'),
+    )
+
+    const trimmedPreferredLabel = preferredLabel.trim()
+
+    if (trimmedPreferredLabel && !existingLabels.has(trimmedPreferredLabel)) {
+      return trimmedPreferredLabel
+    }
+
+    if (trimmedPreferredLabel) {
+      let duplicateCursor = 2
+
+      while (existingLabels.has(`${trimmedPreferredLabel} ${duplicateCursor}`)) {
+        duplicateCursor += 1
+      }
+
+      return `${trimmedPreferredLabel} ${duplicateCursor}`
+    }
+
+    let cursor = 1
+
+    while (existingLabels.has(`Group ${cursor}`)) {
+      cursor += 1
+    }
+
+    return `Group ${cursor}`
+  }
+
+  const assignCardsToGroup = async (cardIds, groupLabel) => {
+    const targetCardIds = new Set(Array.isArray(cardIds) ? cardIds : [cardIds])
+
+    await updateCurrentStepCards((cards) =>
+      cards.map((card) => (targetCardIds.has(card.id) ? applyGroupLabelToCard(card, groupLabel) : card)),
+    )
+  }
+
+  const toggleGroupingCardSelection = (cardId) => {
+    setSelectedGroupingCardIds((currentCardIds) =>
+      currentCardIds.includes(cardId)
+        ? currentCardIds.filter((currentCardId) => currentCardId !== cardId)
+        : [...currentCardIds, cardId],
+    )
+  }
+
+  const renameCardGroup = async (previousGroupLabel, nextGroupLabel) => {
+    const normalizedNextGroupLabel = nextGroupLabel.trim()
+
+    if (!normalizedNextGroupLabel || normalizedNextGroupLabel === previousGroupLabel) {
+      setGroupLabelDrafts((currentDrafts) => {
+        const nextDrafts = { ...currentDrafts }
+        delete nextDrafts[previousGroupLabel]
+        return nextDrafts
+      })
+      return
+    }
+
+    await updateCurrentStepCards((cards) =>
+      cards.map((card) =>
+        (card.metadata?.groupId?.trim() || '') === previousGroupLabel
+          ? applyGroupLabelToCard(card, normalizedNextGroupLabel)
+          : card,
+      ),
+    )
+
+    setGroupLabelDrafts((currentDrafts) => {
+      const nextDrafts = { ...currentDrafts }
+      delete nextDrafts[previousGroupLabel]
+      return nextDrafts
+    })
+  }
+
+  const groupSelectedCards = async () => {
+    if (selectedGroupingCardIds.length === 0) {
+      return
+    }
+
+    const firstSelectedCard = displayedStepCards.find((card) => selectedGroupingCardIds.includes(card.id))
+
+    await assignCardsToGroup(
+      selectedGroupingCardIds,
+      getNextGeneratedGroupLabel(firstSelectedCard?.text || ''),
+    )
+    setSelectedGroupingCardIds([])
+  }
+
+  const ungroupSelectedCards = async () => {
+    if (selectedGroupingCardIds.length === 0) {
+      return
+    }
+
+    await assignCardsToGroup(selectedGroupingCardIds, '')
+    setSelectedGroupingCardIds([])
+  }
+
+  const handleGroupDrop = async (groupLabel) => {
+    if (!draggedCardId) {
+      return
+    }
+
+    await assignCardsToGroup(draggedCardId, groupLabel === 'Ungrouped' ? '' : groupLabel)
+    setDraggedCardId(null)
+  }
+
+  const setVotingOptionVoteCount = async (representativeCardId, nextVoteCount) => {
+    if (!currentMember?.id) {
+      return
+    }
+
+    const normalizedVoteCount = Math.max(0, Math.floor(nextVoteCount))
+
+    await updateCurrentStepCards((cards) =>
+      cards.map((card) => {
+        if (card.id !== representativeCardId) {
+          return card
+        }
+
+        const nextMetadata =
+          card.metadata && typeof card.metadata === 'object' ? { ...card.metadata } : {}
+        const nextVotes =
+          nextMetadata.votes && typeof nextMetadata.votes === 'object' && !Array.isArray(nextMetadata.votes)
+            ? { ...nextMetadata.votes }
+            : {}
+
+        if (normalizedVoteCount > 0) {
+          nextVotes[currentMember.id] = normalizedVoteCount
+        } else {
+          delete nextVotes[currentMember.id]
+        }
+
+        if (Object.keys(nextVotes).length > 0) {
+          nextMetadata.votes = nextVotes
+        } else {
+          delete nextMetadata.votes
+        }
+
+        if (Object.keys(nextMetadata).length === 0) {
+          const { metadata, ...cardWithoutMetadata } = card
+          return cardWithoutMetadata
+        }
+
+        return {
+          ...card,
+          metadata: nextMetadata,
+        }
+      }),
+    )
+  }
+
+  const addVoteToCard = async (optionId) => {
+    if (!currentMember?.id || remainingVotes <= 0) {
+      return
+    }
+
+    const option = votingOptions.find((candidateOption) => candidateOption.id === optionId)
+
+    if (!option?.representativeCardId) {
+      return
+    }
+
+    const card = option?.cards.find(
+      (candidateCard) => candidateCard.id === option.representativeCardId,
+    )
+    const currentVotes = Math.max(
+      0,
+      Math.floor(toNumber(card?.metadata?.votes?.[currentMember.id]) ?? 0),
+    )
+
+    await setVotingOptionVoteCount(option?.representativeCardId, currentVotes + 1)
+  }
+
+  const removeVoteFromCard = async (optionId) => {
+    if (!currentMember?.id) {
+      return
+    }
+
+    const option = votingOptions.find((candidateOption) => candidateOption.id === optionId)
+
+    if (!option?.representativeCardId) {
+      return
+    }
+
+    const card = option?.cards.find(
+      (candidateCard) => candidateCard.id === option.representativeCardId,
+    )
+    const currentVotes = Math.max(
+      0,
+      Math.floor(toNumber(card?.metadata?.votes?.[currentMember.id]) ?? 0),
+    )
+
+    if (currentVotes === 0) {
+      return
+    }
+
+    await setVotingOptionVoteCount(option?.representativeCardId, currentVotes - 1)
+  }
+
+  const setCardSelectionState = async (optionId, shouldSelect) => {
+    const option = votingOptions.find((candidateOption) => candidateOption.id === optionId)
+
+    if (!option) {
+      return
+    }
+
+    const targetCardIds = new Set(option.cards.map((card) => card.id))
+
+    await updateCurrentStepCards((cards) =>
+      cards.map((card) => {
+        if (!targetCardIds.has(card.id)) {
+          return card
+        }
+
+        const nextMetadata =
+          card.metadata && typeof card.metadata === 'object' ? { ...card.metadata } : {}
+
+        if (shouldSelect) {
+          nextMetadata.selected = true
+        } else {
+          delete nextMetadata.selected
+        }
+
+        if (Object.keys(nextMetadata).length === 0) {
+          const { metadata, ...cardWithoutMetadata } = card
+          return cardWithoutMetadata
+        }
+
+        return {
+          ...card,
+          metadata: nextMetadata,
+        }
+      }),
+    )
+  }
+
+  const toggleCardSelectionOption = async (optionId) => {
+    const isSelected = selectedOptionIds.includes(optionId)
+
+    if (!isSelected && remainingSelections <= 0) {
+      return
+    }
+
+    await setCardSelectionState(optionId, !isSelected)
+  }
+
+  const updateFillInBlankInput = async (inputIndex, nextValue) => {
+    if (!currentStepKey || inputIndex < 0) {
+      return
+    }
+
+    await persistWorkflowState((currentWorkflowState) => {
+      const currentStepState = currentWorkflowState.steps?.[currentStepKey] ?? {
+        startTime: null,
+        pauseTime: null,
+        cards: [],
+        fillInBlankInputs: [],
+      }
+      const nextInputs = Array.from({ length: fillInBlankCount }, (_, index) =>
+        index === inputIndex
+          ? nextValue
+          : typeof currentStepState.fillInBlankInputs?.[index] === 'string'
+            ? currentStepState.fillInBlankInputs[index]
+            : '',
+      )
+
+      return {
+        ...currentWorkflowState,
+        steps: {
+          ...currentWorkflowState.steps,
+          [currentStepKey]: {
+            ...currentStepState,
+            fillInBlankInputs: nextInputs,
+          },
+        },
+      }
+    })
+  }
+
   const handleRoomIdentitySubmit = async (event) => {
     event.preventDefault()
     setRoomIdentityError('')
@@ -4001,6 +4799,64 @@ function RoomPage({ roomId }) {
       setRoomIdentityLoading(false)
     }
   }
+
+  useEffect(() => {
+    setGroupLabelDrafts({})
+    setDraggedCardId(null)
+    setSelectedGroupingCardIds([])
+  }, [currentStepKey])
+
+  useEffect(() => {
+    const nextDrafts = Array.from(
+      { length: fillInBlankCount },
+      (_, index) => currentStepFillInBlankInputs[index] ?? '',
+    )
+
+    setFillInBlankDrafts((currentDrafts) =>
+      currentDrafts.length === nextDrafts.length &&
+      currentDrafts.every((value, index) => value === nextDrafts[index])
+        ? currentDrafts
+        : nextDrafts,
+    )
+  }, [currentStepFillInBlankInputs.join('\u0000'), currentStepKey, fillInBlankCount])
+
+  useEffect(() => {
+    if (
+      !hasWorkflowStarted ||
+      !shouldSeedCurrentStepCards ||
+      !currentStep ||
+      displayedStepCards.length > 0
+    ) {
+      return undefined
+    }
+
+    const seedCards = seededCurrentStepCards
+
+    if (seedCards.length === 0) {
+      return undefined
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void persistWorkflowState((currentWorkflowState) =>
+        createWorkflowRuntimeForStep(
+          workflowSequence,
+          safeCurrentStepIndex,
+          currentWorkflowState,
+        ),
+      )
+    }, 0)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [
+    currentStep,
+    displayedStepCards.length,
+    hasWorkflowStarted,
+    shouldSeedCurrentStepCards,
+    roomWorkflowState,
+    safeCurrentStepIndex,
+    seededCurrentStepCards,
+    workflowSequence,
+  ])
 
   useEffect(() => {
     if (workflowSequence.length === 0 || !hasWorkflowStarted) {
@@ -4149,7 +5005,7 @@ function RoomPage({ roomId }) {
   ])
 
   return (
-    <main className="min-h-screen bg-[image:var(--theme-bg-room)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
+    <main className="h-screen overflow-hidden bg-[image:var(--theme-bg-room)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
       {shouldPromptForRoomIdentity ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 px-5 py-6 backdrop-blur-sm">
           <div className="w-full max-w-3xl rounded-[2rem] border border-slate-900/20 bg-[image:var(--theme-panel-gradient)] p-6 shadow-[var(--theme-shadow-modal)] sm:p-8">
@@ -4163,7 +5019,7 @@ function RoomPage({ roomId }) {
                     Enter your details to continue.
                   </h2>
                   <p className="mt-3 text-sm leading-6 text-slate-700">
-                    We could not find your saved room identity on this device, so add it again to keep collaborating in {roomCode}.
+                    We could not find your saved room identity on this device, so add it again to keep collaborating.
                   </p>
                 </div>
                 <button
@@ -4176,16 +5032,16 @@ function RoomPage({ roomId }) {
               </div>
 
               <div className="grid gap-4 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-                <label className="grid gap-2 text-sm font-medium text-slate-50">
+                <label className="grid min-w-0 gap-2 text-sm font-medium text-slate-50">
                   Room Number
                   <input
                     type="text"
                     value={roomCode}
                     readOnly
-                    className="min-h-28 rounded-[1.75rem] border border-white/10 bg-white/10 px-5 text-3xl font-semibold uppercase tracking-[0.24em] text-white outline-none sm:min-h-32 sm:text-4xl"
+                    className="min-h-28 w-full min-w-0 rounded-[1.75rem] border border-white/10 bg-white/10 px-5 text-center text-3xl font-semibold uppercase tracking-[0.16em] text-white outline-none sm:min-h-32 sm:text-4xl"
                   />
                 </label>
-                <div className="grid gap-4 self-end">
+                <div className="grid min-w-0 gap-4 self-end">
                   <label className="grid gap-2 text-sm font-medium text-slate-50">
                     Your Name
                     <input
@@ -4228,8 +5084,8 @@ function RoomPage({ roomId }) {
         </div>
       ) : null}
 
-      <div className="mx-auto grid max-w-7xl gap-6">
-        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-5 py-4 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-6 md:py-4">
+      <div className="mx-auto flex h-full max-w-7xl flex-col gap-6 overflow-hidden">
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-5 py-4 backdrop-blur md:px-6 md:py-4">
           <div className="absolute -right-12 top-0 h-56 w-56 rounded-full bg-[image:var(--theme-orb-room)]" />
           <div className="relative flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="min-w-0 max-w-3xl">
@@ -4366,8 +5222,8 @@ function RoomPage({ roomId }) {
           </div>
         </section>
 
-        <section className="grid gap-5 xl:grid-cols-[20rem_minmax(0,1fr)]">
-          <aside className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 text-slate-900 shadow-[var(--theme-shadow-soft)] backdrop-blur">
+        <section className="grid min-h-0 flex-1 gap-5 overflow-hidden xl:grid-cols-[20rem_minmax(0,1fr)]">
+          <aside className="min-h-0 overflow-y-auto rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 text-slate-900 shadow-[var(--theme-shadow-soft)] backdrop-blur">
             {workflowActivities.length > 0 ? (
               <div className="space-y-4">
                 {workflowActivities.map((activity, activityIndex) => {
@@ -4401,10 +5257,7 @@ function RoomPage({ roomId }) {
                     >
                       <div className="flex items-center justify-between gap-3">
                         <div>
-                          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">
-                            Activity {activityIndex + 1}
-                          </p>
-                          <h3 className="mt-1 text-base font-semibold text-slate-900">
+                          <h3 className="text-base font-semibold text-slate-900">
                             {activity.title}
                           </h3>
                         </div>
@@ -4510,9 +5363,9 @@ function RoomPage({ roomId }) {
             )}
           </aside>
 
-          <div className="space-y-5">
-            {hasWorkflowStarted ? (
-              <div className="rounded-[1.5rem] border border-slate-900/20 bg-slate-950 px-4 py-4 text-white shadow-[var(--theme-shadow-dark-panel)]">
+          <div className="flex min-h-0 flex-col gap-5 overflow-hidden pr-1">
+            {hasWorkflowStarted && !isWorkflowComplete ? (
+              <div className="rounded-[1.5rem] border border-slate-900/20 bg-slate-950 px-4 py-4 text-white">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0">
                     <p className="text-[11px] uppercase tracking-[0.18em] text-slate-200/75">Timer</p>
@@ -4597,27 +5450,38 @@ function RoomPage({ roomId }) {
                   ))}
                 </div>
                 <div className="mt-2 flex items-center justify-between text-[11px] text-slate-100/70">
-                  <span>{Math.round(currentStepProgressPercent)}% complete</span>
+                  <span>{Math.round(stepStatusProgressPercent)}% complete</span>
                   <span>{formatCountdown(remainingSeconds)} remaining</span>
                 </div>
               </div>
             ) : null}
 
-            <article className="rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-6 shadow-[var(--theme-shadow-soft)] backdrop-blur">
-              <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                <div>
-                  <p className="text-sm uppercase tracking-[0.2em] text-slate-700">
-                    {hasWorkflowStarted
-                      ? currentStep?.title ?? 'Waiting for workflow'
-                      : 'Ready to start'}
-                  </p>
-                  <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">
-                    {hasWorkflowStarted
-                      ? currentStep?.description || currentStep?.title || 'Waiting for workflow'
-                      : 'Ready to start'}
-                  </h2>
+            <article className={`min-h-0 flex-1 overflow-y-auto rounded-[1.75rem] ${
+              isWorkflowComplete
+                ? 'bg-transparent p-0 shadow-none'
+                : 'border border-slate-900/10 bg-white/90 p-6 shadow-[var(--theme-shadow-soft)] backdrop-blur'
+            }`}>
+              {!isWorkflowComplete ? (
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <p className="text-sm uppercase tracking-[0.2em] text-slate-700">
+                      {hasWorkflowStarted
+                        ? currentStep?.title ?? 'Waiting for workflow'
+                        : 'Ready to start'}
+                    </p>
+                    <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">
+                      {hasWorkflowStarted
+                        ? currentStep?.prompt || currentStep?.title || 'Waiting for workflow'
+                        : 'Ready to start'}
+                    </h2>
+                    {hasWorkflowStarted && currentStep?.description ? (
+                      <p className="mt-3 max-w-3xl text-base leading-7 text-slate-600">
+                        {currentStep.description}
+                      </p>
+                    ) : null}
+                  </div>
                 </div>
-              </div>
+              ) : null}
 
               {!hasWorkflowStarted ? (
                 <div className="mt-5 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
@@ -4670,7 +5534,120 @@ function RoomPage({ roomId }) {
                 </div>
               ) : null}
 
-              {hasWorkflowStarted && isRoundRobinStep ? (
+              {hasWorkflowStarted && isWorkflowComplete ? (
+                <div className="relative mt-5 overflow-hidden rounded-[1.75rem] border border-slate-900/20 bg-slate-950 p-6 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                  <style>
+                    {`@keyframes workflow-confetti-fall {
+                      0% { transform: translate3d(0, -12vh, 0) rotate(0deg); opacity: 0; }
+                      10% { opacity: 1; }
+                      100% { transform: translate3d(0, 115vh, 0) rotate(540deg); opacity: 0; }
+                    }`}
+                  </style>
+                  <div className="pointer-events-none absolute inset-0 overflow-hidden">
+                    {Array.from({ length: 28 }).map((_, index) => (
+                      <span
+                        key={`confetti-${index}`}
+                        className="absolute block rounded-sm"
+                        style={{
+                          left: `${(index * 17) % 100}%`,
+                          top: '-10%',
+                          width: `${8 + (index % 3) * 3}px`,
+                          height: `${14 + (index % 4) * 4}px`,
+                          backgroundColor: ['#facc15', '#38bdf8', '#f472b6', '#34d399'][index % 4],
+                          animation: `workflow-confetti-fall ${3.4 + (index % 5) * 0.45}s linear ${index * 0.08}s infinite`,
+                        }}
+                      />
+                    ))}
+                  </div>
+
+                  <div className="relative">
+                    <div className="max-w-3xl">
+                      <p className="text-sm uppercase tracking-[0.2em] text-slate-300">
+                        Session complete
+                      </p>
+                      <h3 className="mt-3 text-3xl font-semibold tracking-tight text-white">
+                        Summary
+                      </h3>
+                      <p className="mt-3 text-base leading-7 text-slate-300">
+                        Review the outputs captured across the prompts in this workflow.
+                      </p>
+                    </div>
+
+                    <div className="mt-6 space-y-5">
+                      {workflowSummarySteps.map((step, stepIndex) => (
+                        <article
+                          key={`summary-step-${step.id || stepIndex}`}
+                          className="rounded-[1.5rem] border border-white/10 bg-white/5 p-5"
+                        >
+                          <h4 className="text-2xl font-semibold text-white">
+                            {step.prompt || step.title}
+                          </h4>
+                          {['individual stickies', 'group stickies'].includes(
+                            normalizeActivityType(step.activityType),
+                          ) && step.outputCards.length > 0 ? (
+                            <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                              {step.outputCards.map((card, cardIndex) => (
+                                <div
+                                  key={`summary-card-${step.id || 'step'}-${card.id || 'card'}-${cardIndex}`}
+                                  className="rounded-[1rem] border border-slate-200 bg-white p-3 text-slate-900"
+                                >
+                                  <p className="text-sm leading-6">{card.text}</p>
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                          {normalizeActivityType(step.activityType) === 'voting' && step.stepOptions.length > 0 ? (
+                            <div className="mt-4 space-y-3">
+                              {step.stepOptions.map((option, optionIndex) => {
+                                const representativeCard = option.cards.find(
+                                  (card) => card.id === option.representativeCardId,
+                                )
+                                const totalVotes = getWorkflowCardVoteCount(representativeCard)
+
+                                return (
+                                  <div
+                                    key={`summary-vote-${step.id || 'step'}-${option.id || 'option'}-${optionIndex}`}
+                                    className="rounded-[1rem] border border-slate-200 bg-white p-3 text-slate-900"
+                                  >
+                                    <div className="flex items-center justify-between gap-3">
+                                      <p className="text-base font-medium">
+                                        {option.type === 'group' ? option.title : representativeCard?.text}
+                                      </p>
+                                      <span className="rounded-full bg-yellow-100 px-3 py-1 text-sm font-medium text-yellow-800">
+                                        {totalVotes} team vote{totalVotes === 1 ? '' : 's'}
+                                      </span>
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          ) : null}
+                          {normalizeActivityType(step.activityType) === 'card selection' &&
+                          step.selectedCards.length > 0 ? (
+                            <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                              {step.selectedCards.map((card, cardIndex) => (
+                                <div
+                                  key={`summary-selected-${step.id || 'step'}-${card.id || 'card'}-${cardIndex}`}
+                                  className="rounded-[1rem] border border-slate-200 bg-white p-3 text-slate-900"
+                                >
+                                  <p className="text-sm leading-6">{card.text}</p>
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                          {normalizeActivityType(step.activityType) === 'group fill in the blank' ? (
+                            <div className="mt-4 rounded-[1rem] border border-slate-200 bg-white p-4 text-slate-900">
+                              <p className="text-lg leading-8">{step.fillInBlankText}</p>
+                            </div>
+                          ) : null}
+                        </article>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+
+              {hasWorkflowStarted && !isWorkflowComplete && isRoundRobinStep ? (
                 <div className="mt-6 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
                   <p className="text-sm uppercase tracking-[0.18em] text-slate-300">Round Robin</p>
                   {activeRoundRobinMember ? (
@@ -4759,111 +5736,562 @@ function RoomPage({ roomId }) {
                   </div>
                 </div>
               ) : null}
-              {hasWorkflowStarted && (isIndividualBrainstormStep || isGroupBrainstormStep) ? (
+              {hasWorkflowStarted && !isWorkflowComplete && (isIndividualBrainstormStep || isGroupBrainstormStep) ? (
+                isIndividualBrainstormStep ? (
+                  <>
+                    <div className="mt-6 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                      <div>
+                        <p className="text-sm uppercase tracking-[0.18em] text-slate-300">
+                          Individual brainstorm
+                        </p>
+                        <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-100/70">
+                          Add one idea at a time. You can read your own cards now, while everyone else stays hidden until the next step.
+                        </p>
+                      </div>
+
+                      <div className="mt-5">
+                        <form
+                          onSubmit={(event) => {
+                            void submitBrainstormCard(event)
+                          }}
+                          className="min-h-16 rounded-[1.25rem] border border-white/10 bg-slate-900 p-3 shadow-[var(--theme-shadow-soft)]"
+                        >
+                          <label className="sr-only" htmlFor="brainstorm-card-input">
+                            Add a card
+                          </label>
+                          <p className="text-sm font-medium text-slate-300">
+                            Add a card
+                          </p>
+                          <textarea
+                            id="brainstorm-card-input"
+                            value={brainstormDraft}
+                            onChange={(event) => setBrainstormDraft(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' && event.shiftKey) {
+                                event.preventDefault()
+                                event.currentTarget.form?.requestSubmit()
+                              }
+                            }}
+                            placeholder="Type one problem or idea"
+                            className="mt-2 min-h-12 w-full resize-none border-0 bg-transparent p-0 text-lg leading-7 text-white outline-none placeholder:text-slate-500"
+                            maxLength={180}
+                            disabled={!currentMember?.id || isSubmittingBrainstormCard}
+                          />
+                          <div className="mt-3 flex justify-end">
+                            <button
+                              type="submit"
+                              disabled={
+                                !currentMember?.id ||
+                                !brainstormDraft.trim() ||
+                                isSubmittingBrainstormCard
+                              }
+                              className={gradientButtonCompactClass}
+                            >
+                              {isSubmittingBrainstormCard ? 'Adding…' : 'Add card'}
+                            </button>
+                          </div>
+                        </form>
+                      </div>
+                    </div>
+
+                    {currentStepCards.length > 0 ? (
+                      <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                        {currentStepCards.map((card, cardIndex) => {
+                          const isCurrentUsersCard = card.authorId === currentMember?.id
+                          const isHiddenCard = !shouldRevealAllBrainstormCards && !isCurrentUsersCard
+
+                          return (
+                            <article
+                              key={`individual-card-${card.id || 'card'}-${cardIndex}`}
+                              className={`relative min-h-24 rounded-[1rem] border p-2.5 shadow-[var(--theme-shadow-soft)] transition ${
+                                isHiddenCard
+                                  ? 'border-slate-200 bg-slate-100'
+                                  : 'border-slate-200 bg-white'
+                              }`}
+                            >
+                              <p className="text-sm font-medium text-slate-500">
+                                {isCurrentUsersCard ? 'You' : card.authorName || 'Room member'}
+                              </p>
+                              <p
+                                className={`mt-1.5 text-base leading-6 text-slate-900 ${
+                                  isHiddenCard ? 'select-none blur-md' : ''
+                                }`}
+                                aria-hidden={isHiddenCard}
+                              >
+                                {card.text}
+                              </p>
+                            </article>
+                          )
+                        })}
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <div className="mt-6 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                    <div>
+                      <div>
+                        <p className="text-sm uppercase tracking-[0.18em] text-slate-300">
+                          Group cards
+                        </p>
+                        <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-300">
+                          Select two or more cards, then click `Group selected` to create a group. To remove cards from a group, select them and click `Ungroup selected`.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 space-y-5">
+                        <div className="flex flex-wrap gap-3">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void groupSelectedCards()
+                            }}
+                            disabled={selectedGroupingCardIds.length === 0}
+                            className={gradientButtonCompactClass}
+                          >
+                            Group selected
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void ungroupSelectedCards()
+                            }}
+                            disabled={selectedGroupingCardIds.length === 0}
+                            className="inline-flex items-center justify-center rounded-full border border-white/15 bg-white/10 px-4 py-2 text-sm font-medium text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Ungroup selected
+                          </button>
+                        </div>
+
+                        {groupedCardSections.length > 0 ? (
+                          groupedCardSections.map(([groupLabel, cards]) => (
+                            <section
+                              key={groupLabel}
+                              className="rounded-[1.5rem] border border-white/10 bg-white/5 p-4"
+                              onDragOver={(event) => {
+                                event.preventDefault()
+                              }}
+                              onDrop={() => {
+                                void handleGroupDrop(groupLabel)
+                              }}
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                {groupLabel === 'Ungrouped' ? (
+                                  <h3 className="text-sm font-semibold uppercase tracking-[0.16em] text-slate-200">
+                                    Ungrouped
+                                  </h3>
+                                ) : (
+                                  <input
+                                    type="text"
+                                    value={groupLabelDrafts[groupLabel] ?? groupLabel}
+                                    onChange={(event) =>
+                                      setGroupLabelDrafts((currentDrafts) => ({
+                                        ...currentDrafts,
+                                        [groupLabel]: event.target.value,
+                                      }))
+                                    }
+                                    onBlur={(event) => {
+                                      void renameCardGroup(groupLabel, event.target.value)
+                                    }}
+                                    onKeyDown={(event) => {
+                                      if (event.key === 'Enter') {
+                                        event.preventDefault()
+                                        event.currentTarget.blur()
+                                      }
+                                    }}
+                                    className="min-w-0 bg-transparent text-sm font-semibold uppercase tracking-[0.16em] text-slate-200 outline-none"
+                                  />
+                                )}
+                                <p className="text-xs text-slate-400">
+                                  {cards.length} card{cards.length === 1 ? '' : 's'}
+                                </p>
+                              </div>
+                              <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                                {cards.map((card, cardIndex) => {
+                                  const isCurrentUsersCard = card.authorId === currentMember?.id
+                                  const isHiddenCard = !shouldRevealAllBrainstormCards && !isCurrentUsersCard
+
+                                  return (
+                                    <article
+                                      key={`${groupLabel}-card-${card.id || 'card'}-${cardIndex}`}
+                                      draggable={!isHiddenCard}
+                                      onDragStart={() => {
+                                        if (!isHiddenCard) {
+                                          setDraggedCardId(card.id)
+                                        }
+                                      }}
+                                      onDragEnd={() => {
+                                        setDraggedCardId(null)
+                                      }}
+                                      onClick={() => {
+                                        if (!isHiddenCard) {
+                                          toggleGroupingCardSelection(card.id)
+                                        }
+                                      }}
+                                      className={`relative min-h-24 rounded-[1rem] border p-2.5 shadow-[var(--theme-shadow-soft)] transition ${
+                                        isHiddenCard
+                                          ? 'border-white/10 bg-white/10'
+                                          : 'border-slate-200 bg-slate-50'
+                                      } ${
+                                        selectedGroupingCardIds.includes(card.id)
+                                          ? 'ring-4 ring-sky-300/80 bg-sky-50'
+                                          : ''
+                                      } ${
+                                        isHiddenCard
+                                          ? 'cursor-default'
+                                          : draggedCardId === card.id
+                                            ? 'cursor-grabbing opacity-70'
+                                            : 'cursor-grab'
+                                      }`}
+                                    >
+                                      <p className={`text-sm font-medium ${
+                                        isHiddenCard ? 'text-slate-300' : 'text-slate-500'
+                                      }`}>
+                                        {isCurrentUsersCard ? 'You' : card.authorName || 'Room member'}
+                                      </p>
+                                      <p
+                                        className={`mt-1.5 text-base leading-6 ${
+                                          isHiddenCard ? 'text-white' : 'text-slate-900'
+                                        } ${
+                                          isHiddenCard ? 'select-none blur-md' : ''
+                                        }`}
+                                        aria-hidden={isHiddenCard}
+                                      >
+                                        {card.text}
+                                      </p>
+                                    </article>
+                                  )
+                                })}
+                              </div>
+                            </section>
+                          ))
+                        ) : (
+                          <div className="rounded-[1.5rem] border border-dashed border-white/15 bg-white/5 px-5 py-10 text-sm text-slate-300">
+                            No cards were imported for this grouping step yet.
+                          </div>
+                        )}
+                    </div>
+                  </div>
+                )
+              ) : null}
+              {hasWorkflowStarted && !isWorkflowComplete && isVotingStep ? (
                 <div className="mt-6 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
-                  <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                     <div>
                       <p className="text-sm uppercase tracking-[0.18em] text-slate-300">
-                        {isIndividualBrainstormStep ? 'Individual brainstorm' : 'Shared board'}
+                        Voting
                       </p>
-                      <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-100/70">
-                        {isIndividualBrainstormStep
-                          ? 'Add one idea at a time. You can read your own cards now, while everyone else stays hidden until the next step.'
-                          : 'All cards are now visible so the group can read, discuss, and organize them together.'}
+                      <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-300">
+                        Review the cards below and place your votes on the strongest options. You can spread your votes across multiple cards or stack them on a favorite.
                       </p>
                     </div>
-                    <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-100/70">
-                      <p>
-                        {currentStepCards.length} card{currentStepCards.length === 1 ? '' : 's'}
+                    <div className="rounded-[1.25rem] border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+                      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">
+                        Your votes
                       </p>
-                      {hiddenBrainstormCardCount > 0 ? (
-                        <p className="mt-1 text-xs uppercase tracking-[0.14em] text-slate-500">
-                          {hiddenBrainstormCardCount} hidden from you
-                        </p>
-                      ) : null}
+                      <p className="mt-1 text-2xl font-semibold text-white">
+                        {remainingVotes}
+                        <span className="ml-1 text-sm font-medium text-slate-300">
+                          left / {voteLimit}
+                        </span>
+                      </p>
                     </div>
                   </div>
 
-                  {isIndividualBrainstormStep ? (
-                    <form
-                      onSubmit={(event) => {
-                        void submitBrainstormCard(event)
-                      }}
-                      className="mt-5 rounded-[1.5rem] border border-white/10 bg-white/5 p-4 shadow-[var(--theme-shadow-soft)]"
-                    >
-                      <label className="block text-sm font-medium text-white" htmlFor="brainstorm-card-input">
-                        Add a card
-                      </label>
-                      <div className="mt-3 flex flex-col gap-3 sm:flex-row">
-                        <input
-                          id="brainstorm-card-input"
-                          type="text"
-                          value={brainstormDraft}
-                          onChange={(event) => setBrainstormDraft(event.target.value)}
-                          placeholder="Type one problem or idea"
-                          className="min-w-0 flex-1 rounded-2xl border border-white/10 bg-white/10 px-4 py-3 text-base text-white outline-none transition placeholder:text-slate-300/45 focus:border-slate-200 focus:bg-white/15"
-                          maxLength={180}
-                          disabled={!currentMember?.id || isSubmittingBrainstormCard}
-                        />
-                        <button
-                          type="submit"
-                          disabled={
-                            !currentMember?.id ||
-                            !brainstormDraft.trim() ||
-                            isSubmittingBrainstormCard
-                          }
-                          className={gradientButtonCompactClass}
-                        >
-                          {isSubmittingBrainstormCard ? 'Adding…' : 'Add card'}
-                        </button>
-                      </div>
-                    </form>
-                  ) : null}
-
-                  <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                    {currentStepCards.length > 0 ? (
-                      currentStepCards.map((card) => {
-                        const isCurrentUsersCard = card.authorId === currentMember?.id
-                        const isHiddenCard = !shouldRevealAllBrainstormCards && !isCurrentUsersCard
+                  {votingOptions.length > 0 ? (
+                    <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                      {votingOptions.map((option, optionIndex) => {
+                        const representativeCard = option.cards.find(
+                          (card) => card.id === option.representativeCardId,
+                        )
+                        const currentUserVotes = currentMember?.id
+                          ? Math.max(
+                              0,
+                              Math.floor(
+                                toNumber(representativeCard?.metadata?.votes?.[currentMember.id]) ?? 0,
+                              ),
+                            )
+                          : 0
+                        const canAddVote = Boolean(currentMember?.id) && remainingVotes > 0
+                        const canRemoveVote = currentUserVotes > 0
+                        const isVoteLocked = !canAddVote && !canRemoveVote
 
                         return (
                           <article
-                            key={card.id}
-                            className={`relative min-h-40 rounded-[1.5rem] border p-4 shadow-[var(--theme-shadow-soft)] transition ${
-                              isHiddenCard
-                                ? 'border-white/10 bg-white/10'
-                                : 'border-amber-300/20 bg-amber-300/10'
+                            key={`vote-option-${option.id || 'option'}-${optionIndex}`}
+                            onClick={() => {
+                              if (canAddVote) {
+                                void addVoteToCard(option.id)
+                              }
+                            }}
+                            className={`group relative flex min-h-28 flex-col rounded-[1rem] border border-slate-200 bg-white p-3 text-slate-900 shadow-[var(--theme-shadow-soft)] ${
+                              canAddVote ? 'cursor-pointer' : ''
+                            } ${
+                              isVoteLocked ? 'bg-slate-100 opacity-55' : ''
                             }`}
                           >
-                            <p className="text-xs uppercase tracking-[0.16em] text-slate-300">
-                              {isCurrentUsersCard ? 'You' : card.authorName || 'Room member'}
-                            </p>
-                            <p
-                              className={`mt-3 text-lg leading-7 text-white ${
-                                isHiddenCard ? 'select-none blur-md' : ''
-                              }`}
-                              aria-hidden={isHiddenCard}
-                            >
-                              {card.text}
-                            </p>
-                            {isHiddenCard ? (
-                              <div className="absolute inset-4 flex items-end">
-                                <p className="rounded-full bg-slate-900/90 px-3 py-1 text-xs font-medium uppercase tracking-[0.14em] text-slate-200 shadow-sm">
-                                  Reveals next step
-                                </p>
+                            {canAddVote || canRemoveVote ? (
+                              <div className="absolute inset-0 flex items-center justify-center opacity-0 transition group-hover:opacity-100">
+                                <div className="flex items-center gap-3">
+                                  {canRemoveVote ? (
+                                    <button
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.stopPropagation()
+                                        void removeVoteFromCard(option.id)
+                                      }}
+                                      className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-yellow-400 text-2xl font-semibold leading-none text-slate-900 shadow-sm"
+                                      aria-label="Remove vote"
+                                      title="Remove vote"
+                                    >
+                                      -
+                                    </button>
+                                  ) : null}
+                                  {canAddVote ? (
+                                    <button
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.stopPropagation()
+                                        void addVoteToCard(option.id)
+                                      }}
+                                      className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-yellow-400 text-2xl font-semibold leading-none text-slate-900 shadow-sm"
+                                      aria-label="Add vote"
+                                      title="Add vote"
+                                    >
+                                      +
+                                    </button>
+                                  ) : null}
+                                </div>
                               </div>
                             ) : null}
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                {option.type === 'group' ? (
+                                  <div className="space-y-2">
+                                    <p className="text-base font-semibold leading-6 text-slate-900">
+                                      {option.title}
+                                    </p>
+                                    {option.cards.map((card) => (
+                                      <div
+                                        key={card.id}
+                                        className="rounded-[0.9rem] border border-slate-200 bg-slate-50 px-3 py-2"
+                                      >
+                                        <p className="text-sm leading-6 text-slate-700">
+                                          {card.text}
+                                        </p>
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <p className="text-base leading-6 text-slate-900">
+                                    {representativeCard?.text}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+
+                            <div className="mt-auto flex items-end justify-between gap-3 pt-4">
+                              <div className="flex min-h-9 items-center gap-2">
+                                {Array.from({ length: currentUserVotes }).map((_, index) => (
+                                  <button
+                                    key={`${option.id}-vote-${index + 1}`}
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      void removeVoteFromCard(option.id)
+                                    }}
+                                    className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-yellow-300 bg-yellow-400 text-slate-900 transition hover:bg-yellow-300"
+                                    aria-label="Remove vote"
+                                    title="Remove vote"
+                                  >
+                                    <span className="h-2.5 w-2.5 rounded-full bg-current" />
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
                           </article>
                         )
-                      })
-                    ) : (
-                      <div className="rounded-[1.5rem] border border-dashed border-white/15 bg-white/5 px-5 py-10 text-sm text-slate-300 md:col-span-2 xl:col-span-3">
-                        {isIndividualBrainstormStep
-                          ? 'No cards yet. Add the first idea for this step.'
-                          : 'No cards are available for this step yet.'}
-                      </div>
-                    )}
+                      })}
+                    </div>
+                  ) : (
+                    <div className="mt-5 rounded-[1.5rem] border border-dashed border-white/15 bg-white/5 px-5 py-10 text-sm text-slate-300">
+                      No cards were imported for this voting step yet.
+                    </div>
+                  )}
+                </div>
+              ) : null}
+              {hasWorkflowStarted && !isWorkflowComplete && isCardSelectionStep && !isVotingStep ? (
+                <div className="mt-6 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <p className="text-sm uppercase tracking-[0.18em] text-slate-300">
+                        Select cards
+                      </p>
+                      <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-300">
+                        Pick up to {selectionLimit} option{selectionLimit === 1 ? '' : 's'} to carry forward. Grouped cards count as one selection and bring all cards in that group with them.
+                      </p>
+                    </div>
+                    <div className="rounded-[1.25rem] border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+                      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">
+                        Selected
+                      </p>
+                      <p className="mt-1 text-2xl font-semibold text-white">
+                        {selectedOptionIds.length}
+                        <span className="ml-1 text-sm font-medium text-slate-300">
+                          / {selectionLimit}
+                        </span>
+                      </p>
+                    </div>
                   </div>
+
+                  {votingOptions.length > 0 ? (
+                    <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                      {votingOptions.map((option, optionIndex) => {
+                        const representativeCard = option.cards.find(
+                          (card) => card.id === option.representativeCardId,
+                        )
+                        const isSelected = selectedOptionIds.includes(option.id)
+                        const isDisabled = !isSelected && remainingSelections <= 0
+                        const carriedVoteCount = getWorkflowCardVoteCount(representativeCard)
+
+                        return (
+                          <article
+                            key={`selection-option-${option.id || 'option'}-${optionIndex}`}
+                            onClick={() => {
+                              if (!isDisabled) {
+                                void toggleCardSelectionOption(option.id)
+                              }
+                            }}
+                            className={`flex min-h-28 flex-col rounded-[1rem] border bg-white p-3 text-slate-900 shadow-[var(--theme-shadow-soft)] transition ${
+                              isSelected
+                                ? 'border-sky-400 bg-sky-50 ring-2 ring-sky-200'
+                                : 'border-slate-200 hover:border-sky-300 hover:bg-sky-50'
+                            } ${
+                              isDisabled ? 'opacity-60' : ''
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="mb-3 flex items-center justify-between gap-3">
+                                <div className="flex min-h-8 items-center gap-1.5">
+                                  {Array.from({ length: carriedVoteCount }).map((_, index) => (
+                                    <span
+                                      key={`${option.id}-carried-vote-${index + 1}`}
+                                      className="inline-flex h-5 w-5 rounded-full border border-yellow-300 bg-yellow-400"
+                                      aria-hidden="true"
+                                    />
+                                  ))}
+                                </div>
+                                {isSelected ? (
+                                  <span className="rounded-full border border-sky-200 bg-sky-100 px-3 py-1 text-sm font-medium text-sky-700">
+                                    Selected
+                                  </span>
+                                ) : null}
+                              </div>
+                              {option.type === 'group' ? (
+                                <div className="space-y-2">
+                                  <p className="text-base font-semibold leading-6 text-slate-900">
+                                    {option.title}
+                                  </p>
+                                  {option.cards.map((card, cardIndex) => (
+                                    <div
+                                      key={`${option.id || 'option'}-selection-card-${card.id || 'card'}-${cardIndex}`}
+                                      className="rounded-[0.9rem] border border-slate-200 bg-slate-50 px-3 py-2"
+                                    >
+                                      <p className="text-sm leading-6 text-slate-700">
+                                        {card.text}
+                                      </p>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : (
+                                <p className="text-base leading-6 text-slate-900">
+                                  {representativeCard?.text}
+                                </p>
+                              )}
+                            </div>
+                          </article>
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    <div className="mt-5 rounded-[1.5rem] border border-dashed border-white/15 bg-white/5 px-5 py-10 text-sm text-slate-300">
+                      No cards were imported for this selection step yet.
+                    </div>
+                  )}
+                </div>
+              ) : null}
+              {hasWorkflowStarted && !isWorkflowComplete && isGroupFillInBlankStep ? (
+                <div className="mt-6 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                  <div>
+                    <p className="text-sm uppercase tracking-[0.18em] text-slate-300">
+                      Fill in the blank
+                    </p>
+                    <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-300">
+                      Use the selected cards as reference and complete the shared sentence together.
+                    </p>
+                  </div>
+
+                  <div className="mt-5 rounded-[1.5rem] border border-white/10 bg-white/5 p-5">
+                    <div className="flex flex-wrap items-center gap-3 text-lg leading-8 text-white">
+                      {(() => {
+                        let blankInputIndex = -1
+
+                        return fillInBlankTemplateParts.map((part, index) => {
+                          if (part.type === 'text') {
+                            return <span key={`fill-text-${index}`}>{part.value}</span>
+                          }
+
+                          blankInputIndex += 1
+                          const currentInputIndex = blankInputIndex
+
+                          return (
+                            <input
+                              key={`fill-input-${index}`}
+                              type="text"
+                              value={fillInBlankDrafts[currentInputIndex] ?? ''}
+                              onChange={(event) => {
+                                const nextValue = event.target.value
+
+                                setFillInBlankDrafts((currentDrafts) => {
+                                  const nextDrafts = [...currentDrafts]
+                                  nextDrafts[currentInputIndex] = nextValue
+                                  return nextDrafts
+                                })
+                                void updateFillInBlankInput(currentInputIndex, nextValue)
+                              }}
+                              placeholder={part.label}
+                              className="min-h-14 min-w-[18rem] flex-1 rounded-[1.25rem] border border-white/15 bg-white/10 px-5 py-3 text-lg text-white outline-none placeholder:text-slate-400 focus:border-slate-200"
+                            />
+                          )
+                        })
+                      })()}
+                    </div>
+                  </div>
+
+                  {fillInBlankReferenceCards.length > 0 ? (
+                    <div className="mt-5">
+                      <p className="text-sm uppercase tracking-[0.18em] text-slate-300">
+                        Reference cards
+                      </p>
+                      <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                        {fillInBlankReferenceCards.map((card, cardIndex) => (
+                          <article
+                            key={`fill-reference-card-${card.id || 'card'}-${cardIndex}`}
+                            className="min-h-24 rounded-[1rem] border border-slate-200 bg-white p-3 text-slate-900 shadow-[var(--theme-shadow-soft)]"
+                          >
+                            {fillInBlankReferencePromptLabel ? (
+                              <p className="text-sm font-medium uppercase tracking-[0.14em] text-slate-500">
+                                {fillInBlankReferencePromptLabel}
+                              </p>
+                            ) : null}
+                            <p className="text-base leading-6 text-slate-900">
+                              {card.text}
+                            </p>
+                          </article>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </article>
