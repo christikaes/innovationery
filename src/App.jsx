@@ -457,6 +457,13 @@ function serializeWorkflowDefinition(template) {
   return {
     name: workflow.title || template?.name || 'Untitled workflow',
     description: workflow.description || template?.description || '',
+    accessTier:
+      template?.accessTier === 'pro'
+        ? 'pro'
+        : template?.accessTier === 'disabled'
+          ? 'disabled'
+          : 'free',
+    sortOrder: toNumber(template?.sortOrder) ?? 0,
     activities: Array.isArray(workflow.activities)
       ? workflow.activities.map(serializeWorkflowActivity)
       : [],
@@ -492,6 +499,10 @@ function getDefaultWorkflowDefinition(workflowId) {
 
 function getWorkflowPersistenceKey(template) {
   return JSON.stringify(serializeWorkflowDefinition(template))
+}
+
+function normalizeWorkflowAccessTier(value) {
+  return value === 'pro' || value === 'disabled' ? value : 'free'
 }
 
 function getStepTypeDefinition(activityType) {
@@ -1481,6 +1492,7 @@ function normalizeRoomTemplate(id, template) {
       workflow.title || template?.name || template?.title || 'Untitled workflow',
     description:
       workflow.description || template?.description || '',
+    accessTier: normalizeWorkflowAccessTier(template?.accessTier ?? workflowSource.accessTier),
     sortOrder: toNumber(template?.sortOrder) ?? Number.MAX_SAFE_INTEGER,
     workflow,
     pipeline: workflow,
@@ -1707,7 +1719,9 @@ function hasStrictWorkflowSchema(workflow) {
 
   const keys = Object.keys(workflow)
 
-  return keys.every((key) => ['name', 'description', 'activities', 'steps'].includes(key))
+  return keys.every((key) =>
+    ['name', 'description', 'accessTier', 'sortOrder', 'activities', 'steps'].includes(key),
+  )
 }
 
 async function updateRoomDocument(roomId, updater) {
@@ -1939,7 +1953,11 @@ function HomePage() {
 
   useEffect(() => {
     if (!roomTemplates.some((template) => template.id === selectedRoomType)) {
-      setSelectedRoomType(roomTemplates[0]?.id ?? '')
+      const defaultTemplateId =
+        roomTemplates.find((template) => normalizeWorkflowAccessTier(template.accessTier) !== 'disabled')?.id ??
+        roomTemplates[0]?.id ??
+        ''
+      setSelectedRoomType(defaultTemplateId)
     }
   }, [roomTemplates, selectedRoomType])
 
@@ -1947,6 +1965,8 @@ function HomePage() {
     roomTemplates.find((template) => template.id === selectedRoomType) ??
     roomTemplates[0] ??
     null
+  const selectedTemplateTier = normalizeWorkflowAccessTier(selectedTemplate?.accessTier)
+  const isSelectedTemplateEnabled = selectedTemplateTier !== 'disabled'
 
   async function handleJoinSubmit(event) {
     event.preventDefault()
@@ -2011,6 +2031,11 @@ function HomePage() {
 
     if (!selectedTemplate) {
       setCreateError('No room template is available yet.')
+      return
+    }
+
+    if (!isSelectedTemplateEnabled) {
+      setCreateError('This workflow is currently disabled.')
       return
     }
 
@@ -2232,7 +2257,7 @@ function HomePage() {
                     </div>
                     <button
                       type="submit"
-                      disabled={createLoading || !selectedTemplate}
+                    disabled={createLoading || !selectedTemplate || !isSelectedTemplateEnabled}
                       className={`${gradientButtonMediumClass} shrink-0`}
                     >
                       {createLoading ? 'Preparing...' : 'Create Room'}
@@ -2309,7 +2334,8 @@ function HomePage() {
                       className="max-h-[24rem] space-y-3 overflow-y-auto pr-1"
                     >
                       {roomTemplates.map((roomType) => {
-                        const isEnabled = roomType.id === 'hackathon' || roomType.id === 'ideation'
+                        const accessTier = normalizeWorkflowAccessTier(roomType.accessTier)
+                        const isEnabled = accessTier !== 'disabled'
                         const isSelected = selectedRoomType === roomType.id
 
                         return (
@@ -2338,11 +2364,11 @@ function HomePage() {
                                 <span className={`block text-lg font-semibold ${isSelected ? 'text-white' : 'text-slate-900'}`}>
                                   {roomType.workflow?.title ?? 'Untitled workflow'}
                                 </span>
-                                {roomType.id === 'hackathon' || roomType.id === 'ideation' ? (
+                                {accessTier ? (
                                   <span className={`rounded-full px-2.5 py-1 text-xs font-medium uppercase tracking-[0.18em] ${
                                     isSelected ? 'bg-white/10 text-slate-50' : 'bg-slate-900 text-white'
                                   }`}>
-                                    Free
+                                    {accessTier}
                                   </span>
                                 ) : null}
                               </span>
@@ -2744,7 +2770,7 @@ function AdminPage() {
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <a
-                href="/admin/workflows/hackathon"
+                href="/admin/workflows"
                 className={secondaryButtonMediumClass}
               >
                 Edit workflows
@@ -2862,6 +2888,254 @@ function AdminPage() {
                       </td>
                       <td className="px-6 py-5 text-sm text-slate-500">
                         {memberCounts[room.id] > 0 ? 'Active members' : 'No activity yet'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </section>
+      </div>
+    </main>
+  )
+}
+
+function WorkflowLibraryAdminPage() {
+  const [workflows, setWorkflows] = useState([])
+  const [status, setStatus] = useState('loading')
+  const [reorderStatus, setReorderStatus] = useState('idle')
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      collection(db, 'workflows'),
+      (snapshot) => {
+        const nextWorkflows = snapshot.docs
+          .map((workflowDoc) => normalizeRoomTemplate(workflowDoc.id, workflowDoc.data()))
+          .sort((left, right) => {
+            if (left.sortOrder !== right.sortOrder) {
+              return left.sortOrder - right.sortOrder
+            }
+
+            return left.name.localeCompare(right.name)
+          })
+
+        setWorkflows(nextWorkflows)
+        setStatus('ready')
+      },
+      () => {
+        setWorkflows([])
+        setStatus('error')
+      },
+    )
+
+    return unsubscribe
+  }, [])
+
+  const moveWorkflowByOffset = async (workflowIndex, offset) => {
+    const targetIndex = workflowIndex + offset
+
+    if (targetIndex < 0 || targetIndex >= workflows.length) {
+      return
+    }
+
+    const nextWorkflows = [...workflows]
+    const [movedWorkflow] = nextWorkflows.splice(workflowIndex, 1)
+
+    if (!movedWorkflow) {
+      return
+    }
+
+    nextWorkflows.splice(targetIndex, 0, movedWorkflow)
+    setReorderStatus('saving')
+
+    try {
+      await Promise.all(
+        nextWorkflows.map((workflow, index) =>
+          setDoc(
+            doc(db, 'workflows', workflow.id),
+            {
+              ...serializeWorkflowDefinition({
+                ...workflow,
+                sortOrder: index,
+              }),
+              sortOrder: index,
+            },
+          ),
+        ),
+      )
+      setReorderStatus('saved')
+    } catch {
+      setReorderStatus('error')
+    }
+  }
+
+  const updateWorkflowAccessTier = async (workflow, accessTier) => {
+    setReorderStatus('saving')
+
+    try {
+      await setDoc(
+        doc(db, 'workflows', workflow.id),
+        {
+          ...serializeWorkflowDefinition({
+            ...workflow,
+            accessTier,
+          }),
+          sortOrder: toNumber(workflow.sortOrder) ?? 0,
+        },
+      )
+      setReorderStatus('saved')
+    } catch {
+      setReorderStatus('error')
+    }
+  }
+
+  return (
+    <main className="min-h-screen bg-[image:var(--theme-bg-admin)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
+      <div className="mx-auto grid max-w-7xl gap-6">
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-10 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-10 md:py-14">
+          <div className="absolute -right-10 top-0 h-48 w-48 rounded-full bg-[image:var(--theme-orb-admin)]" />
+          <p className="relative text-xs uppercase tracking-[0.24em] text-slate-700">
+            Admin
+          </p>
+          <div className="relative mt-4 flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <h1 className="font-serif text-5xl leading-tight tracking-tight text-slate-900 sm:text-6xl">
+                Workflows
+              </h1>
+              <p className="mt-4 max-w-3xl text-lg leading-8 text-slate-600">
+                Browse all workflows in Firestore, open the editor for any workflow, and reorder how they appear in the app.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700">
+                {reorderStatus === 'saving'
+                  ? 'Saving order...'
+                  : reorderStatus === 'saved'
+                    ? 'Order saved'
+                    : reorderStatus === 'error'
+                      ? 'Save error'
+                      : 'Ready'}
+              </span>
+              <a href="/admin" className={secondaryButtonMediumClass}>
+                Rooms
+              </a>
+              <a href="/" className={gradientButtonMediumClass}>
+                Back home
+              </a>
+            </div>
+          </div>
+        </section>
+
+        <section className="overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/90 shadow-[var(--theme-shadow-soft)]">
+          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-900/10 px-6 py-5">
+            <div>
+              <p className="text-sm uppercase tracking-[0.18em] text-slate-700">
+                Firestore workflows
+              </p>
+              <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                Workflow library
+              </h2>
+            </div>
+            <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700">
+              {workflows.length} total
+            </span>
+          </div>
+
+          {status === 'loading' ? (
+            <p className="px-6 py-10 text-base text-slate-600">Loading workflows...</p>
+          ) : null}
+          {status === 'error' ? (
+            <p className="px-6 py-10 text-base text-rose-700">
+              Unable to load workflows from Firestore.
+            </p>
+          ) : null}
+          {status === 'ready' && workflows.length === 0 ? (
+            <p className="px-6 py-10 text-base text-slate-600">
+              No workflows have been created yet.
+            </p>
+          ) : null}
+
+          {status === 'ready' && workflows.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="min-w-full border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 text-left">
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Order
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Workflow
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Tier
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Activities / steps
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Actions
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {workflows.map((workflow, workflowIndex) => (
+                    <tr key={workflow.id} className="border-t border-slate-900/10 align-top">
+                      <td className="px-6 py-5 text-sm font-medium text-slate-900">
+                        {workflowIndex + 1}
+                      </td>
+                      <td className="px-6 py-5">
+                        <a
+                          href={`/admin/workflows/${encodeURIComponent(workflow.id)}`}
+                          className="text-base font-semibold text-slate-900 underline decoration-slate-300 underline-offset-4 transition hover:decoration-slate-600"
+                        >
+                          {workflow.workflow?.title || workflow.name || workflow.id}
+                        </a>
+                        <p className="mt-1 text-sm text-slate-500">
+                          {workflow.id}
+                        </p>
+                      </td>
+                      <td className="px-6 py-5 text-sm text-slate-600">
+                        <select
+                          value={normalizeWorkflowAccessTier(workflow.accessTier)}
+                          onChange={(event) => {
+                            void updateWorkflowAccessTier(workflow, event.target.value)
+                          }}
+                          className="rounded-full border border-slate-300 bg-white px-3 py-1 text-sm text-slate-700 outline-none transition focus:border-slate-500"
+                        >
+                          <option value="free">Free</option>
+                          <option value="pro">Pro</option>
+                          <option value="disabled">Disabled</option>
+                        </select>
+                      </td>
+                      <td className="px-6 py-5 text-sm text-slate-600">
+                        {(workflow.workflow?.activities?.length ?? 0) > 0
+                          ? `${workflow.workflow.activities.length} / ${workflow.workflow?.stepCount ?? workflow.workflow?.steps?.length ?? 0}`
+                          : `1 / ${workflow.workflow?.steps?.length ?? 0}`}
+                      </td>
+                      <td className="px-6 py-5">
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={workflowIndex === 0 || reorderStatus === 'saving'}
+                            onClick={() => {
+                              void moveWorkflowByOffset(workflowIndex, -1)
+                            }}
+                            className="rounded-full border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:border-slate-200 disabled:text-slate-300 disabled:hover:bg-transparent"
+                          >
+                            ^
+                          </button>
+                          <button
+                            type="button"
+                            disabled={workflowIndex === workflows.length - 1 || reorderStatus === 'saving'}
+                            onClick={() => {
+                              void moveWorkflowByOffset(workflowIndex, 1)
+                            }}
+                            className="rounded-full border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:border-slate-200 disabled:text-slate-300 disabled:hover:bg-transparent"
+                          >
+                            v
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -3860,6 +4134,10 @@ function RoomPage({ roomId }) {
   const [room, setRoom] = useState(null)
   const [authUser, setAuthUser] = useState(() => auth.currentUser)
   const [members, setMembers] = useState([])
+  const [workflowTemplates, setWorkflowTemplates] = useState(
+    normalizedFallbackRoomTemplates,
+  )
+  const [selectedWorkflowTemplateId, setSelectedWorkflowTemplateId] = useState('hackathon')
   const [workflowDefinition, setWorkflowDefinition] = useState(null)
   const [workflowStatus, setWorkflowStatus] = useState('loading')
   const [brainstormDraft, setBrainstormDraft] = useState('')
@@ -3874,6 +4152,8 @@ function RoomPage({ roomId }) {
   }))
   const [roomIdentityError, setRoomIdentityError] = useState('')
   const [roomIdentityLoading, setRoomIdentityLoading] = useState(false)
+  const [isAutoJoiningRoom, setIsAutoJoiningRoom] = useState(false)
+  const [didAutoJoinFail, setDidAutoJoinFail] = useState(false)
   const [status, setStatus] = useState('loading')
   const [nowMs, setNowMs] = useState(() => Date.now())
   const [roundRobinOrder, setRoundRobinOrder] = useState([])
@@ -3923,6 +4203,64 @@ function RoomPage({ roomId }) {
 
     return unsubscribe
   }, [roomId])
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      collection(db, 'workflows'),
+      (snapshot) => {
+        if (snapshot.empty) {
+          setWorkflowTemplates(normalizedFallbackRoomTemplates)
+          return
+        }
+
+        const templates = snapshot.docs
+          .map((templateDoc) => {
+            const templateData = templateDoc.data()
+            const normalizedTemplate = normalizeRoomTemplate(templateDoc.id, templateData)
+
+            if (!hasStrictWorkflowSchema(templateData)) {
+              void setDoc(
+                doc(db, 'workflows', templateDoc.id),
+                serializeWorkflowDefinition(normalizedTemplate),
+              )
+            }
+
+            return normalizedTemplate
+          })
+          .sort((left, right) => {
+            if (left.sortOrder !== right.sortOrder) {
+              return left.sortOrder - right.sortOrder
+            }
+
+            return (left.workflow?.title ?? '').localeCompare(right.workflow?.title ?? '')
+          })
+
+        setWorkflowTemplates(templates)
+      },
+      () => {
+        setWorkflowTemplates(normalizedFallbackRoomTemplates)
+      },
+    )
+
+    return unsubscribe
+  }, [])
+
+  useEffect(() => {
+    if (room?.workflowId) {
+      setSelectedWorkflowTemplateId(room.workflowId)
+      return
+    }
+
+    if (workflowTemplates.some((template) => template.id === selectedWorkflowTemplateId)) {
+      return
+    }
+
+    const defaultTemplateId =
+      workflowTemplates.find((template) => template.id === 'hackathon')?.id ??
+      workflowTemplates[0]?.id ??
+      ''
+    setSelectedWorkflowTemplateId(defaultTemplateId)
+  }, [room?.workflowId, selectedWorkflowTemplateId, workflowTemplates])
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -3982,6 +4320,7 @@ function RoomPage({ roomId }) {
   const sortedMembers = [...members].sort((left, right) =>
     getMemberDisplayName(left).localeCompare(getMemberDisplayName(right)),
   )
+  const onlineMembers = sortedMembers.filter((member) => member.isOnline)
   const currentMember =
     authUser
       ? sortedMembers.find(
@@ -3990,6 +4329,97 @@ function RoomPage({ roomId }) {
             (authUser.email && member.email === authUser.email),
         ) ?? null
       : null
+  const selectedWorkflowTemplate =
+    workflowTemplates.find((template) => template.id === selectedWorkflowTemplateId) ??
+    workflowTemplates.find((template) => template.id === 'hackathon') ??
+    workflowTemplates[0] ??
+    null
+  const selectedWorkflowTemplateTier = normalizeWorkflowAccessTier(selectedWorkflowTemplate?.accessTier)
+  const getMemberAvatarClassName = (member, baseClass, ringOffsetClass = 'ring-offset-white') =>
+    `${baseClass} ${
+      member?.id && member.id === currentMember?.id
+        ? `ring-2 ring-yellow-400 ring-offset-2 ${ringOffsetClass}`
+        : ''
+    }`
+
+  useEffect(() => {
+    if ((!['ready', 'missing'].includes(status) && !isDemoRoom) || currentMember?.id || isAutoJoiningRoom || didAutoJoinFail) {
+      return undefined
+    }
+
+    let cancelled = false
+
+    const autoJoinRoom = async () => {
+      setIsAutoJoiningRoom(true)
+      setDidAutoJoinFail(false)
+      setRoomIdentityError('')
+
+      try {
+        const pendingContext = readPendingAuthContext()
+        const matchingPendingContext = pendingContext?.roomId === roomId ? pendingContext : null
+        const activeUser = await ensureActiveUser()
+        const knownEmail =
+          (!activeUser.isAnonymous ? activeUser.email?.trim().toLowerCase() : '') ||
+          matchingPendingContext?.email?.trim().toLowerCase() ||
+          ''
+        const knownName =
+          matchingPendingContext?.name?.trim() ||
+          (!activeUser.isAnonymous ? activeUser.displayName?.trim() : '') ||
+          (knownEmail ? knownEmail.split('@')[0] : '')
+
+        if (cancelled) {
+          return
+        }
+
+        setRoomIdentityForm({
+          name: knownName,
+          email: knownEmail,
+        })
+
+        if (!knownName || !knownEmail) {
+          setDidAutoJoinFail(true)
+          return
+        }
+
+        setRoomIdentityForm({
+          name: knownName,
+          email: knownEmail,
+        })
+
+        await upsertRoomMembership({
+          roomId,
+          workflowId: room?.workflowId ?? (isDemoRoom ? demoTemplate?.id ?? null : null),
+          name: knownName,
+          email: knownEmail,
+          authUser: activeUser,
+        })
+      } catch {
+        if (!cancelled) {
+          setDidAutoJoinFail(true)
+          setRoomIdentityError('Unable to join this room automatically. Enter your details to continue.')
+        }
+      } finally {
+        if (!cancelled) {
+          setIsAutoJoiningRoom(false)
+        }
+      }
+    }
+
+    void autoJoinRoom()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    currentMember?.id,
+    demoTemplate?.id,
+    didAutoJoinFail,
+    isAutoJoiningRoom,
+    isDemoRoom,
+    room?.workflowId,
+    roomId,
+    status,
+  ])
 
   useEffect(() => {
     if (!currentMember?.id) {
@@ -4030,9 +4460,11 @@ function RoomPage({ roomId }) {
   }, [currentMember?.id, roomId])
   const roomWorkflow =
     workflowDefinition?.workflow ??
+    (workflowStatus === 'unassigned' ? selectedWorkflowTemplate?.workflow ?? null : null) ??
     (isDemoRoom ? demoTemplate?.workflow : null)
   const workflowTitle =
     workflowDefinition?.workflow?.title ??
+    (workflowStatus === 'unassigned' ? selectedWorkflowTemplate?.workflow?.title : null) ??
     (isDemoRoom ? demoTemplate?.workflow?.title : null)
   const workflowActivities =
     roomWorkflow?.activities?.length
@@ -4052,7 +4484,7 @@ function RoomPage({ roomId }) {
     workflowStatus === 'loading'
       ? 'Loading workflow definition...'
       : workflowStatus === 'unassigned'
-        ? 'This room does not have a workflowId yet.'
+        ? 'Choose a workflow to get this room started.'
         : workflowStatus === 'missing'
           ? `Workflow "${room?.workflowId}" was not found in Firestore.`
           : workflowStatus === 'error'
@@ -4201,7 +4633,9 @@ function RoomPage({ roomId }) {
     return leftLabel.localeCompare(rightLabel)
   })
   const shouldRevealAllBrainstormCards = isGroupBrainstormStep
-  const shouldPromptForRoomIdentity = !currentMember?.id && (status === 'ready' || isDemoRoom)
+  const isRoomJoinable = status === 'ready' || status === 'missing' || isDemoRoom
+  const shouldPromptForRoomIdentity =
+    didAutoJoinFail && !isAutoJoiningRoom && !currentMember?.id && isRoomJoinable
   const visibleBrainstormCardCount = currentStepCards.filter(
     (card) => shouldRevealAllBrainstormCards || card.authorId === currentMember?.id,
   ).length
@@ -4282,7 +4716,12 @@ function RoomPage({ roomId }) {
         typeof updater === 'function' ? updater(currentWorkflowState) : updater
 
       return {
-        workflowId: currentRoom.workflowId ?? room?.workflowId ?? demoTemplate?.id ?? null,
+        workflowId:
+          currentRoom.workflowId ??
+          room?.workflowId ??
+          (workflowStatus === 'unassigned' ? selectedWorkflowTemplate?.id ?? null : null) ??
+          demoTemplate?.id ??
+          null,
         workflowState: nextWorkflowState,
       }
     })
@@ -5031,17 +5470,8 @@ function RoomPage({ roomId }) {
                 </button>
               </div>
 
-              <div className="grid gap-4 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-                <label className="grid min-w-0 gap-2 text-sm font-medium text-slate-50">
-                  Room Number
-                  <input
-                    type="text"
-                    value={roomCode}
-                    readOnly
-                    className="min-h-28 w-full min-w-0 rounded-[1.75rem] border border-white/10 bg-white/10 px-5 text-center text-3xl font-semibold uppercase tracking-[0.16em] text-white outline-none sm:min-h-32 sm:text-4xl"
-                  />
-                </label>
-                <div className="grid min-w-0 gap-4 self-end">
+              <div className="grid gap-4 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6">
+                <div className="grid min-w-0 gap-4">
                   <label className="grid gap-2 text-sm font-medium text-slate-50">
                     Your Name
                     <input
@@ -5074,7 +5504,7 @@ function RoomPage({ roomId }) {
                   </label>
                 </div>
                 {roomIdentityError ? (
-                  <p className="text-sm font-medium text-rose-300 lg:col-span-2">
+                  <p className="text-sm font-medium text-rose-300">
                     {roomIdentityError}
                   </p>
                 ) : null}
@@ -5191,7 +5621,7 @@ function RoomPage({ roomId }) {
               <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-50/70 px-3 py-2.5">
                 <p className="text-[0.65rem] uppercase tracking-[0.2em] text-slate-700">Members</p>
                 <div className="mt-2 flex items-center">
-                  {members.slice(0, 6).map((member, memberIndex) => {
+                  {onlineMembers.slice(0, 6).map((member, memberIndex) => {
                     const displayName = getMemberDisplayName(member)
 
                     return (
@@ -5203,7 +5633,10 @@ function RoomPage({ roomId }) {
                         <img
                           src={createAvatarUrl(member.email, member.name)}
                           alt={`${displayName} avatar`}
-                          className="h-8 w-8 rounded-full border-2 border-white bg-slate-200 object-cover shadow-sm"
+                          className={getMemberAvatarClassName(
+                            member,
+                            'h-8 w-8 rounded-full border-2 border-white bg-slate-200 object-cover shadow-sm',
+                          )}
                         />
                         {member.isOnline ? (
                           <span className="absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-white bg-emerald-500" />
@@ -5211,9 +5644,9 @@ function RoomPage({ roomId }) {
                       </div>
                     )
                   })}
-                  {members.length > 6 ? (
+                  {onlineMembers.length > 6 ? (
                     <div className="-ml-3 flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-slate-200 text-[10px] font-semibold text-slate-600 shadow-sm">
-                      +{members.length - 6}
+                      +{onlineMembers.length - 6}
                     </div>
                   ) : null}
                 </div>
@@ -5222,6 +5655,237 @@ function RoomPage({ roomId }) {
           </div>
         </section>
 
+        {!hasWorkflowStarted ? (
+          <section className="min-h-0 flex-1 overflow-y-auto rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 shadow-[var(--theme-shadow-soft)] backdrop-blur sm:p-6">
+            <div className="space-y-6">
+              <div className="rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                <div className="flex flex-wrap items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm uppercase tracking-[0.18em] text-slate-300">Room Members</p>
+                    <p className="mt-2 text-sm text-slate-100/70">
+                      {onlineMembers.length > 0
+                        ? `${onlineMembers.length} member${onlineMembers.length === 1 ? '' : 's'} online and ready to begin this session.`
+                        : 'No members are online in this room yet.'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void startWorkflow()
+                    }}
+                    disabled={onlineMembers.length === 0}
+                    className={`${gradientButtonBaseClass} min-h-16 px-10 text-lg font-semibold`}
+                  >
+                    Start
+                  </button>
+                </div>
+                <div className="mt-5 flex flex-wrap gap-3">
+                  {onlineMembers.map((member) => {
+                    const displayName = getMemberDisplayName(member)
+
+                    return (
+                      <div
+                        key={member.id || member.email || displayName}
+                        className="flex items-center gap-3 rounded-full border border-white/10 bg-white/5 px-3 py-2"
+                      >
+                        <img
+                          src={createAvatarUrl(member.email, member.name)}
+                          alt={`${displayName} avatar`}
+                          className={getMemberAvatarClassName(
+                            member,
+                            'h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover',
+                            'ring-offset-slate-950',
+                          )}
+                        />
+                        <div className="min-w-0">
+                          <p className="max-w-[10rem] truncate text-sm font-medium text-white">
+                            {displayName}
+                          </p>
+                          <p className="text-xs text-slate-300">
+                            {member.isOnline ? 'Online' : 'In room'}
+                          </p>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+
+              {workflowStatus === 'unassigned' ? (
+                <div className="grid gap-6 lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+                  <div className="rounded-[1.5rem] border border-slate-900/10 bg-white p-4">
+                    <div className="mb-4 flex items-center justify-between gap-4">
+                      <div>
+                        <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+                          Room Types
+                        </p>
+                        <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                          Pick a brainstorm format
+                        </h2>
+                      </div>
+                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                        {workflowTemplates.length} templates
+                      </span>
+                    </div>
+
+                    <div
+                      role="radiogroup"
+                      aria-label="Room workflows"
+                      className="max-h-[24rem] space-y-3 overflow-y-auto pr-1"
+                    >
+                      {workflowTemplates.map((template) => {
+                        const accessTier = normalizeWorkflowAccessTier(template.accessTier)
+                        const isEnabled = accessTier !== 'disabled'
+                        const isSelected = selectedWorkflowTemplateId === template.id
+
+                        return (
+                          <button
+                            key={template.id}
+                            type="button"
+                            onClick={() => {
+                              if (isEnabled) {
+                                setSelectedWorkflowTemplateId(template.id)
+                              }
+                            }}
+                            disabled={!isEnabled}
+                            role="radio"
+                            aria-checked={isSelected}
+                            aria-disabled={!isEnabled}
+                            className={`w-full rounded-[1.25rem] border px-4 py-4 text-left transition ${
+                              isSelected
+                                ? 'border-slate-950 bg-slate-950 text-slate-50 shadow-[var(--theme-shadow-strong)]'
+                                : isEnabled
+                                  ? 'border-slate-900/10 bg-slate-50/60 hover:border-slate-700/40 hover:bg-slate-50'
+                                  : 'cursor-not-allowed border-slate-900/10 bg-slate-100/70 opacity-55'
+                            }`}
+                          >
+                            <span className="block min-w-0">
+                              <span className="flex items-center justify-between gap-3">
+                                <span className={`block text-lg font-semibold ${isSelected ? 'text-white' : 'text-slate-900'}`}>
+                                  {template.workflow?.title ?? 'Untitled workflow'}
+                                </span>
+                                {accessTier ? (
+                                  <span className={`rounded-full px-2.5 py-1 text-xs font-medium uppercase tracking-[0.18em] ${
+                                    isSelected ? 'bg-white/10 text-slate-50' : 'bg-slate-900 text-white'
+                                  }`}>
+                                    {accessTier}
+                                  </span>
+                                ) : null}
+                              </span>
+                              <span className={`mt-2 block text-sm leading-6 ${isSelected ? 'text-slate-200' : 'text-slate-600'}`}>
+                                {template.workflow?.description ?? ''}
+                              </span>
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="relative rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6">
+                    <div
+                      aria-hidden="true"
+                      className="absolute left-[-14px] top-16 hidden h-7 w-7 rotate-45 border-b border-l border-slate-900/20 bg-slate-950 lg:block"
+                    />
+                    <p className="text-xs uppercase tracking-[0.24em] text-slate-200/80">
+                      Workflow
+                    </p>
+                    <h2 className="mt-2 text-2xl font-semibold tracking-tight">
+                      {selectedWorkflowTemplate?.workflow?.title ?? 'No workflow available'}
+                    </h2>
+                    {selectedWorkflowTemplate?.workflow?.description ? (
+                      <p className="mt-3 max-w-xl text-sm leading-6 text-slate-100/80">
+                        {selectedWorkflowTemplate.workflow?.description}
+                      </p>
+                    ) : null}
+
+                    <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                      <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
+                        <p className="text-sm text-slate-100/70">Activities / steps</p>
+                        <p className="mt-2 text-3xl font-semibold">
+                          {selectedWorkflowTemplate
+                            ? `${selectedWorkflowTemplate.workflow?.activities?.length || 1} / ${selectedWorkflowTemplate.workflow?.steps?.length ?? 0}`
+                            : '0 / 0'}
+                        </p>
+                      </div>
+                      <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
+                        <p className="text-sm text-slate-100/70">Total time</p>
+                        <p className="mt-2 text-3xl font-semibold">
+                          {selectedWorkflowTemplate?.workflow?.totalMinutes
+                            ? `${selectedWorkflowTemplate.workflow?.totalMinutes} min`
+                            : 'Custom'}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="mt-6 space-y-4">
+                      {((selectedWorkflowTemplate?.workflow?.activities?.length ?? 0) > 0
+                        ? selectedWorkflowTemplate?.workflow?.activities ?? []
+                        : [
+                            {
+                              id: 'default-activity',
+                              title: 'Workflow',
+                              description: '',
+                              totalMinutes: selectedWorkflowTemplate?.workflow?.totalMinutes ?? null,
+                              steps: selectedWorkflowTemplate?.workflow?.steps ?? [],
+                            },
+                          ]
+                      ).map((activity, activityIndex) => (
+                        <section
+                          key={activity.id}
+                          className="rounded-[1.5rem] border border-white/10 bg-white/5 p-4"
+                        >
+                          <div className="flex flex-wrap items-center gap-3">
+                            <p className="text-sm uppercase tracking-[0.18em] text-slate-200/75">
+                              Activity {activityIndex + 1}
+                            </p>
+                            <h3 className="text-lg font-semibold text-white">{activity.title}</h3>
+                            {activity.totalMinutes ? (
+                              <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs font-medium text-slate-100/80">
+                                {activity.totalMinutes} min
+                              </span>
+                            ) : null}
+                          </div>
+                          {activity.description ? (
+                            <p className="mt-2 text-sm leading-6 text-slate-100/75">
+                              {activity.description}
+                            </p>
+                          ) : null}
+                          <div className="mt-4 flex flex-wrap items-center gap-3 text-sm text-slate-100/75">
+                            <span className="rounded-full bg-slate-950/40 px-3 py-1">
+                              {activity.steps.length} steps
+                            </span>
+                            <span>Open the room to view step details.</span>
+                          </div>
+                        </section>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : workflowActivities.length > 0 ? (
+                <div className="rounded-[1.5rem] border border-slate-900/10 bg-slate-50/70 p-5">
+                  <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+                    Selected Workflow
+                  </p>
+                  <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                    {workflowTitle ?? 'Ready to start'}
+                  </h2>
+                  {roomWorkflow?.description ? (
+                    <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">
+                      {roomWorkflow.description}
+                    </p>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="rounded-[1.5rem] border border-dashed border-slate-900/15 bg-slate-50/70 px-5 py-6 text-sm text-slate-500">
+                  {emptyWorkflowMessage}
+                </div>
+              )}
+            </div>
+          </section>
+        ) : null}
+
+        {hasWorkflowStarted ? (
         <section className="grid min-h-0 flex-1 gap-5 overflow-hidden xl:grid-cols-[20rem_minmax(0,1fr)]">
           <aside className="min-h-0 overflow-y-auto rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 text-slate-900 shadow-[var(--theme-shadow-soft)] backdrop-blur">
             {workflowActivities.length > 0 ? (
@@ -5489,9 +6153,9 @@ function RoomPage({ roomId }) {
                     <div>
                       <p className="text-sm uppercase tracking-[0.18em] text-slate-300">Room Members</p>
                       <p className="mt-2 text-sm text-slate-100/70">
-                        {members.length > 0
-                          ? `${members.length} member${members.length === 1 ? '' : 's'} ready to begin this session.`
-                          : 'No members are in this room yet.'}
+                        {onlineMembers.length > 0
+                          ? `${onlineMembers.length} member${onlineMembers.length === 1 ? '' : 's'} online and ready to begin this session.`
+                          : 'No members are online in this room yet.'}
                       </p>
                     </div>
                     <button
@@ -5499,14 +6163,14 @@ function RoomPage({ roomId }) {
                       onClick={() => {
                         void startWorkflow()
                       }}
-                      disabled={members.length === 0}
-                      className={gradientButtonCompactClass}
+                      disabled={onlineMembers.length === 0 || (workflowStatus === 'unassigned' && selectedWorkflowTemplateTier === 'disabled')}
+                      className={`${gradientButtonBaseClass} min-h-16 px-10 text-lg font-semibold`}
                     >
                       Start
                     </button>
                   </div>
                   <div className="mt-5 flex flex-wrap gap-3">
-                    {members.map((member) => {
+                    {onlineMembers.map((member) => {
                       const displayName = getMemberDisplayName(member)
 
                       return (
@@ -5517,7 +6181,11 @@ function RoomPage({ roomId }) {
                           <img
                             src={createAvatarUrl(member.email, member.name)}
                             alt={`${displayName} avatar`}
-                            className="h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover"
+                            className={getMemberAvatarClassName(
+                              member,
+                              'h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover',
+                              'ring-offset-slate-950',
+                            )}
                           />
                           <div className="min-w-0">
                             <p className="max-w-[10rem] truncate text-sm font-medium text-white">
@@ -5659,7 +6327,11 @@ function RoomPage({ roomId }) {
                             activeRoundRobinMember.name,
                           )}
                           alt={`${getMemberDisplayName(activeRoundRobinMember)} avatar`}
-                          className="h-16 w-16 rounded-full border border-white/10 bg-slate-200 object-cover"
+                          className={getMemberAvatarClassName(
+                            activeRoundRobinMember,
+                            'h-16 w-16 rounded-full border border-white/10 bg-slate-200 object-cover',
+                            'ring-offset-slate-950',
+                          )}
                         />
                         <div>
                           <p className="text-sm text-slate-300">Now speaking</p>
@@ -5697,7 +6369,11 @@ function RoomPage({ roomId }) {
                             <img
                               src={createAvatarUrl(member.email, member.name)}
                               alt={`${displayName} avatar`}
-                              className="h-11 w-11 rounded-full border border-white/10 bg-slate-200 object-cover"
+                              className={getMemberAvatarClassName(
+                                member,
+                                'h-11 w-11 rounded-full border border-white/10 bg-slate-200 object-cover',
+                                'ring-offset-slate-950',
+                              )}
                             />
                             {isCompletedSpeaker ? (
                               <span className="absolute -bottom-1 -right-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-white">
@@ -6298,6 +6974,7 @@ function RoomPage({ roomId }) {
 
           </div>
         </section>
+        ) : null}
       </div>
     </main>
   )
@@ -6324,6 +7001,7 @@ function App() {
   const [authReady, setAuthReady] = useState(!isSignInWithEmailLink(auth, window.location.href))
   const { pathname } = window.location
   const roomMatch = pathname.match(/^\/room\/([^/]+)\/?$/)
+  const workflowAdminListMatch = pathname.match(/^\/admin\/workflows\/?$/)
   const workflowAdminMatch = pathname.match(/^\/admin\/workflows\/([^/]+)\/?$/)
 
   useEffect(() => {
@@ -6407,6 +7085,10 @@ function App() {
 
   if (pathname === '/admin') {
     return <AdminPage />
+  }
+
+  if (workflowAdminListMatch) {
+    return <WorkflowLibraryAdminPage />
   }
 
   if (workflowAdminMatch) {

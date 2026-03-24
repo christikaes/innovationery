@@ -62,5 +62,7 @@ export interface FirebaseWorkflowActivity {
 export interface FirebaseWorkflowDocument {
   name: string
   description: string
+  accessTier: string
+  sortOrder: number
   activities: FirebaseWorkflowActivity[]
 }
