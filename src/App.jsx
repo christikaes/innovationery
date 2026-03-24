@@ -13,9 +13,12 @@ import {
   doc,
   getDoc,
   getDocs,
+  limit,
   onSnapshot,
+  query,
   serverTimestamp,
   setDoc,
+  where,
 } from 'firebase/firestore'
 import { auth, db } from './firebase.js'
 
@@ -27,18 +30,379 @@ function formatCountdown(totalSeconds) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
-function shuffleArray(items) {
-  const nextItems = [...items]
+function escapePdfText(value) {
+  return String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+    .replace(/\r/g, ' ')
+    .replace(/\n/g, ' ')
+}
 
-  for (let index = nextItems.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(Math.random() * (index + 1))
-    const currentValue = nextItems[index]
+function wrapTextByCharacterCount(text, maxCharacters, firstLinePrefix = '', continuationPrefix = '') {
+  const normalizedText = String(text ?? '').trim().replace(/\s+/g, ' ')
 
-    nextItems[index] = nextItems[swapIndex]
-    nextItems[swapIndex] = currentValue
+  if (!normalizedText) {
+    return []
   }
 
-  return nextItems
+  const words = normalizedText.split(' ')
+  const lines = []
+  let currentLine = firstLinePrefix
+
+  words.forEach((word) => {
+    const candidateLine =
+      currentLine.trim().length === 0 ? `${currentLine}${word}` : `${currentLine} ${word}`
+
+    if (
+      currentLine.trim().length > 0 &&
+      candidateLine.length > maxCharacters
+    ) {
+      lines.push(currentLine)
+      currentLine = `${continuationPrefix}${word}`
+      return
+    }
+
+    currentLine = candidateLine
+  })
+
+  if (currentLine.trim().length > 0) {
+    lines.push(currentLine)
+  }
+
+  return lines
+}
+
+function createSummaryPdfBlob({ title, subtitle, sections }) {
+  const pageWidth = 612
+  const pageHeight = 792
+  const marginX = 54
+  const topY = 738
+  const bottomY = 54
+  const pages = [[]]
+  let currentPageIndex = 0
+  let currentY = topY
+
+  const addLine = (text, { font = 'F1', fontSize = 12, lineHeight = 16 } = {}) => {
+    if (currentY - lineHeight < bottomY) {
+      pages.push([])
+      currentPageIndex += 1
+      currentY = topY
+    }
+
+    pages[currentPageIndex].push({
+      text,
+      font,
+      fontSize,
+      x: marginX,
+      y: currentY,
+    })
+    currentY -= lineHeight
+  }
+
+  const addWrappedLines = (
+    text,
+    {
+      font = 'F1',
+      fontSize = 12,
+      lineHeight = 16,
+      maxCharacters = 90,
+      firstLinePrefix = '',
+      continuationPrefix = '',
+    } = {},
+  ) => {
+    wrapTextByCharacterCount(
+      text,
+      maxCharacters,
+      firstLinePrefix,
+      continuationPrefix,
+    ).forEach((line) => {
+      addLine(line, { font, fontSize, lineHeight })
+    })
+  }
+
+  addWrappedLines(title || 'Workflow Summary', {
+    font: 'F2',
+    fontSize: 24,
+    lineHeight: 30,
+    maxCharacters: 40,
+  })
+
+  if (subtitle) {
+    addWrappedLines(subtitle, {
+      font: 'F1',
+      fontSize: 12,
+      lineHeight: 18,
+      maxCharacters: 90,
+    })
+  }
+
+  currentY -= 8
+
+  sections.forEach((section, sectionIndex) => {
+    if (sectionIndex > 0) {
+      currentY -= 4
+    }
+
+    addWrappedLines(section.title, {
+      font: 'F2',
+      fontSize: 16,
+      lineHeight: 22,
+      maxCharacters: 64,
+    })
+
+    const items = Array.isArray(section.items) ? section.items : []
+
+    if (items.length === 0) {
+      addWrappedLines('No outputs recorded.', {
+        font: 'F1',
+        fontSize: 12,
+        lineHeight: 16,
+        maxCharacters: 88,
+        firstLinePrefix: '- ',
+        continuationPrefix: '  ',
+      })
+      return
+    }
+
+    items.forEach((item) => {
+      addWrappedLines(item, {
+        font: 'F1',
+        fontSize: 12,
+        lineHeight: 16,
+        maxCharacters: 88,
+        firstLinePrefix: '- ',
+        continuationPrefix: '  ',
+      })
+    })
+  })
+
+  const objects = new Map()
+  const pageObjectNumbers = pages.map((_, index) => 5 + index * 2)
+  const contentObjectNumbers = pages.map((_, index) => 6 + index * 2)
+
+  objects.set(1, '<< /Type /Catalog /Pages 2 0 R >>')
+  objects.set(
+    2,
+    `<< /Type /Pages /Kids [${pageObjectNumbers.map((objectNumber) => `${objectNumber} 0 R`).join(' ')}] /Count ${pages.length} >>`,
+  )
+  objects.set(3, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>')
+  objects.set(4, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>')
+
+  pages.forEach((pageLines, index) => {
+    const pageObjectNumber = pageObjectNumbers[index]
+    const contentObjectNumber = contentObjectNumbers[index]
+    const contentStream = [
+      'BT',
+      ...pageLines.flatMap((line) => [
+        `/${line.font} ${line.fontSize} Tf`,
+        `1 0 0 1 ${line.x} ${line.y} Tm`,
+        `(${escapePdfText(line.text)}) Tj`,
+      ]),
+      'ET',
+    ].join('\n')
+
+    objects.set(
+      pageObjectNumber,
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${contentObjectNumber} 0 R >>`,
+    )
+    objects.set(
+      contentObjectNumber,
+      `<< /Length ${contentStream.length} >>\nstream\n${contentStream}\nendstream`,
+    )
+  })
+
+  const objectNumbers = Array.from(objects.keys()).sort((left, right) => left - right)
+  let pdf = '%PDF-1.4\n'
+  const offsets = []
+
+  objectNumbers.forEach((objectNumber) => {
+    offsets[objectNumber] = pdf.length
+    pdf += `${objectNumber} 0 obj\n${objects.get(objectNumber)}\nendobj\n`
+  })
+
+  const xrefOffset = pdf.length
+  pdf += `xref\n0 ${objectNumbers[objectNumbers.length - 1] + 1}\n`
+  pdf += '0000000000 65535 f \n'
+
+  for (let objectNumber = 1; objectNumber <= objectNumbers[objectNumbers.length - 1]; objectNumber += 1) {
+    const offset = offsets[objectNumber] ?? 0
+    pdf += `${String(offset).padStart(10, '0')} 00000 n \n`
+  }
+
+  pdf += `trailer\n<< /Size ${objectNumbers[objectNumbers.length - 1] + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`
+
+  return new Blob([pdf], { type: 'application/pdf' })
+}
+
+function downloadSummaryPdfFile({ fileName, title, subtitle, sections }) {
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return
+  }
+
+  const blob = createSummaryPdfBlob({ title, subtitle, sections })
+  const url = window.URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+
+  anchor.href = url
+  anchor.download = fileName
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => {
+    window.URL.revokeObjectURL(url)
+  }, 0)
+}
+
+function getSummaryStepItems(step) {
+  const normalizedActivityType = normalizeActivityType(step?.activityType)
+
+  if (['individual stickies', 'group stickies'].includes(normalizedActivityType)) {
+    return step.outputCards.map((card) => card.text).filter(Boolean)
+  }
+
+  if (normalizedActivityType === 'voting') {
+    return step.stepOptions.map((option) => {
+      const representativeCard = option.cards.find(
+        (card) => card.id === option.representativeCardId,
+      )
+      const totalVotes = getWorkflowCardVoteCount(representativeCard)
+      const label = option.type === 'group' ? option.title : representativeCard?.text
+
+      return `${label || 'Untitled option'} (${totalVotes} vote${totalVotes === 1 ? '' : 's'})`
+    })
+  }
+
+  if (normalizedActivityType === 'card selection') {
+    return step.selectedCards.map((card) => card.text).filter(Boolean)
+  }
+
+  if (normalizedActivityType === 'group fill in the blank') {
+    return step.fillInBlankText ? [step.fillInBlankText] : []
+  }
+
+  return []
+}
+
+function playStepVictorySound(audioContextRef) {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext
+
+  if (!AudioContextClass) {
+    return
+  }
+
+  try {
+    const audioContext =
+      audioContextRef.current && audioContextRef.current.state !== 'closed'
+        ? audioContextRef.current
+        : new AudioContextClass()
+
+    audioContextRef.current = audioContext
+
+    if (audioContext.state === 'suspended') {
+      void audioContext.resume().catch(() => {})
+    }
+
+    const startAt = audioContext.currentTime + 0.02
+    const notes = [523.25, 659.25, 783.99]
+
+    notes.forEach((frequency, index) => {
+      const oscillator = audioContext.createOscillator()
+      const gainNode = audioContext.createGain()
+      const noteStartAt = startAt + index * 0.12
+      const noteEndAt = noteStartAt + 0.22
+
+      oscillator.type = 'triangle'
+      oscillator.frequency.setValueAtTime(frequency, noteStartAt)
+      gainNode.gain.setValueAtTime(0.0001, noteStartAt)
+      gainNode.gain.exponentialRampToValueAtTime(0.12, noteStartAt + 0.03)
+      gainNode.gain.exponentialRampToValueAtTime(0.0001, noteEndAt)
+
+      oscillator.connect(gainNode)
+      gainNode.connect(audioContext.destination)
+      oscillator.start(noteStartAt)
+      oscillator.stop(noteEndAt)
+    })
+  } catch {
+    return
+  }
+}
+
+function playTimeoutAlertSound(audioContextRef) {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext
+
+  if (!AudioContextClass) {
+    return
+  }
+
+  try {
+    const audioContext =
+      audioContextRef.current && audioContextRef.current.state !== 'closed'
+        ? audioContextRef.current
+        : new AudioContextClass()
+
+    audioContextRef.current = audioContext
+
+    if (audioContext.state === 'suspended') {
+      void audioContext.resume().catch(() => {})
+    }
+
+    const startAt = audioContext.currentTime + 0.02
+    const frequencies = [880, 659.25, 880]
+
+    frequencies.forEach((frequency, index) => {
+      const oscillator = audioContext.createOscillator()
+      const gainNode = audioContext.createGain()
+      const noteStartAt = startAt + index * 0.18
+      const noteEndAt = noteStartAt + 0.12
+
+      oscillator.type = 'sine'
+      oscillator.frequency.setValueAtTime(frequency, noteStartAt)
+      gainNode.gain.setValueAtTime(0.0001, noteStartAt)
+      gainNode.gain.exponentialRampToValueAtTime(0.18, noteStartAt + 0.02)
+      gainNode.gain.exponentialRampToValueAtTime(0.0001, noteEndAt)
+
+      oscillator.connect(gainNode)
+      gainNode.connect(audioContext.destination)
+      oscillator.start(noteStartAt)
+      oscillator.stop(noteEndAt)
+    })
+  } catch {
+    return
+  }
+}
+
+function hashSeededString(seed, value) {
+  let hash = 2166136261
+  const seedSource = `${seed}:${value}`
+
+  for (let index = 0; index < seedSource.length; index += 1) {
+    hash ^= seedSource.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return hash >>> 0
+}
+
+function getDeterministicRoundRobinOrder(memberIds, seed) {
+  return [...memberIds].sort((left, right) => {
+    const leftScore = hashSeededString(seed, left)
+    const rightScore = hashSeededString(seed, right)
+
+    if (leftScore !== rightScore) {
+      return leftScore - rightScore
+    }
+
+    return left.localeCompare(right)
+  })
 }
 
 const fallbackRoomTemplates = [
@@ -457,6 +821,13 @@ function serializeWorkflowDefinition(template) {
   return {
     name: workflow.title || template?.name || 'Untitled workflow',
     description: workflow.description || template?.description || '',
+    accessTier:
+      template?.accessTier === 'pro'
+        ? 'pro'
+        : template?.accessTier === 'disabled'
+          ? 'disabled'
+          : 'free',
+    sortOrder: toNumber(template?.sortOrder) ?? 0,
     activities: Array.isArray(workflow.activities)
       ? workflow.activities.map(serializeWorkflowActivity)
       : [],
@@ -492,6 +863,10 @@ function getDefaultWorkflowDefinition(workflowId) {
 
 function getWorkflowPersistenceKey(template) {
   return JSON.stringify(serializeWorkflowDefinition(template))
+}
+
+function normalizeWorkflowAccessTier(value) {
+  return value === 'pro' || value === 'disabled' ? value : 'free'
 }
 
 function getStepTypeDefinition(activityType) {
@@ -864,6 +1239,9 @@ function normalizeWorkflowRuntime(runtime, steps, legacyStepCardsByKey = {}) {
         typeof persistedStepState?.startTime === 'string' ? persistedStepState.startTime : null,
       pauseTime:
         typeof persistedStepState?.pauseTime === 'string' ? persistedStepState.pauseTime : null,
+      roundRobinMemberIds: Array.isArray(persistedStepState?.roundRobinMemberIds)
+        ? persistedStepState.roundRobinMemberIds.filter((value) => typeof value === 'string')
+        : [],
       cards: Array.isArray(persistedStepState?.cards)
         ? persistedStepState.cards
             .map((card, cardIndex) => normalizeWorkflowCard(card, cardIndex))
@@ -990,6 +1368,25 @@ function getStepOutputCards(step, cards) {
   })
 }
 
+function getResolvedStepOutputCards(step, stepState) {
+  const normalizedStepState = stepState && typeof stepState === 'object' ? stepState : {}
+  const outputCards = getStepOutputCards(step, normalizedStepState.cards ?? [])
+
+  if (normalizeActivityType(step?.activityType) !== 'group fill in the blank') {
+    return outputCards
+  }
+
+  const resolvedText = fillInBlankTextFromInputs(
+    step?.data?.text,
+    normalizedStepState.fillInBlankInputs ?? [],
+  )
+
+  return outputCards.map((card) => ({
+    ...card,
+    text: resolvedText,
+  }))
+}
+
 function prepareCardsForStep(step, cards) {
   const normalizedCards = Array.isArray(cards) ? cards.map((card) => ({ ...card })) : []
 
@@ -1102,6 +1499,28 @@ function fillInBlankTextFromInputs(template, inputs) {
     .join('')
 }
 
+function getStepPromptLabel(step) {
+  return step?.prompt?.trim() || step?.title?.trim() || 'Reference'
+}
+
+function groupReferenceCardsByPrompt(cards, fallbackPromptLabel) {
+  return cards.reduce((rows, card) => {
+    const promptLabel = card.metadata?.sourcePrompt?.trim() || fallbackPromptLabel || 'Reference'
+    const existingRow = rows.find((row) => row.promptLabel === promptLabel)
+
+    if (existingRow) {
+      existingRow.cards.push(card)
+      return rows
+    }
+
+    rows.push({
+      promptLabel,
+      cards: [card],
+    })
+    return rows
+  }, [])
+}
+
 function getCardSourcePrompts(steps, stepIndex, visited = new Set()) {
   const step = steps[stepIndex]
 
@@ -1139,7 +1558,7 @@ function getCardSourcePrompts(steps, stepIndex, visited = new Set()) {
     }
 
     const sourceStep = steps[sourceStepIndex]
-    const prompt = sourceStep?.prompt?.trim() || sourceStep?.title?.trim() || ''
+    const prompt = getStepPromptLabel(sourceStep)
 
     return prompt ? [prompt] : []
   })
@@ -1168,13 +1587,20 @@ function getSeedCardsForStep(steps, stepIndex, runtime) {
       }
 
       const sourceStepKey = getWorkflowStepStateKey(steps[sourceStepIndex], sourceStepIndex)
-      const sourceCards = getStepOutputCards(
+      const sourceCards = getResolvedStepOutputCards(
         steps[sourceStepIndex],
-        normalizedRuntime.steps[sourceStepKey]?.cards ?? [],
+        normalizedRuntime.steps[sourceStepKey],
       )
+      const sourcePrompt = getStepPromptLabel(steps[sourceStepIndex])
 
       sourceCards.forEach((card) => {
-        combinedCards.push({ ...card })
+        combinedCards.push({
+          ...card,
+          metadata: {
+            ...(card.metadata ?? {}),
+            sourcePrompt,
+          },
+        })
       })
     })
 
@@ -1192,19 +1618,32 @@ function getSeedCardsForStep(steps, stepIndex, runtime) {
       normalizeActivityType(step.activityType),
     )
   ) {
+    const sourcePrompt = getStepPromptLabel(steps[stepIndex - 1])
     return prepareCardsForStep(
       step,
-      getStepOutputCards(
-      steps[stepIndex - 1],
-      normalizedRuntime.steps[previousStepKey]?.cards ?? [],
-      ),
+      getResolvedStepOutputCards(
+        steps[stepIndex - 1],
+        normalizedRuntime.steps[previousStepKey],
+      ).map((card) => ({
+        ...card,
+        metadata: {
+          ...(card.metadata ?? {}),
+          sourcePrompt,
+        },
+      })),
     )
   }
 
   return []
 }
 
-function createWorkflowRuntimeForStep(steps, stepIndex, runtime, timestamp = new Date()) {
+function createWorkflowRuntimeForStep(
+  steps,
+  stepIndex,
+  runtime,
+  timestamp = new Date(),
+  participantIds = [],
+) {
   const normalizedRuntime = normalizeWorkflowRuntime(runtime, steps)
   const boundedStepIndex =
     steps.length > 0 ? Math.max(0, Math.min(stepIndex, steps.length - 1)) : 0
@@ -1214,7 +1653,11 @@ function createWorkflowRuntimeForStep(steps, stepIndex, runtime, timestamp = new
   const existingFillInBlankInputs = stepKey
     ? normalizedRuntime.steps[stepKey]?.fillInBlankInputs ?? []
     : []
+  const existingRoundRobinMemberIds = stepKey
+    ? normalizedRuntime.steps[stepKey]?.roundRobinMemberIds ?? []
+    : []
   const seededCards = getSeedCardsForStep(steps, boundedStepIndex, normalizedRuntime)
+  const isRoundRobinStep = normalizeActivityType(targetStep?.activityType) === 'roundrobin'
   const isFillInBlankStep = normalizeActivityType(targetStep?.activityType) === 'group fill in the blank'
   const shouldResetCardsFromInputs =
     !isFillInBlankStep && normalizeStepInputIds(targetStep?.inputStepIds).length > 0
@@ -1234,6 +1677,14 @@ function createWorkflowRuntimeForStep(steps, stepIndex, runtime, timestamp = new
               ...(normalizedRuntime.steps[stepKey] ?? {}),
               startTime: timestamp.toISOString(),
               pauseTime: null,
+              roundRobinMemberIds: isRoundRobinStep
+                ? existingRoundRobinMemberIds.length > 0
+                  ? existingRoundRobinMemberIds
+                  : getDeterministicRoundRobinOrder(
+                      participantIds.filter(Boolean),
+                      timestamp.toISOString(),
+                    )
+                : existingRoundRobinMemberIds,
               cards: shouldResetCardsFromInputs
                 ? seededCards
                 : isFillInBlankStep
@@ -1481,14 +1932,13 @@ function normalizeRoomTemplate(id, template) {
       workflow.title || template?.name || template?.title || 'Untitled workflow',
     description:
       workflow.description || template?.description || '',
+    accessTier: normalizeWorkflowAccessTier(template?.accessTier ?? workflowSource.accessTier),
     sortOrder: toNumber(template?.sortOrder) ?? Number.MAX_SAFE_INTEGER,
     workflow,
     pipeline: workflow,
   })
 }
 
-const EMAIL_STORAGE_KEY = 'innovationery:email-link-email'
-const PENDING_AUTH_KEY = 'innovationery:pending-auth'
 const subscriptionTiers = [
   {
     name: 'Starter',
@@ -1707,7 +2157,9 @@ function hasStrictWorkflowSchema(workflow) {
 
   const keys = Object.keys(workflow)
 
-  return keys.every((key) => ['name', 'description', 'activities', 'steps'].includes(key))
+  return keys.every((key) =>
+    ['name', 'description', 'accessTier', 'sortOrder', 'activities', 'steps'].includes(key),
+  )
 }
 
 async function updateRoomDocument(roomId, updater) {
@@ -1767,24 +2219,6 @@ function getRoomCurrentStage(room) {
   return room?.workflowId ? 'Waiting for workflow' : 'No workflow assigned'
 }
 
-function readPendingAuthContext() {
-  try {
-    return JSON.parse(window.localStorage.getItem(PENDING_AUTH_KEY) || 'null')
-  } catch {
-    return null
-  }
-}
-
-function writePendingAuthContext(context) {
-  window.localStorage.setItem(PENDING_AUTH_KEY, JSON.stringify(context))
-  window.localStorage.setItem(EMAIL_STORAGE_KEY, context.email)
-}
-
-function clearPendingAuthContext() {
-  window.localStorage.removeItem(PENDING_AUTH_KEY)
-  window.localStorage.removeItem(EMAIL_STORAGE_KEY)
-}
-
 function getActionCodeSettings(roomId) {
   return {
     url: `${window.location.origin}/room/${encodeURIComponent(roomId)}`,
@@ -1799,6 +2233,87 @@ async function ensureActiveUser() {
 
   const credentials = await signInAnonymously(auth)
   return credentials.user
+}
+
+function normalizeKnownIdentity(source) {
+  if (!source || typeof source !== 'object') {
+    return null
+  }
+
+  const email = typeof source.email === 'string' ? source.email.trim().toLowerCase() : ''
+  const name = typeof source.name === 'string' ? source.name.trim() : ''
+
+  if (!email) {
+    return null
+  }
+
+  return {
+    name: name || email.split('@')[0],
+    email,
+  }
+}
+
+async function loadKnownIdentityProfile(authUser) {
+  if (!authUser) {
+    return null
+  }
+
+  if (authUser.uid) {
+    const userSnapshot = await getDoc(doc(db, 'users', authUser.uid))
+    const identityFromUid = normalizeKnownIdentity(userSnapshot.exists() ? userSnapshot.data() : null)
+
+    if (identityFromUid) {
+      return identityFromUid
+    }
+  }
+
+  const normalizedEmail = authUser.email?.trim().toLowerCase() || ''
+
+  if (!normalizedEmail) {
+    return null
+  }
+
+  const matchingUsers = await getDocs(
+    query(collection(db, 'users'), where('email', '==', normalizedEmail), limit(1)),
+  )
+  const identityFromEmail = normalizeKnownIdentity(matchingUsers.docs[0]?.data())
+
+  if (identityFromEmail) {
+    return identityFromEmail
+  }
+
+  return {
+    name: authUser.displayName?.trim() || normalizedEmail.split('@')[0],
+    email: normalizedEmail,
+  }
+}
+
+async function resolveKnownMemberIdentity(authUser, pendingContext = null) {
+  const pendingIdentity = normalizeKnownIdentity(pendingContext)
+
+  if (pendingIdentity?.name && pendingIdentity?.email) {
+    return pendingIdentity
+  }
+
+  const profileIdentity = await loadKnownIdentityProfile(authUser)
+
+  if (profileIdentity?.name && profileIdentity?.email) {
+    return profileIdentity
+  }
+
+  const fallbackEmail =
+    pendingIdentity?.email ||
+    (!authUser?.isAnonymous ? authUser?.email?.trim().toLowerCase() : '') ||
+    ''
+  const fallbackName =
+    pendingIdentity?.name ||
+    (!authUser?.isAnonymous ? authUser?.displayName?.trim() : '') ||
+    (fallbackEmail ? fallbackEmail.split('@')[0] : '')
+
+  return {
+    name: fallbackName,
+    email: fallbackEmail,
+  }
 }
 
 async function upsertRoomMembership({
@@ -1939,7 +2454,11 @@ function HomePage() {
 
   useEffect(() => {
     if (!roomTemplates.some((template) => template.id === selectedRoomType)) {
-      setSelectedRoomType(roomTemplates[0]?.id ?? '')
+      const defaultTemplateId =
+        roomTemplates.find((template) => normalizeWorkflowAccessTier(template.accessTier) !== 'disabled')?.id ??
+        roomTemplates[0]?.id ??
+        ''
+      setSelectedRoomType(defaultTemplateId)
     }
   }, [roomTemplates, selectedRoomType])
 
@@ -1947,6 +2466,8 @@ function HomePage() {
     roomTemplates.find((template) => template.id === selectedRoomType) ??
     roomTemplates[0] ??
     null
+  const selectedTemplateTier = normalizeWorkflowAccessTier(selectedTemplate?.accessTier)
+  const isSelectedTemplateEnabled = selectedTemplateTier !== 'disabled'
 
   async function handleJoinSubmit(event) {
     event.preventDefault()
@@ -1965,21 +2486,9 @@ function HomePage() {
 
     try {
       const activeUser = await ensureActiveUser()
-      const flow = {
-        roomId,
-        workflowId: null,
-        name,
-        email,
-        created: false,
-      }
-
-      writePendingAuthContext(flow)
-
       try {
         await sendSignInLinkToEmail(auth, email, getActionCodeSettings(roomId))
-      } catch {
-        clearPendingAuthContext()
-      }
+      } catch {}
 
       await upsertRoomMembership({
         roomId,
@@ -2014,25 +2523,18 @@ function HomePage() {
       return
     }
 
+    if (!isSelectedTemplateEnabled) {
+      setCreateError('This workflow is currently disabled.')
+      return
+    }
+
     setCreateLoading(true)
 
     try {
       const activeUser = await ensureActiveUser()
-      const flow = {
-        roomId,
-        workflowId: selectedTemplate.id,
-        name,
-        email,
-        created: true,
-      }
-
-      writePendingAuthContext(flow)
-
       try {
         await sendSignInLinkToEmail(auth, email, getActionCodeSettings(roomId))
-      } catch {
-        clearPendingAuthContext()
-      }
+      } catch {}
 
       await upsertRoomMembership({
         roomId,
@@ -2232,7 +2734,7 @@ function HomePage() {
                     </div>
                     <button
                       type="submit"
-                      disabled={createLoading || !selectedTemplate}
+                    disabled={createLoading || !selectedTemplate || !isSelectedTemplateEnabled}
                       className={`${gradientButtonMediumClass} shrink-0`}
                     >
                       {createLoading ? 'Preparing...' : 'Create Room'}
@@ -2309,7 +2811,8 @@ function HomePage() {
                       className="max-h-[24rem] space-y-3 overflow-y-auto pr-1"
                     >
                       {roomTemplates.map((roomType) => {
-                        const isEnabled = roomType.id === 'hackathon' || roomType.id === 'ideation'
+                        const accessTier = normalizeWorkflowAccessTier(roomType.accessTier)
+                        const isEnabled = accessTier !== 'disabled'
                         const isSelected = selectedRoomType === roomType.id
 
                         return (
@@ -2338,11 +2841,11 @@ function HomePage() {
                                 <span className={`block text-lg font-semibold ${isSelected ? 'text-white' : 'text-slate-900'}`}>
                                   {roomType.workflow?.title ?? 'Untitled workflow'}
                                 </span>
-                                {roomType.id === 'hackathon' || roomType.id === 'ideation' ? (
+                                {accessTier ? (
                                   <span className={`rounded-full px-2.5 py-1 text-xs font-medium uppercase tracking-[0.18em] ${
                                     isSelected ? 'bg-white/10 text-slate-50' : 'bg-slate-900 text-white'
                                   }`}>
-                                    Free
+                                    {accessTier}
                                   </span>
                                 ) : null}
                               </span>
@@ -2744,7 +3247,7 @@ function AdminPage() {
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <a
-                href="/admin/workflows/hackathon"
+                href="/admin/workflows"
                 className={secondaryButtonMediumClass}
               >
                 Edit workflows
@@ -2862,6 +3365,254 @@ function AdminPage() {
                       </td>
                       <td className="px-6 py-5 text-sm text-slate-500">
                         {memberCounts[room.id] > 0 ? 'Active members' : 'No activity yet'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </section>
+      </div>
+    </main>
+  )
+}
+
+function WorkflowLibraryAdminPage() {
+  const [workflows, setWorkflows] = useState([])
+  const [status, setStatus] = useState('loading')
+  const [reorderStatus, setReorderStatus] = useState('idle')
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      collection(db, 'workflows'),
+      (snapshot) => {
+        const nextWorkflows = snapshot.docs
+          .map((workflowDoc) => normalizeRoomTemplate(workflowDoc.id, workflowDoc.data()))
+          .sort((left, right) => {
+            if (left.sortOrder !== right.sortOrder) {
+              return left.sortOrder - right.sortOrder
+            }
+
+            return left.name.localeCompare(right.name)
+          })
+
+        setWorkflows(nextWorkflows)
+        setStatus('ready')
+      },
+      () => {
+        setWorkflows([])
+        setStatus('error')
+      },
+    )
+
+    return unsubscribe
+  }, [])
+
+  const moveWorkflowByOffset = async (workflowIndex, offset) => {
+    const targetIndex = workflowIndex + offset
+
+    if (targetIndex < 0 || targetIndex >= workflows.length) {
+      return
+    }
+
+    const nextWorkflows = [...workflows]
+    const [movedWorkflow] = nextWorkflows.splice(workflowIndex, 1)
+
+    if (!movedWorkflow) {
+      return
+    }
+
+    nextWorkflows.splice(targetIndex, 0, movedWorkflow)
+    setReorderStatus('saving')
+
+    try {
+      await Promise.all(
+        nextWorkflows.map((workflow, index) =>
+          setDoc(
+            doc(db, 'workflows', workflow.id),
+            {
+              ...serializeWorkflowDefinition({
+                ...workflow,
+                sortOrder: index,
+              }),
+              sortOrder: index,
+            },
+          ),
+        ),
+      )
+      setReorderStatus('saved')
+    } catch {
+      setReorderStatus('error')
+    }
+  }
+
+  const updateWorkflowAccessTier = async (workflow, accessTier) => {
+    setReorderStatus('saving')
+
+    try {
+      await setDoc(
+        doc(db, 'workflows', workflow.id),
+        {
+          ...serializeWorkflowDefinition({
+            ...workflow,
+            accessTier,
+          }),
+          sortOrder: toNumber(workflow.sortOrder) ?? 0,
+        },
+      )
+      setReorderStatus('saved')
+    } catch {
+      setReorderStatus('error')
+    }
+  }
+
+  return (
+    <main className="min-h-screen bg-[image:var(--theme-bg-admin)] px-5 py-6 text-slate-800 sm:px-8 lg:px-10">
+      <div className="mx-auto grid max-w-7xl gap-6">
+        <section className="relative overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/85 px-6 py-10 shadow-[var(--theme-shadow-soft)] backdrop-blur md:px-10 md:py-14">
+          <div className="absolute -right-10 top-0 h-48 w-48 rounded-full bg-[image:var(--theme-orb-admin)]" />
+          <p className="relative text-xs uppercase tracking-[0.24em] text-slate-700">
+            Admin
+          </p>
+          <div className="relative mt-4 flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <h1 className="font-serif text-5xl leading-tight tracking-tight text-slate-900 sm:text-6xl">
+                Workflows
+              </h1>
+              <p className="mt-4 max-w-3xl text-lg leading-8 text-slate-600">
+                Browse all workflows in Firestore, open the editor for any workflow, and reorder how they appear in the app.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700">
+                {reorderStatus === 'saving'
+                  ? 'Saving order...'
+                  : reorderStatus === 'saved'
+                    ? 'Order saved'
+                    : reorderStatus === 'error'
+                      ? 'Save error'
+                      : 'Ready'}
+              </span>
+              <a href="/admin" className={secondaryButtonMediumClass}>
+                Rooms
+              </a>
+              <a href="/" className={gradientButtonMediumClass}>
+                Back home
+              </a>
+            </div>
+          </div>
+        </section>
+
+        <section className="overflow-hidden rounded-[2rem] border border-slate-900/10 bg-white/90 shadow-[var(--theme-shadow-soft)]">
+          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-900/10 px-6 py-5">
+            <div>
+              <p className="text-sm uppercase tracking-[0.18em] text-slate-700">
+                Firestore workflows
+              </p>
+              <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                Workflow library
+              </h2>
+            </div>
+            <span className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700">
+              {workflows.length} total
+            </span>
+          </div>
+
+          {status === 'loading' ? (
+            <p className="px-6 py-10 text-base text-slate-600">Loading workflows...</p>
+          ) : null}
+          {status === 'error' ? (
+            <p className="px-6 py-10 text-base text-rose-700">
+              Unable to load workflows from Firestore.
+            </p>
+          ) : null}
+          {status === 'ready' && workflows.length === 0 ? (
+            <p className="px-6 py-10 text-base text-slate-600">
+              No workflows have been created yet.
+            </p>
+          ) : null}
+
+          {status === 'ready' && workflows.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="min-w-full border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 text-left">
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Order
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Workflow
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Tier
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Activities / steps
+                    </th>
+                    <th className="px-6 py-4 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Actions
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {workflows.map((workflow, workflowIndex) => (
+                    <tr key={workflow.id} className="border-t border-slate-900/10 align-top">
+                      <td className="px-6 py-5 text-sm font-medium text-slate-900">
+                        {workflowIndex + 1}
+                      </td>
+                      <td className="px-6 py-5">
+                        <a
+                          href={`/admin/workflows/${encodeURIComponent(workflow.id)}`}
+                          className="text-base font-semibold text-slate-900 underline decoration-slate-300 underline-offset-4 transition hover:decoration-slate-600"
+                        >
+                          {workflow.workflow?.title || workflow.name || workflow.id}
+                        </a>
+                        <p className="mt-1 text-sm text-slate-500">
+                          {workflow.id}
+                        </p>
+                      </td>
+                      <td className="px-6 py-5 text-sm text-slate-600">
+                        <select
+                          value={normalizeWorkflowAccessTier(workflow.accessTier)}
+                          onChange={(event) => {
+                            void updateWorkflowAccessTier(workflow, event.target.value)
+                          }}
+                          className="rounded-full border border-slate-300 bg-white px-3 py-1 text-sm text-slate-700 outline-none transition focus:border-slate-500"
+                        >
+                          <option value="free">Free</option>
+                          <option value="pro">Pro</option>
+                          <option value="disabled">Disabled</option>
+                        </select>
+                      </td>
+                      <td className="px-6 py-5 text-sm text-slate-600">
+                        {(workflow.workflow?.activities?.length ?? 0) > 0
+                          ? `${workflow.workflow.activities.length} / ${workflow.workflow?.stepCount ?? workflow.workflow?.steps?.length ?? 0}`
+                          : `1 / ${workflow.workflow?.steps?.length ?? 0}`}
+                      </td>
+                      <td className="px-6 py-5">
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={workflowIndex === 0 || reorderStatus === 'saving'}
+                            onClick={() => {
+                              void moveWorkflowByOffset(workflowIndex, -1)
+                            }}
+                            className="rounded-full border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:border-slate-200 disabled:text-slate-300 disabled:hover:bg-transparent"
+                          >
+                            ^
+                          </button>
+                          <button
+                            type="button"
+                            disabled={workflowIndex === workflows.length - 1 || reorderStatus === 'saving'}
+                            onClick={() => {
+                              void moveWorkflowByOffset(workflowIndex, 1)
+                            }}
+                            className="rounded-full border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:border-slate-200 disabled:text-slate-300 disabled:hover:bg-transparent"
+                          >
+                            v
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -3859,7 +4610,13 @@ function WorkflowEditorPage({ workflowId }) {
 function RoomPage({ roomId }) {
   const [room, setRoom] = useState(null)
   const [authUser, setAuthUser] = useState(() => auth.currentUser)
+  const [authUserReady, setAuthUserReady] = useState(() => auth.currentUser !== null)
   const [members, setMembers] = useState([])
+  const [membersStatus, setMembersStatus] = useState('loading')
+  const [workflowTemplates, setWorkflowTemplates] = useState(
+    normalizedFallbackRoomTemplates,
+  )
+  const [selectedWorkflowTemplateId, setSelectedWorkflowTemplateId] = useState('hackathon')
   const [workflowDefinition, setWorkflowDefinition] = useState(null)
   const [workflowStatus, setWorkflowStatus] = useState('loading')
   const [brainstormDraft, setBrainstormDraft] = useState('')
@@ -3870,19 +4627,27 @@ function RoomPage({ roomId }) {
   const [isSubmittingBrainstormCard, setIsSubmittingBrainstormCard] = useState(false)
   const [roomIdentityForm, setRoomIdentityForm] = useState(() => ({
     name: '',
-    email: window.localStorage.getItem(EMAIL_STORAGE_KEY) || '',
+    email: auth.currentUser?.email?.trim().toLowerCase() || '',
   }))
   const [roomIdentityError, setRoomIdentityError] = useState('')
   const [roomIdentityLoading, setRoomIdentityLoading] = useState(false)
   const [status, setStatus] = useState('loading')
   const [nowMs, setNowMs] = useState(() => Date.now())
-  const [roundRobinOrder, setRoundRobinOrder] = useState([])
-  const [completedRoundRobinSpeakerIds, setCompletedRoundRobinSpeakerIds] = useState([])
+  const timeoutAlertAudioContextRef = useRef(null)
+  const timeoutAlertCycleKeyRef = useRef('')
+  const timeoutAlertBucketRef = useRef(-1)
   const isDemoRoom = roomId.trim().toLowerCase() === 'demo'
   const demoTemplate =
     normalizedFallbackRoomTemplates.find((template) => template.id === 'hackathon') ?? null
 
-  useEffect(() => onAuthStateChanged(auth, setAuthUser), [])
+  useEffect(
+    () =>
+      onAuthStateChanged(auth, (nextUser) => {
+        setAuthUser(nextUser)
+        setAuthUserReady(true)
+      }),
+    [],
+  )
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
@@ -3907,6 +4672,8 @@ function RoomPage({ roomId }) {
   }, [roomId])
 
   useEffect(() => {
+    setMembersStatus('loading')
+
     const unsubscribe = onSnapshot(
       collection(db, 'rooms', roomId, 'members'),
       (snapshot) => {
@@ -3915,14 +4682,74 @@ function RoomPage({ roomId }) {
           .filter(Boolean)
 
         setMembers(nextMembers)
+        setMembersStatus('ready')
       },
       () => {
         setMembers([])
+        setMembersStatus('error')
       },
     )
 
     return unsubscribe
   }, [roomId])
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      collection(db, 'workflows'),
+      (snapshot) => {
+        if (snapshot.empty) {
+          setWorkflowTemplates(normalizedFallbackRoomTemplates)
+          return
+        }
+
+        const templates = snapshot.docs
+          .map((templateDoc) => {
+            const templateData = templateDoc.data()
+            const normalizedTemplate = normalizeRoomTemplate(templateDoc.id, templateData)
+
+            if (!hasStrictWorkflowSchema(templateData)) {
+              void setDoc(
+                doc(db, 'workflows', templateDoc.id),
+                serializeWorkflowDefinition(normalizedTemplate),
+              )
+            }
+
+            return normalizedTemplate
+          })
+          .sort((left, right) => {
+            if (left.sortOrder !== right.sortOrder) {
+              return left.sortOrder - right.sortOrder
+            }
+
+            return (left.workflow?.title ?? '').localeCompare(right.workflow?.title ?? '')
+          })
+
+        setWorkflowTemplates(templates)
+      },
+      () => {
+        setWorkflowTemplates(normalizedFallbackRoomTemplates)
+      },
+    )
+
+    return unsubscribe
+  }, [])
+
+  useEffect(() => {
+    if (room?.workflowId) {
+      setSelectedWorkflowTemplateId(room.workflowId)
+      return
+    }
+
+    if (workflowTemplates.some((template) => template.id === selectedWorkflowTemplateId)) {
+      return
+    }
+
+    const defaultTemplateId =
+      workflowTemplates.find((template) => template.id === 'hackathon')?.id ??
+      workflowTemplates[0]?.id ??
+      ''
+    setSelectedWorkflowTemplateId(defaultTemplateId)
+  }, [room?.workflowId, selectedWorkflowTemplateId, workflowTemplates])
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -3931,6 +4758,15 @@ function RoomPage({ roomId }) {
 
     return () => window.clearInterval(intervalId)
   }, [])
+
+  useEffect(
+    () => () => {
+      if (timeoutAlertAudioContextRef.current?.state !== 'closed') {
+        void timeoutAlertAudioContextRef.current?.close().catch(() => {})
+      }
+    },
+    [],
+  )
 
   useEffect(() => {
     if (!room || isDemoRoom || hasStrictRoomSchema(room)) {
@@ -3982,6 +4818,8 @@ function RoomPage({ roomId }) {
   const sortedMembers = [...members].sort((left, right) =>
     getMemberDisplayName(left).localeCompare(getMemberDisplayName(right)),
   )
+  const onlineMembers = sortedMembers.filter((member) => member.isOnline)
+  const roundRobinParticipantIds = onlineMembers.map((member) => member.id).filter(Boolean)
   const currentMember =
     authUser
       ? sortedMembers.find(
@@ -3990,6 +4828,45 @@ function RoomPage({ roomId }) {
             (authUser.email && member.email === authUser.email),
         ) ?? null
       : null
+  const selectedWorkflowTemplate =
+    workflowTemplates.find((template) => template.id === selectedWorkflowTemplateId) ??
+    workflowTemplates.find((template) => template.id === 'hackathon') ??
+    workflowTemplates[0] ??
+    null
+  const selectedWorkflowTemplateTier = normalizeWorkflowAccessTier(selectedWorkflowTemplate?.accessTier)
+  const getMemberAvatarClassName = (member, baseClass, ringOffsetClass = 'ring-offset-white') =>
+    `${baseClass} ${
+      member?.id && member.id === currentMember?.id
+        ? `ring-2 ring-yellow-400 ring-offset-2 ${ringOffsetClass}`
+        : ''
+    }`
+
+  useEffect(() => {
+    if (!authUserReady || !authUser || currentMember?.id) {
+      return undefined
+    }
+
+    let cancelled = false
+
+    const preloadKnownIdentity = async () => {
+      const knownIdentity = await resolveKnownMemberIdentity(authUser)
+
+      if (cancelled || !knownIdentity) {
+        return
+      }
+
+      setRoomIdentityForm((current) => ({
+        name: current.name || knownIdentity.name || '',
+        email: current.email || knownIdentity.email || '',
+      }))
+    }
+
+    void preloadKnownIdentity()
+
+    return () => {
+      cancelled = true
+    }
+  }, [authUser, authUserReady, currentMember?.id])
 
   useEffect(() => {
     if (!currentMember?.id) {
@@ -4030,9 +4907,11 @@ function RoomPage({ roomId }) {
   }, [currentMember?.id, roomId])
   const roomWorkflow =
     workflowDefinition?.workflow ??
+    (workflowStatus === 'unassigned' ? selectedWorkflowTemplate?.workflow ?? null : null) ??
     (isDemoRoom ? demoTemplate?.workflow : null)
   const workflowTitle =
     workflowDefinition?.workflow?.title ??
+    (workflowStatus === 'unassigned' ? selectedWorkflowTemplate?.workflow?.title : null) ??
     (isDemoRoom ? demoTemplate?.workflow?.title : null)
   const workflowActivities =
     roomWorkflow?.activities?.length
@@ -4052,7 +4931,7 @@ function RoomPage({ roomId }) {
     workflowStatus === 'loading'
       ? 'Loading workflow definition...'
       : workflowStatus === 'unassigned'
-        ? 'This room does not have a workflowId yet.'
+        ? 'Choose a workflow to get this room started.'
         : workflowStatus === 'missing'
           ? `Workflow "${room?.workflowId}" was not found in Firestore.`
           : workflowStatus === 'error'
@@ -4105,15 +4984,48 @@ function RoomPage({ roomId }) {
   const remainingSeconds = hasWorkflowStarted
     ? getStepRemainingSeconds(currentStepDurationSeconds, currentStepRuntime, new Date(nowMs))
     : 0
+  const currentStepStartTimeMs = Date.parse(currentStepRuntime?.startTime ?? '')
+  const currentStepTimeoutAtMs =
+    Number.isFinite(currentStepStartTimeMs) && currentStepDurationSeconds > 0
+      ? currentStepStartTimeMs + currentStepDurationSeconds * 1000
+      : NaN
   const isPaused = Boolean(currentStepRuntime?.pauseTime)
+  const roundRobinOrder =
+    currentStepRuntime?.roundRobinMemberIds?.length > 0
+      ? currentStepRuntime.roundRobinMemberIds
+      : isRoundRobinStep
+        ? getDeterministicRoundRobinOrder(
+            roundRobinParticipantIds,
+            currentStepRuntime?.startTime || currentStepKey || 'round-robin',
+          )
+        : []
   const roundRobinMembers = roundRobinOrder
     .map((memberId) => sortedMembers.find((member) => member.id === memberId))
     .filter(Boolean)
   const roundRobinSpeakerCount = roundRobinMembers.length
-  const activeRoundRobinMember =
-    roundRobinMembers.find((member) => !completedRoundRobinSpeakerIds.includes(member.id)) ?? null
+  const roundRobinElapsedSeconds =
+    currentStepDurationSeconds > 0
+      ? Math.min(
+          currentStepDurationSeconds,
+          Math.max(0, currentStepDurationSeconds - remainingSeconds),
+        )
+      : 0
+  const completedRoundRobinSpeakerCount =
+    hasWorkflowStarted && isRoundRobinStep && currentStepDurationSeconds > 0 && roundRobinSpeakerCount > 0
+      ? remainingSeconds === 0
+        ? roundRobinSpeakerCount
+        : Math.min(
+            roundRobinSpeakerCount - 1,
+            Math.floor((roundRobinElapsedSeconds * roundRobinSpeakerCount) / currentStepDurationSeconds),
+          )
+      : 0
+  const completedRoundRobinSpeakerIds = roundRobinMembers
+    .slice(0, completedRoundRobinSpeakerCount)
+    .map((member) => member.id)
+    .filter(Boolean)
+  const activeRoundRobinMember = roundRobinMembers[completedRoundRobinSpeakerCount] ?? null
   const currentRoundRobinSpeakerIndex = activeRoundRobinMember
-    ? Math.min(completedRoundRobinSpeakerIds.length + 1, roundRobinSpeakerCount)
+    ? Math.min(completedRoundRobinSpeakerCount + 1, roundRobinSpeakerCount)
     : 0
   const roundRobinProgressDots =
     isRoundRobinStep && roundRobinSpeakerCount > 1
@@ -4122,6 +5034,11 @@ function RoomPage({ roomId }) {
   const isWorkflowComplete =
     workflowSequence.length > 0 &&
     safeCurrentStepIndex === workflowSequence.length - 1 &&
+    remainingSeconds === 0
+  const shouldHighlightCompleteStep =
+    hasWorkflowStarted &&
+    Boolean(currentStep) &&
+    !isWorkflowComplete &&
     remainingSeconds === 0
   const currentStepProgressPercent =
     currentStepDurationSeconds > 0
@@ -4163,6 +5080,8 @@ function RoomPage({ roomId }) {
   const stepProgressPercent =
     workflowSequence.length > 0 ? (displayedCompletedSteps / workflowSequence.length) * 100 : 0
   const compactRadialCircumference = 2 * Math.PI * 18
+  const showHeaderProgressCard = workflowStatus !== 'loading'
+  const showHeaderMembersCard = membersStatus !== 'loading'
   const currentStepCards = currentStepKey
     ? roomWorkflowState.steps?.[currentStepKey]?.cards ?? []
     : []
@@ -4176,6 +5095,17 @@ function RoomPage({ roomId }) {
   const displayedStepCards = currentStepCards.length > 0 ? currentStepCards : seededCurrentStepCards
   const fillInBlankTemplateParts = parseFillInBlankTemplate(currentStep?.data?.text)
   const fillInBlankCount = fillInBlankTemplateParts.filter((part) => part.type === 'blank').length
+  const individualBrainstormReferenceCards = isIndividualBrainstormStep
+    ? getSeedCardsForStep(workflowSequence, safeCurrentStepIndex, roomWorkflowState)
+    : []
+  const individualBrainstormReferencePrompts = isIndividualBrainstormStep
+    ? getCardSourcePrompts(workflowSequence, safeCurrentStepIndex)
+    : []
+  const individualBrainstormReferencePromptLabel = individualBrainstormReferencePrompts.join(' / ')
+  const individualBrainstormReferenceCardRows = groupReferenceCardsByPrompt(
+    individualBrainstormReferenceCards,
+    individualBrainstormReferencePromptLabel,
+  )
   const fillInBlankReferenceCards = isGroupFillInBlankStep
     ? getSeedCardsForStep(workflowSequence, safeCurrentStepIndex, roomWorkflowState)
     : []
@@ -4183,6 +5113,10 @@ function RoomPage({ roomId }) {
     ? getCardSourcePrompts(workflowSequence, safeCurrentStepIndex)
     : []
   const fillInBlankReferencePromptLabel = fillInBlankReferencePrompts.join(' / ')
+  const fillInBlankReferenceCardRows = groupReferenceCardsByPrompt(
+    fillInBlankReferenceCards,
+    fillInBlankReferencePromptLabel,
+  )
   const groupedCardsByLabel = displayedStepCards.reduce((accumulator, card) => {
     const groupLabel = card.metadata?.groupId?.trim() || 'Ungrouped'
 
@@ -4201,7 +5135,8 @@ function RoomPage({ roomId }) {
     return leftLabel.localeCompare(rightLabel)
   })
   const shouldRevealAllBrainstormCards = isGroupBrainstormStep
-  const shouldPromptForRoomIdentity = !currentMember?.id && (status === 'ready' || isDemoRoom)
+  const isRoomJoinable = status === 'ready' || status === 'missing' || isDemoRoom
+  const shouldPromptForRoomIdentity = authUserReady && !currentMember?.id && isRoomJoinable
   const visibleBrainstormCardCount = currentStepCards.filter(
     (card) => shouldRevealAllBrainstormCards || card.authorId === currentMember?.id,
   ).length
@@ -4235,11 +5170,14 @@ function RoomPage({ roomId }) {
     return accumulator
   }, [])
   const remainingSelections = Math.max(0, selectionLimit - selectedOptionIds.length)
+  const areAllSelectionsSubmitted =
+    !isCardSelectionStep || selectionLimit === 0 || selectedOptionIds.length >= selectionLimit
   const totalTeamVotesCast = votingOptions.reduce((total, option) => {
     const representativeCard = option.cards.find((card) => card.id === option.representativeCardId)
     return total + getWorkflowCardVoteCount(representativeCard)
   }, 0)
-  const maxTeamVotes = voteLimit * members.length
+  const maxTeamVotes = voteLimit * onlineMembers.length
+  const areAllVotesSubmitted = !isVotingStep || maxTeamVotes === 0 || totalTeamVotesCast >= maxTeamVotes
   const stepStatusProgressPercent = isVotingStep
     ? maxTeamVotes > 0
       ? Math.min(100, Math.max(0, (totalTeamVotesCast / maxTeamVotes) * 100))
@@ -4275,6 +5213,132 @@ function RoomPage({ roomId }) {
   const workflowSummarySteps = workflowSummaryActivities
     .flatMap((activity) => activity.summarySteps)
     .filter((step) => normalizeActivityType(step.activityType) !== 'roundrobin')
+  const summaryPdfSections = workflowSummarySteps.map((step) => ({
+    title: step.prompt || step.title || 'Untitled step',
+    items: getSummaryStepItems(step),
+  }))
+  const lastSummarySection = summaryPdfSections[summaryPdfSections.length - 1] ?? null
+  const totalIdeasCaptured = workflowSummarySteps.reduce(
+    (total, step) =>
+      total +
+      (['individual stickies', 'group stickies'].includes(normalizeActivityType(step.activityType))
+        ? step.outputCards.length
+        : 0),
+    0,
+  )
+  const totalIdeasPicked = workflowSummarySteps.reduce(
+    (total, step) =>
+      total +
+      (normalizeActivityType(step.activityType) === 'card selection'
+        ? step.selectedCards.length
+        : 0),
+    0,
+  )
+  const totalVotesAcrossWorkflow = workflowSummarySteps.reduce((total, step) => {
+    if (normalizeActivityType(step.activityType) !== 'voting') {
+      return total
+    }
+
+    return (
+      total +
+      step.stepOptions.reduce((optionTotal, option) => {
+        const representativeCard = option.cards.find(
+          (card) => card.id === option.representativeCardId,
+        )
+
+        return optionTotal + getWorkflowCardVoteCount(representativeCard)
+      }, 0)
+    )
+  }, 0)
+  const participatingMemberIds = new Set()
+
+  workflowSummarySteps.forEach((step) => {
+    step.outputCards.forEach((card) => {
+      if (card.authorId) {
+        participatingMemberIds.add(card.authorId)
+      }
+    })
+
+    step.stepOptions.forEach((option) => {
+      option.cards.forEach((card) => {
+        if (card.authorId) {
+          participatingMemberIds.add(card.authorId)
+        }
+
+        Object.keys(card.metadata?.votes ?? {}).forEach((memberId) => {
+          if (memberId) {
+            participatingMemberIds.add(memberId)
+          }
+        })
+      })
+    })
+
+    step.selectedCards.forEach((card) => {
+      if (card.authorId) {
+        participatingMemberIds.add(card.authorId)
+      }
+    })
+  })
+
+  const participantCount = participatingMemberIds.size || members.length
+  const summaryStats = [
+    { label: 'Team members', value: participantCount },
+    { label: 'Ideas captured', value: totalIdeasCaptured },
+    { label: 'Ideas picked', value: totalIdeasPicked },
+    { label: 'Votes cast', value: totalVotesAcrossWorkflow },
+  ]
+
+  useEffect(() => {
+    const cycleKey =
+      currentStepKey && currentStepRuntime?.startTime
+        ? `${currentStepKey}:${currentStepRuntime.startTime}`
+        : currentStepKey || ''
+
+    if (timeoutAlertCycleKeyRef.current !== cycleKey) {
+      timeoutAlertCycleKeyRef.current = cycleKey
+      timeoutAlertBucketRef.current = -1
+    }
+
+    if (
+      !cycleKey ||
+      !shouldHighlightCompleteStep ||
+      !Number.isFinite(currentStepTimeoutAtMs) ||
+      isPaused
+    ) {
+      return
+    }
+
+    const nextBucket = Math.floor(Math.max(0, nowMs - currentStepTimeoutAtMs) / 10000)
+
+    if (nextBucket > 9 || timeoutAlertBucketRef.current === nextBucket) {
+      return
+    }
+
+    timeoutAlertBucketRef.current = nextBucket
+    playTimeoutAlertSound(timeoutAlertAudioContextRef)
+  }, [
+    currentStepKey,
+    currentStepRuntime?.startTime,
+    currentStepTimeoutAtMs,
+    isPaused,
+    nowMs,
+    shouldHighlightCompleteStep,
+  ])
+
+  const downloadWorkflowSummaryPdf = () => {
+    const workflowTitle = roomWorkflow?.title || 'Workflow Summary'
+    const roomLabel = roomId ? `Room ${roomId}` : 'Room summary'
+    const safeFileName =
+      `${workflowTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'workflow-summary'}-${roomId || 'room'}.pdf`
+
+    downloadSummaryPdfFile({
+      fileName: safeFileName,
+      title: workflowTitle,
+      subtitle: roomLabel,
+      sections: summaryPdfSections,
+    })
+  }
+
   const persistWorkflowState = async (updater) => {
     await updateRoomDocument(roomId, (currentRoom) => {
       const currentWorkflowState = normalizeRoomWorkflowState(currentRoom.workflowState, workflowSequence)
@@ -4282,7 +5346,12 @@ function RoomPage({ roomId }) {
         typeof updater === 'function' ? updater(currentWorkflowState) : updater
 
       return {
-        workflowId: currentRoom.workflowId ?? room?.workflowId ?? demoTemplate?.id ?? null,
+        workflowId:
+          currentRoom.workflowId ??
+          room?.workflowId ??
+          (workflowStatus === 'unassigned' ? selectedWorkflowTemplate?.id ?? null : null) ??
+          demoTemplate?.id ??
+          null,
         workflowState: nextWorkflowState,
       }
     })
@@ -4295,7 +5364,7 @@ function RoomPage({ roomId }) {
       createWorkflowRuntimeForStep(workflowSequence, 0, {
         ...currentWorkflowState,
         startedAt: timestamp,
-      }),
+      }, new Date(timestamp), roundRobinParticipantIds),
     )
   }
 
@@ -4363,8 +5432,10 @@ function RoomPage({ roomId }) {
           safeCurrentStepIndex + 1,
           currentWorkflowState,
           timestamp,
+          roundRobinParticipantIds,
         ),
       )
+      playStepVictorySound(timeoutAlertAudioContextRef)
       return
     }
 
@@ -4377,6 +5448,7 @@ function RoomPage({ roomId }) {
         timestamp,
       ),
     )
+    playStepVictorySound(timeoutAlertAudioContextRef)
   }
   const submitBrainstormCard = async (event) => {
     event.preventDefault()
@@ -4770,21 +5842,9 @@ function RoomPage({ roomId }) {
 
     try {
       const activeUser = await ensureActiveUser()
-      const flow = {
-        roomId,
-        workflowId: room?.workflowId ?? (isDemoRoom ? demoTemplate?.id ?? null : null),
-        name,
-        email,
-        created: false,
-      }
-
-      writePendingAuthContext(flow)
-
       try {
         await sendSignInLinkToEmail(auth, email, getActionCodeSettings(roomId))
-      } catch {
-        clearPendingAuthContext()
-      }
+      } catch {}
 
       await upsertRoomMembership({
         roomId,
@@ -4842,6 +5902,8 @@ function RoomPage({ roomId }) {
           workflowSequence,
           safeCurrentStepIndex,
           currentWorkflowState,
+          new Date(),
+          roundRobinParticipantIds,
         ),
       )
     }, 0)
@@ -4875,6 +5937,8 @@ function RoomPage({ roomId }) {
           workflowSequence,
           safeCurrentStepIndex,
           currentWorkflowState,
+          new Date(),
+          roundRobinParticipantIds,
         ),
       )
     }, 0)
@@ -4887,121 +5951,53 @@ function RoomPage({ roomId }) {
   ])
 
   useEffect(() => {
-    if (hasWorkflowStarted) {
-      return undefined
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      setRoundRobinOrder([])
-      setCompletedRoundRobinSpeakerIds([])
-    }, 0)
-
-    return () => window.clearTimeout(timeoutId)
-  }, [hasWorkflowStarted])
-
-  useEffect(() => {
-    if (!isRoundRobinStep) {
-      const timeoutId = window.setTimeout(() => {
-        setRoundRobinOrder([])
-        setCompletedRoundRobinSpeakerIds([])
-      }, 0)
-
-      return () => window.clearTimeout(timeoutId)
-    }
-
-    const randomizedMemberIds = shuffleArray(
-      members
-        .map((member) => member.id)
-        .filter(Boolean),
-    )
-
-    const timeoutId = window.setTimeout(() => {
-      setRoundRobinOrder(randomizedMemberIds)
-      setCompletedRoundRobinSpeakerIds([])
-    }, 0)
-
-    return () => window.clearTimeout(timeoutId)
-  }, [currentStep?.sequenceIndex, isRoundRobinStep, members])
-
-  useEffect(() => {
     if (
       !hasWorkflowStarted ||
       !isRoundRobinStep ||
-      isPaused ||
-      currentStepDurationSeconds <= 0 ||
-      roundRobinSpeakerCount === 0
+      !currentStepKey ||
+      !currentStepRuntime?.startTime ||
+      (currentStepRuntime.roundRobinMemberIds?.length ?? 0) > 0
     ) {
-      return
-    }
-
-    const elapsedSeconds = Math.min(
-      currentStepDurationSeconds,
-      Math.max(0, currentStepDurationSeconds - remainingSeconds),
-    )
-    const expectedCompletedSpeakerCount =
-      remainingSeconds === 0
-        ? roundRobinSpeakerCount
-        : Math.min(
-            roundRobinSpeakerCount - 1,
-            Math.floor((elapsedSeconds * roundRobinSpeakerCount) / currentStepDurationSeconds),
-          )
-
-    if (expectedCompletedSpeakerCount <= completedRoundRobinSpeakerIds.length) {
       return undefined
     }
 
     const timeoutId = window.setTimeout(() => {
-      setCompletedRoundRobinSpeakerIds(
-        roundRobinMembers
-          .slice(0, expectedCompletedSpeakerCount)
-          .map((member) => member.id)
-          .filter(Boolean),
+      const nextRoundRobinMemberIds = getDeterministicRoundRobinOrder(
+        roundRobinParticipantIds,
+        currentStepRuntime.startTime,
       )
+
+      void persistWorkflowState((currentWorkflowState) => {
+        const currentStepState = currentWorkflowState.steps?.[currentStepKey] ?? {
+          startTime: currentStepRuntime.startTime,
+          pauseTime: currentStepRuntime.pauseTime ?? null,
+          roundRobinMemberIds: [],
+          cards: [],
+          fillInBlankInputs: [],
+        }
+
+        return {
+          ...currentWorkflowState,
+          steps: {
+            ...currentWorkflowState.steps,
+            [currentStepKey]: {
+              ...currentStepState,
+              roundRobinMemberIds: nextRoundRobinMemberIds,
+            },
+          },
+        }
+      })
     }, 0)
 
     return () => window.clearTimeout(timeoutId)
   }, [
-    completedRoundRobinSpeakerIds.length,
-    currentStepDurationSeconds,
+    currentStepKey,
+    currentStepRuntime?.pauseTime,
+    currentStepRuntime?.roundRobinMemberIds?.length,
+    currentStepRuntime?.startTime,
     hasWorkflowStarted,
-    isPaused,
     isRoundRobinStep,
-    remainingSeconds,
-    roundRobinMembers,
-    roundRobinSpeakerCount,
-  ])
-
-  useEffect(() => {
-    if (!hasWorkflowStarted || !currentStep || workflowSequence.length === 0) {
-      return undefined
-    }
-
-    if (isPaused) {
-      return undefined
-    }
-
-    if (remainingSeconds === 0 && safeCurrentStepIndex < workflowSequence.length - 1) {
-      const timeoutId = window.setTimeout(() => {
-        void persistWorkflowState((currentWorkflowState) =>
-          createWorkflowRuntimeForStep(
-            workflowSequence,
-            safeCurrentStepIndex + 1,
-            currentWorkflowState,
-          ),
-        )
-      }, 1200)
-
-      return () => window.clearTimeout(timeoutId)
-    }
-
-    return undefined
-  }, [
-    currentStep,
-    hasWorkflowStarted,
-    isPaused,
-    remainingSeconds,
-    safeCurrentStepIndex,
-    workflowSequence.length,
+    roundRobinParticipantIds,
   ])
 
   return (
@@ -5031,17 +6027,8 @@ function RoomPage({ roomId }) {
                 </button>
               </div>
 
-              <div className="grid gap-4 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-                <label className="grid min-w-0 gap-2 text-sm font-medium text-slate-50">
-                  Room Number
-                  <input
-                    type="text"
-                    value={roomCode}
-                    readOnly
-                    className="min-h-28 w-full min-w-0 rounded-[1.75rem] border border-white/10 bg-white/10 px-5 text-center text-3xl font-semibold uppercase tracking-[0.16em] text-white outline-none sm:min-h-32 sm:text-4xl"
-                  />
-                </label>
-                <div className="grid min-w-0 gap-4 self-end">
+              <div className="grid gap-4 rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6">
+                <div className="grid min-w-0 gap-4">
                   <label className="grid gap-2 text-sm font-medium text-slate-50">
                     Your Name
                     <input
@@ -5074,7 +6061,7 @@ function RoomPage({ roomId }) {
                   </label>
                 </div>
                 {roomIdentityError ? (
-                  <p className="text-sm font-medium text-rose-300 lg:col-span-2">
+                  <p className="text-sm font-medium text-rose-300">
                     {roomIdentityError}
                   </p>
                 ) : null}
@@ -5106,264 +6093,508 @@ function RoomPage({ roomId }) {
               </p>
             </div>
 
-            <div className="flex flex-col gap-2 sm:flex-row lg:justify-end">
-              <div className="rounded-[1.25rem] border border-slate-900/10 bg-white px-3 py-2.5 shadow-sm">
-                <p className="text-[0.65rem] uppercase tracking-[0.2em] text-slate-700">Progress</p>
-                <div className="mt-2 flex items-center gap-2.5">
-                  <div className="flex items-center gap-2">
-                    <div className="relative h-10 w-10">
-                      <svg
-                        viewBox="0 0 48 48"
-                        className="-rotate-90 h-10 w-10"
-                        aria-hidden="true"
-                      >
-                        <circle
-                          cx="24"
-                          cy="24"
-                          r="18"
-                          fill="none"
-                          stroke="rgb(226 232 240)"
-                          strokeWidth="4"
-                        />
-                        <circle
-                          cx="24"
-                          cy="24"
-                          r="18"
-                          fill="none"
-                          stroke="rgb(15 23 42)"
-                          strokeWidth="4"
-                          strokeLinecap="round"
-                          strokeDasharray={compactRadialCircumference}
-                          strokeDashoffset={
-                            compactRadialCircumference * (1 - timerProgressPercent / 100)
-                          }
-                        />
-                      </svg>
-                    </div>
-                    <div>
-                      <p className="text-[0.65rem] uppercase tracking-[0.18em] text-slate-500">Time</p>
-                      <p className="text-sm font-medium text-slate-900">
-                        {displayedTotalMinutes > 0 ? `${displayedElapsedMinutes}/${displayedTotalMinutes}mins` : 'N/A'}
-                      </p>
-                    </div>
-                  </div>
+            {showHeaderProgressCard || showHeaderMembersCard ? (
+              <div className="flex flex-col gap-2 sm:flex-row lg:justify-end">
+                {showHeaderProgressCard ? (
+                  <div className="rounded-[1.25rem] border border-slate-900/10 bg-white px-3 py-2.5 shadow-sm">
+                    <p className="text-[0.65rem] uppercase tracking-[0.2em] text-slate-700">Progress</p>
+                    <div className="mt-2 flex items-center gap-2.5">
+                      <div className="flex items-center gap-2">
+                        <div className="relative h-10 w-10">
+                          <svg
+                            viewBox="0 0 48 48"
+                            className="-rotate-90 h-10 w-10"
+                            aria-hidden="true"
+                          >
+                            <circle
+                              cx="24"
+                              cy="24"
+                              r="18"
+                              fill="none"
+                              stroke="rgb(226 232 240)"
+                              strokeWidth="4"
+                            />
+                            <circle
+                              cx="24"
+                              cy="24"
+                              r="18"
+                              fill="none"
+                              stroke="rgb(15 23 42)"
+                              strokeWidth="4"
+                              strokeLinecap="round"
+                              strokeDasharray={compactRadialCircumference}
+                              strokeDashoffset={
+                                compactRadialCircumference * (1 - timerProgressPercent / 100)
+                              }
+                            />
+                          </svg>
+                        </div>
+                        <div>
+                          <p className="text-[0.65rem] uppercase tracking-[0.18em] text-slate-500">Time</p>
+                          <p className="text-sm font-medium text-slate-900">
+                            {displayedTotalMinutes > 0 ? `${displayedElapsedMinutes}/${displayedTotalMinutes}mins` : 'N/A'}
+                          </p>
+                        </div>
+                      </div>
 
-                  <div className="flex items-center gap-2">
-                    <div className="relative h-10 w-10">
-                      <svg
-                        viewBox="0 0 48 48"
-                        className="-rotate-90 h-10 w-10"
-                        aria-hidden="true"
-                      >
-                        <circle
-                          cx="24"
-                          cy="24"
-                          r="18"
-                          fill="none"
-                          stroke="rgb(226 232 240)"
-                          strokeWidth="4"
-                        />
-                        <circle
-                          cx="24"
-                          cy="24"
-                          r="18"
-                          fill="none"
-                          stroke="rgb(100 116 139)"
-                          strokeWidth="4"
-                          strokeLinecap="round"
-                          strokeDasharray={compactRadialCircumference}
-                          strokeDashoffset={
-                            compactRadialCircumference * (1 - stepProgressPercent / 100)
-                          }
-                        />
-                      </svg>
-                    </div>
-                    <div>
-                      <p className="text-[0.65rem] uppercase tracking-[0.18em] text-slate-500">Steps</p>
-                      <p className="text-sm font-medium text-slate-900">
-                        {workflowSequence.length > 0 ? `${displayedCompletedSteps}/${workflowSequence.length}steps` : 'N/A'}
-                      </p>
+                      <div className="flex items-center gap-2">
+                        <div className="relative h-10 w-10">
+                          <svg
+                            viewBox="0 0 48 48"
+                            className="-rotate-90 h-10 w-10"
+                            aria-hidden="true"
+                          >
+                            <circle
+                              cx="24"
+                              cy="24"
+                              r="18"
+                              fill="none"
+                              stroke="rgb(226 232 240)"
+                              strokeWidth="4"
+                            />
+                            <circle
+                              cx="24"
+                              cy="24"
+                              r="18"
+                              fill="none"
+                              stroke="rgb(100 116 139)"
+                              strokeWidth="4"
+                              strokeLinecap="round"
+                              strokeDasharray={compactRadialCircumference}
+                              strokeDashoffset={
+                                compactRadialCircumference * (1 - stepProgressPercent / 100)
+                              }
+                            />
+                          </svg>
+                        </div>
+                        <div>
+                          <p className="text-[0.65rem] uppercase tracking-[0.18em] text-slate-500">Steps</p>
+                          <p className="text-sm font-medium text-slate-900">
+                            {workflowSequence.length > 0 ? `${displayedCompletedSteps}/${workflowSequence.length}steps` : 'N/A'}
+                          </p>
+                        </div>
+                      </div>
                     </div>
                   </div>
-                </div>
+                ) : null}
+
+                {showHeaderMembersCard ? (
+                  <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-50/70 px-3 py-2.5">
+                    <p className="text-[0.65rem] uppercase tracking-[0.2em] text-slate-700">Members</p>
+                    <div className="mt-2 flex items-center">
+                      {onlineMembers.slice(0, 6).map((member, memberIndex) => {
+                        const displayName = getMemberDisplayName(member)
+
+                        return (
+                          <div
+                            key={member.id || member.email || displayName}
+                            className={`relative ${memberIndex === 0 ? '' : '-ml-3'}`}
+                            title={displayName}
+                          >
+                            <img
+                              src={createAvatarUrl(member.email, member.name)}
+                              alt={`${displayName} avatar`}
+                              className={getMemberAvatarClassName(
+                                member,
+                                'h-8 w-8 rounded-full border-2 border-white bg-slate-200 object-cover shadow-sm',
+                              )}
+                            />
+                            {member.isOnline ? (
+                              <span className="absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-white bg-emerald-500" />
+                            ) : null}
+                          </div>
+                        )
+                      })}
+                      {onlineMembers.length > 6 ? (
+                        <div className="-ml-3 flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-slate-200 text-[10px] font-semibold text-slate-600 shadow-sm">
+                          +{onlineMembers.length - 6}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
               </div>
+            ) : null}
+          </div>
+        </section>
 
-              <div className="rounded-[1.25rem] border border-slate-900/10 bg-slate-50/70 px-3 py-2.5">
-                <p className="text-[0.65rem] uppercase tracking-[0.2em] text-slate-700">Members</p>
-                <div className="mt-2 flex items-center">
-                  {members.slice(0, 6).map((member, memberIndex) => {
+        {!hasWorkflowStarted ? (
+          <section className="min-h-0 flex-1 overflow-y-auto rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 shadow-[var(--theme-shadow-soft)] backdrop-blur sm:p-6">
+            <div className="space-y-6">
+              <div className="rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-white shadow-[var(--theme-shadow-dark-panel)]">
+                <div className="flex flex-wrap items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm uppercase tracking-[0.18em] text-slate-300">Room Members</p>
+                    <p className="mt-2 text-sm text-slate-100/70">
+                      {onlineMembers.length > 0
+                        ? `${onlineMembers.length} member${onlineMembers.length === 1 ? '' : 's'} online and ready to begin this session.`
+                        : 'No members are online in this room yet.'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void startWorkflow()
+                    }}
+                    disabled={onlineMembers.length === 0}
+                    className={`${gradientButtonBaseClass} min-h-16 px-10 text-lg font-semibold`}
+                  >
+                    Start
+                  </button>
+                </div>
+                <div className="mt-5 flex flex-wrap gap-3">
+                  {onlineMembers.map((member) => {
                     const displayName = getMemberDisplayName(member)
 
                     return (
                       <div
                         key={member.id || member.email || displayName}
-                        className={`relative ${memberIndex === 0 ? '' : '-ml-3'}`}
-                        title={displayName}
+                        className="flex items-center gap-3 rounded-full border border-white/10 bg-white/5 px-3 py-2"
                       >
                         <img
                           src={createAvatarUrl(member.email, member.name)}
                           alt={`${displayName} avatar`}
-                          className="h-8 w-8 rounded-full border-2 border-white bg-slate-200 object-cover shadow-sm"
+                          className={getMemberAvatarClassName(
+                            member,
+                            'h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover',
+                            'ring-offset-slate-950',
+                          )}
                         />
-                        {member.isOnline ? (
-                          <span className="absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-white bg-emerald-500" />
-                        ) : null}
+                        <div className="min-w-0">
+                          <p className="max-w-[10rem] truncate text-sm font-medium text-white">
+                            {displayName}
+                          </p>
+                          <p className="text-xs text-slate-300">
+                            {member.isOnline ? 'Online' : 'In room'}
+                          </p>
+                        </div>
                       </div>
                     )
                   })}
-                  {members.length > 6 ? (
-                    <div className="-ml-3 flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-slate-200 text-[10px] font-semibold text-slate-600 shadow-sm">
-                      +{members.length - 6}
-                    </div>
-                  ) : null}
                 </div>
               </div>
-            </div>
-          </div>
-        </section>
 
-        <section className="grid min-h-0 flex-1 gap-5 overflow-hidden xl:grid-cols-[20rem_minmax(0,1fr)]">
-          <aside className="min-h-0 overflow-y-auto rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 text-slate-900 shadow-[var(--theme-shadow-soft)] backdrop-blur">
-            {workflowActivities.length > 0 ? (
-              <div className="space-y-4">
-                {workflowActivities.map((activity, activityIndex) => {
-                  const isCurrentActivity = currentActivityIndex === activityIndex
-                  const isFutureActivity = activityIndex > currentActivityIndex
-                  const activitySequenceItems = workflowSequence.filter(
-                    (item) => item.activityIndex === activityIndex,
-                  )
-                  const lastActivitySequenceIndex =
-                    activitySequenceItems[activitySequenceItems.length - 1]?.sequenceIndex ?? -1
-                  const isCompletedActivity =
-                    workflowSequence.length > 0 &&
-                    (lastActivitySequenceIndex < safeCurrentStepIndex ||
-                      (isWorkflowComplete &&
-                        lastActivitySequenceIndex === safeCurrentStepIndex))
-                  const isCollapsed = isCompletedActivity || isFutureActivity
-                  const activityProgressLabel = isCompletedActivity
-                    ? `${activity.steps.length}/${activity.steps.length}`
-                    : isCurrentActivity
-                      ? `${Math.min(currentStep?.stepIndex ?? 0, activity.steps.length - 1) + 1}/${activity.steps.length}`
-                      : `0/${activity.steps.length}`
-
-                  return (
-                    <section
-                      key={activity.id || `activity-${activityIndex + 1}`}
-                      className={`rounded-[1.5rem] border bg-white px-4 py-4 text-slate-900 transition ${
-                        isCurrentActivity
-                          ? 'border-slate-900/20 shadow-[var(--theme-shadow-soft)]'
-                          : 'border-slate-900/10 shadow-sm'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <h3 className="text-base font-semibold text-slate-900">
-                            {activity.title}
-                          </h3>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {isCompletedActivity ? (
-                            <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
-                              <svg
-                                viewBox="0 0 16 16"
-                                fill="none"
-                                className="h-3.5 w-3.5"
-                                aria-hidden="true"
-                              >
-                                <path
-                                  d="M3.5 8.5L6.5 11.5L12.5 4.5"
-                                  stroke="currentColor"
-                                  strokeWidth="2"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                />
-                              </svg>
-                            </span>
-                          ) : null}
-                          <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-700">
-                            {activityProgressLabel}
-                          </span>
-                        </div>
-                      </div>
-                      {isCollapsed ? (
-                        <p className={`mt-4 text-sm ${isCompletedActivity ? 'text-emerald-700' : 'text-slate-500'}`}>
-                          {isCompletedActivity ? 'Activity complete' : 'Starts later'}
+              {workflowStatus === 'unassigned' ? (
+                <div className="grid gap-6 lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+                  <div className="rounded-[1.5rem] border border-slate-900/10 bg-white p-4">
+                    <div className="mb-4 flex items-center justify-between gap-4">
+                      <div>
+                        <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+                          Room Types
                         </p>
-                      ) : (
-                        <div className="mt-4 space-y-2">
-                          {activity.steps.map((step, stepIndex) => {
-                            const sequenceItem = activitySequenceItems.find(
-                              (item) => item.stepIndex === stepIndex,
-                            )
-                            const isCurrentStep =
-                              sequenceItem?.sequenceIndex === currentStep?.sequenceIndex
-                            const isPastStep =
-                              (sequenceItem?.sequenceIndex ?? Infinity) < safeCurrentStepIndex
+                        <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                          Pick a brainstorm format
+                        </h2>
+                      </div>
+                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                        {workflowTemplates.length} templates
+                      </span>
+                    </div>
 
-                            return (
-                              <div
-                                key={`${activity.id || activityIndex}-${step.id}-${stepIndex}`}
-                                className={`rounded-2xl px-3 py-3 text-sm ${
-                                  isCurrentStep
-                                    ? 'bg-slate-950 text-white'
-                                    : isPastStep
-                                      ? 'bg-emerald-50 text-emerald-700'
-                                      : 'bg-slate-50 text-slate-600'
-                                }`}
-                              >
-                                <div className="flex items-center justify-between gap-3">
-                                  <div className="flex min-w-0 items-center gap-2">
-                                    {isPastStep ? (
-                                      <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
-                                        <svg
-                                          viewBox="0 0 16 16"
-                                          fill="none"
-                                          className="h-3 w-3"
-                                          aria-hidden="true"
-                                        >
-                                          <path
-                                            d="M3.5 8.5L6.5 11.5L12.5 4.5"
-                                            stroke="currentColor"
-                                            strokeWidth="2"
-                                            strokeLinecap="round"
-                                            strokeLinejoin="round"
-                                          />
-                                        </svg>
-                                      </span>
-                                    ) : (
-                                      <span
-                                        className={`inline-flex h-5 w-5 shrink-0 rounded-full border ${
-                                          isCurrentStep
-                                            ? 'border-white bg-white'
-                                            : 'border-slate-300'
-                                        }`}
-                                      />
-                                    )}
-                                    <p className="truncate font-medium">{step.title}</p>
-                                  </div>
-                                  {step.durationMinutes ? (
-                                    <span className="shrink-0 text-xs">
-                                      {step.durationMinutes} min
-                                    </span>
-                                  ) : null}
-                                </div>
-                              </div>
-                            )
-                          })}
+                    <div
+                      role="radiogroup"
+                      aria-label="Room workflows"
+                      className="max-h-[24rem] space-y-3 overflow-y-auto pr-1"
+                    >
+                      {workflowTemplates.map((template) => {
+                        const accessTier = normalizeWorkflowAccessTier(template.accessTier)
+                        const isEnabled = accessTier !== 'disabled'
+                        const isSelected = selectedWorkflowTemplateId === template.id
+
+                        return (
+                          <button
+                            key={template.id}
+                            type="button"
+                            onClick={() => {
+                              if (isEnabled) {
+                                setSelectedWorkflowTemplateId(template.id)
+                              }
+                            }}
+                            disabled={!isEnabled}
+                            role="radio"
+                            aria-checked={isSelected}
+                            aria-disabled={!isEnabled}
+                            className={`w-full rounded-[1.25rem] border px-4 py-4 text-left transition ${
+                              isSelected
+                                ? 'border-slate-950 bg-slate-950 text-slate-50 shadow-[var(--theme-shadow-strong)]'
+                                : isEnabled
+                                  ? 'border-slate-900/10 bg-slate-50/60 hover:border-slate-700/40 hover:bg-slate-50'
+                                  : 'cursor-not-allowed border-slate-900/10 bg-slate-100/70 opacity-55'
+                            }`}
+                          >
+                            <span className="block min-w-0">
+                              <span className="flex items-center justify-between gap-3">
+                                <span className={`block text-lg font-semibold ${isSelected ? 'text-white' : 'text-slate-900'}`}>
+                                  {template.workflow?.title ?? 'Untitled workflow'}
+                                </span>
+                                {accessTier ? (
+                                  <span className={`rounded-full px-2.5 py-1 text-xs font-medium uppercase tracking-[0.18em] ${
+                                    isSelected ? 'bg-white/10 text-slate-50' : 'bg-slate-900 text-white'
+                                  }`}>
+                                    {accessTier}
+                                  </span>
+                                ) : null}
+                              </span>
+                              <span className={`mt-2 block text-sm leading-6 ${isSelected ? 'text-slate-200' : 'text-slate-600'}`}>
+                                {template.workflow?.description ?? ''}
+                              </span>
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="relative rounded-[1.5rem] border border-slate-900/20 bg-slate-950 p-5 text-slate-50 sm:p-6">
+                    <div
+                      aria-hidden="true"
+                      className="absolute left-[-14px] top-16 hidden h-7 w-7 rotate-45 border-b border-l border-slate-900/20 bg-slate-950 lg:block"
+                    />
+                    <p className="text-xs uppercase tracking-[0.24em] text-slate-200/80">
+                      Workflow
+                    </p>
+                    <h2 className="mt-2 text-2xl font-semibold tracking-tight">
+                      {selectedWorkflowTemplate?.workflow?.title ?? 'No workflow available'}
+                    </h2>
+                    {selectedWorkflowTemplate?.workflow?.description ? (
+                      <p className="mt-3 max-w-xl text-sm leading-6 text-slate-100/80">
+                        {selectedWorkflowTemplate.workflow?.description}
+                      </p>
+                    ) : null}
+
+                    <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                      <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
+                        <p className="text-sm text-slate-100/70">Activities / steps</p>
+                        <p className="mt-2 text-3xl font-semibold">
+                          {selectedWorkflowTemplate
+                            ? `${selectedWorkflowTemplate.workflow?.activities?.length || 1} / ${selectedWorkflowTemplate.workflow?.steps?.length ?? 0}`
+                            : '0 / 0'}
+                        </p>
+                      </div>
+                      <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
+                        <p className="text-sm text-slate-100/70">Total time</p>
+                        <p className="mt-2 text-3xl font-semibold">
+                          {selectedWorkflowTemplate?.workflow?.totalMinutes
+                            ? `${selectedWorkflowTemplate.workflow?.totalMinutes} min`
+                            : 'Custom'}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="mt-6 space-y-4">
+                      {((selectedWorkflowTemplate?.workflow?.activities?.length ?? 0) > 0
+                        ? selectedWorkflowTemplate?.workflow?.activities ?? []
+                        : [
+                            {
+                              id: 'default-activity',
+                              title: 'Workflow',
+                              description: '',
+                              totalMinutes: selectedWorkflowTemplate?.workflow?.totalMinutes ?? null,
+                              steps: selectedWorkflowTemplate?.workflow?.steps ?? [],
+                            },
+                          ]
+                      ).map((activity, activityIndex) => (
+                        <section
+                          key={activity.id}
+                          className="rounded-[1.5rem] border border-white/10 bg-white/5 p-4"
+                        >
+                          <div className="flex flex-wrap items-center gap-3">
+                            <p className="text-sm uppercase tracking-[0.18em] text-slate-200/75">
+                              Activity {activityIndex + 1}
+                            </p>
+                            <h3 className="text-lg font-semibold text-white">{activity.title}</h3>
+                            {activity.totalMinutes ? (
+                              <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs font-medium text-slate-100/80">
+                                {activity.totalMinutes} min
+                              </span>
+                            ) : null}
+                          </div>
+                          {activity.description ? (
+                            <p className="mt-2 text-sm leading-6 text-slate-100/75">
+                              {activity.description}
+                            </p>
+                          ) : null}
+                          <div className="mt-4 flex flex-wrap items-center gap-3 text-sm text-slate-100/75">
+                            <span className="rounded-full bg-slate-950/40 px-3 py-1">
+                              {activity.steps.length} steps
+                            </span>
+                            <span>Open the room to view step details.</span>
+                          </div>
+                        </section>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : workflowActivities.length > 0 ? (
+                <div className="rounded-[1.5rem] border border-slate-900/10 bg-slate-50/70 p-5">
+                  <p className="text-xs uppercase tracking-[0.24em] text-slate-800">
+                    Selected Workflow
+                  </p>
+                  <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
+                    {workflowTitle ?? 'Ready to start'}
+                  </h2>
+                  {roomWorkflow?.description ? (
+                    <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">
+                      {roomWorkflow.description}
+                    </p>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="rounded-[1.5rem] border border-dashed border-slate-900/15 bg-slate-50/70 px-5 py-6 text-sm text-slate-500">
+                  {emptyWorkflowMessage}
+                </div>
+              )}
+            </div>
+          </section>
+        ) : null}
+
+        {hasWorkflowStarted ? (
+        <section className={`grid min-h-0 flex-1 gap-5 overflow-hidden ${
+          isWorkflowComplete ? '' : 'xl:grid-cols-[20rem_minmax(0,1fr)]'
+        }`}>
+          {!isWorkflowComplete ? (
+            <aside className="min-h-0 overflow-y-auto rounded-[1.75rem] border border-slate-900/10 bg-white/90 p-5 text-slate-900 shadow-[var(--theme-shadow-soft)] backdrop-blur">
+              {workflowActivities.length > 0 ? (
+                <div className="space-y-4">
+                  {workflowActivities.map((activity, activityIndex) => {
+                    const isCurrentActivity = currentActivityIndex === activityIndex
+                    const isFutureActivity = activityIndex > currentActivityIndex
+                    const activitySequenceItems = workflowSequence.filter(
+                      (item) => item.activityIndex === activityIndex,
+                    )
+                    const lastActivitySequenceIndex =
+                      activitySequenceItems[activitySequenceItems.length - 1]?.sequenceIndex ?? -1
+                    const isCompletedActivity =
+                      workflowSequence.length > 0 &&
+                      (lastActivitySequenceIndex < safeCurrentStepIndex ||
+                        (isWorkflowComplete &&
+                          lastActivitySequenceIndex === safeCurrentStepIndex))
+                    const isCollapsed = isCompletedActivity || isFutureActivity
+                    const activityProgressLabel = isCompletedActivity
+                      ? `${activity.steps.length}/${activity.steps.length}`
+                      : isCurrentActivity
+                        ? `${Math.min(currentStep?.stepIndex ?? 0, activity.steps.length - 1) + 1}/${activity.steps.length}`
+                        : `0/${activity.steps.length}`
+
+                    return (
+                      <section
+                        key={activity.id || `activity-${activityIndex + 1}`}
+                        className={`rounded-[1.5rem] border bg-white px-4 py-4 text-slate-900 transition ${
+                          isCurrentActivity
+                            ? 'border-slate-900/20 shadow-[var(--theme-shadow-soft)]'
+                            : 'border-slate-900/10 shadow-sm'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <h3 className="text-base font-semibold text-slate-900">
+                              {activity.title}
+                            </h3>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {isCompletedActivity ? (
+                              <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
+                                <svg
+                                  viewBox="0 0 16 16"
+                                  fill="none"
+                                  className="h-3.5 w-3.5"
+                                  aria-hidden="true"
+                                >
+                                  <path
+                                    d="M3.5 8.5L6.5 11.5L12.5 4.5"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              </span>
+                            ) : null}
+                            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-700">
+                              {activityProgressLabel}
+                            </span>
+                          </div>
                         </div>
-                      )}
-                    </section>
-                  )
-                })}
-              </div>
-            ) : (
-              <p className="text-sm text-slate-500">
-                {emptyWorkflowMessage}
-              </p>
-            )}
-          </aside>
+                        {isCollapsed ? (
+                          <p className={`mt-4 text-sm ${isCompletedActivity ? 'text-emerald-700' : 'text-slate-500'}`}>
+                            {isCompletedActivity ? 'Activity complete' : 'Starts later'}
+                          </p>
+                        ) : (
+                          <div className="mt-4 space-y-2">
+                            {activity.steps.map((step, stepIndex) => {
+                              const sequenceItem = activitySequenceItems.find(
+                                (item) => item.stepIndex === stepIndex,
+                              )
+                              const isCurrentStep =
+                                sequenceItem?.sequenceIndex === currentStep?.sequenceIndex
+                              const isPastStep =
+                                (sequenceItem?.sequenceIndex ?? Infinity) < safeCurrentStepIndex
 
-          <div className="flex min-h-0 flex-col gap-5 overflow-hidden pr-1">
+                              return (
+                                <div
+                                  key={`${activity.id || activityIndex}-${step.id}-${stepIndex}`}
+                                  className={`rounded-2xl px-3 py-3 text-sm ${
+                                    isCurrentStep
+                                      ? 'bg-slate-950 text-white'
+                                      : isPastStep
+                                        ? 'bg-emerald-50 text-emerald-700'
+                                        : 'bg-slate-50 text-slate-600'
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between gap-3">
+                                    <div className="flex min-w-0 items-center gap-2">
+                                      {isPastStep ? (
+                                        <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
+                                          <svg
+                                            viewBox="0 0 16 16"
+                                            fill="none"
+                                            className="h-3 w-3"
+                                            aria-hidden="true"
+                                          >
+                                            <path
+                                              d="M3.5 8.5L6.5 11.5L12.5 4.5"
+                                              stroke="currentColor"
+                                              strokeWidth="2"
+                                              strokeLinecap="round"
+                                              strokeLinejoin="round"
+                                            />
+                                          </svg>
+                                        </span>
+                                      ) : (
+                                        <span
+                                          className={`inline-flex h-5 w-5 shrink-0 rounded-full border ${
+                                            isCurrentStep
+                                              ? 'border-white bg-white'
+                                              : 'border-slate-300'
+                                          }`}
+                                        />
+                                      )}
+                                      <p className="truncate font-medium">{step.title}</p>
+                                    </div>
+                                    {step.durationMinutes ? (
+                                      <span className="shrink-0 text-xs">
+                                        {step.durationMinutes} min
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )}
+                      </section>
+                    )
+                  })}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-500">
+                  {emptyWorkflowMessage}
+                </p>
+              )}
+            </aside>
+          ) : null}
+
+          <div className={`flex min-h-0 flex-col gap-5 overflow-hidden ${isWorkflowComplete ? '' : 'pr-1'}`}>
             {hasWorkflowStarted && !isWorkflowComplete ? (
               <div className="rounded-[1.5rem] border border-slate-900/20 bg-slate-950 px-4 py-4 text-white">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -5427,9 +6658,15 @@ function RoomPage({ roomId }) {
                       disabled={
                         !currentStep ||
                         isWorkflowComplete ||
-                        (isRoundRobinStep && roundRobinMembers.length === 0)
+                        (isRoundRobinStep && roundRobinMembers.length === 0) ||
+                        (isVotingStep && remainingSeconds > 0 && !areAllVotesSubmitted) ||
+                        (isCardSelectionStep && !areAllSelectionsSubmitted)
                       }
-                      className={gradientButtonCompactClass}
+                      className={`${gradientButtonCompactClass} ${
+                        shouldHighlightCompleteStep
+                          ? 'animate-pulse ring-4 ring-yellow-300/80 shadow-[0_0_0_0.4rem_rgba(250,204,21,0.22)]'
+                          : ''
+                      }`}
                     >
                       Complete step
                     </button>
@@ -5489,9 +6726,9 @@ function RoomPage({ roomId }) {
                     <div>
                       <p className="text-sm uppercase tracking-[0.18em] text-slate-300">Room Members</p>
                       <p className="mt-2 text-sm text-slate-100/70">
-                        {members.length > 0
-                          ? `${members.length} member${members.length === 1 ? '' : 's'} ready to begin this session.`
-                          : 'No members are in this room yet.'}
+                        {onlineMembers.length > 0
+                          ? `${onlineMembers.length} member${onlineMembers.length === 1 ? '' : 's'} online and ready to begin this session.`
+                          : 'No members are online in this room yet.'}
                       </p>
                     </div>
                     <button
@@ -5499,14 +6736,14 @@ function RoomPage({ roomId }) {
                       onClick={() => {
                         void startWorkflow()
                       }}
-                      disabled={members.length === 0}
-                      className={gradientButtonCompactClass}
+                      disabled={onlineMembers.length === 0 || (workflowStatus === 'unassigned' && selectedWorkflowTemplateTier === 'disabled')}
+                      className={`${gradientButtonBaseClass} min-h-16 px-10 text-lg font-semibold`}
                     >
                       Start
                     </button>
                   </div>
                   <div className="mt-5 flex flex-wrap gap-3">
-                    {members.map((member) => {
+                    {onlineMembers.map((member) => {
                       const displayName = getMemberDisplayName(member)
 
                       return (
@@ -5517,7 +6754,11 @@ function RoomPage({ roomId }) {
                           <img
                             src={createAvatarUrl(member.email, member.name)}
                             alt={`${displayName} avatar`}
-                            className="h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover"
+                            className={getMemberAvatarClassName(
+                              member,
+                              'h-11 w-11 rounded-full border border-slate-200 bg-slate-200 object-cover',
+                              'ring-offset-slate-950',
+                            )}
                           />
                           <div className="min-w-0">
                             <p className="max-w-[10rem] truncate text-sm font-medium text-white">
@@ -5561,16 +6802,69 @@ function RoomPage({ roomId }) {
                   </div>
 
                   <div className="relative">
-                    <div className="max-w-3xl">
-                      <p className="text-sm uppercase tracking-[0.2em] text-slate-300">
-                        Session complete
-                      </p>
-                      <h3 className="mt-3 text-3xl font-semibold tracking-tight text-white">
-                        Summary
-                      </h3>
-                      <p className="mt-3 text-base leading-7 text-slate-300">
-                        Review the outputs captured across the prompts in this workflow.
-                      </p>
+                    <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="max-w-3xl">
+                        <p className="text-sm uppercase tracking-[0.2em] text-slate-300">
+                          Session complete
+                        </p>
+                        <h3 className="mt-3 text-3xl font-semibold tracking-tight text-white">
+                          Summary
+                        </h3>
+                        <p className="mt-3 text-base leading-7 text-slate-300">
+                          Review the outputs captured across the prompts in this workflow.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={downloadWorkflowSummaryPdf}
+                        className="inline-flex min-h-12 items-center justify-center rounded-full border border-white/15 bg-white/10 px-5 text-sm font-medium text-white transition hover:bg-white/15"
+                      >
+                        Download PDF
+                      </button>
+                    </div>
+
+                    {lastSummarySection ? (
+                      <div className="mt-6 rounded-[1.5rem] border border-yellow-300/30 bg-yellow-300/10 p-5">
+                        <p className="text-sm uppercase tracking-[0.18em] text-yellow-100/80">
+                          Final answer
+                        </p>
+                        <h4 className="mt-2 text-2xl font-semibold text-white">
+                          {lastSummarySection.title}
+                        </h4>
+                        {lastSummarySection.items.length > 0 ? (
+                          lastSummarySection.items.length === 1 ? (
+                            <p className="mt-3 text-lg leading-8 text-yellow-50">
+                              {lastSummarySection.items[0]}
+                            </p>
+                          ) : (
+                            <ul className="mt-4 space-y-2 text-base leading-7 text-yellow-50">
+                              {lastSummarySection.items.map((item, itemIndex) => (
+                                <li key={`last-summary-item-${itemIndex}`}>- {item}</li>
+                              ))}
+                            </ul>
+                          )
+                        ) : (
+                          <p className="mt-3 text-base leading-7 text-yellow-50">
+                            No result was captured for the final step.
+                          </p>
+                        )}
+                      </div>
+                    ) : null}
+
+                    <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                      {summaryStats.map((stat) => (
+                        <div
+                          key={stat.label}
+                          className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4"
+                        >
+                          <p className="text-sm uppercase tracking-[0.16em] text-slate-300">
+                            {stat.label}
+                          </p>
+                          <p className="mt-3 text-3xl font-semibold text-white">
+                            {stat.value}
+                          </p>
+                        </div>
+                      ))}
                     </div>
 
                     <div className="mt-6 space-y-5">
@@ -5659,7 +6953,11 @@ function RoomPage({ roomId }) {
                             activeRoundRobinMember.name,
                           )}
                           alt={`${getMemberDisplayName(activeRoundRobinMember)} avatar`}
-                          className="h-16 w-16 rounded-full border border-white/10 bg-slate-200 object-cover"
+                          className={getMemberAvatarClassName(
+                            activeRoundRobinMember,
+                            'h-16 w-16 rounded-full border border-white/10 bg-slate-200 object-cover',
+                            'ring-offset-slate-950',
+                          )}
                         />
                         <div>
                           <p className="text-sm text-slate-300">Now speaking</p>
@@ -5697,7 +6995,11 @@ function RoomPage({ roomId }) {
                             <img
                               src={createAvatarUrl(member.email, member.name)}
                               alt={`${displayName} avatar`}
-                              className="h-11 w-11 rounded-full border border-white/10 bg-slate-200 object-cover"
+                              className={getMemberAvatarClassName(
+                                member,
+                                'h-11 w-11 rounded-full border border-white/10 bg-slate-200 object-cover',
+                                'ring-offset-slate-950',
+                              )}
                             />
                             {isCompletedSpeaker ? (
                               <span className="absolute -bottom-1 -right-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-white">
@@ -5823,6 +7125,38 @@ function RoomPage({ roomId }) {
                             </article>
                           )
                         })}
+                      </div>
+                    ) : null}
+
+                    {individualBrainstormReferenceCards.length > 0 ? (
+                      <div className="mt-6 rounded-[1.5rem] border border-slate-900/10 bg-white/90 p-5 text-slate-900 shadow-[var(--theme-shadow-soft)]">
+                        <p className="text-sm uppercase tracking-[0.18em] text-slate-500">
+                          Reference cards
+                        </p>
+                        <div className="mt-4 space-y-4">
+                          {individualBrainstormReferenceCardRows.map((row, rowIndex) => (
+                            <div
+                              key={`brainstorm-reference-row-${row.promptLabel || rowIndex}`}
+                              className="grid gap-3 lg:grid-cols-[minmax(0,14rem)_1fr] lg:items-start"
+                            >
+                              <p className="text-sm font-medium uppercase tracking-[0.14em] text-slate-500 lg:pt-3">
+                                {row.promptLabel}
+                              </p>
+                              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                                {row.cards.map((card, cardIndex) => (
+                                  <article
+                                    key={`brainstorm-reference-card-${card.id || 'card'}-${rowIndex}-${cardIndex}`}
+                                    className="min-h-24 rounded-[1rem] border border-slate-200 bg-white p-3 text-slate-900 shadow-[var(--theme-shadow-soft)]"
+                                  >
+                                    <p className="text-base leading-6 text-slate-900">
+                                      {card.text}
+                                    </p>
+                                  </article>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     ) : null}
                   </>
@@ -6273,21 +7607,28 @@ function RoomPage({ roomId }) {
                       <p className="text-sm uppercase tracking-[0.18em] text-slate-300">
                         Reference cards
                       </p>
-                      <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                        {fillInBlankReferenceCards.map((card, cardIndex) => (
-                          <article
-                            key={`fill-reference-card-${card.id || 'card'}-${cardIndex}`}
-                            className="min-h-24 rounded-[1rem] border border-slate-200 bg-white p-3 text-slate-900 shadow-[var(--theme-shadow-soft)]"
+                      <div className="mt-4 space-y-4">
+                        {fillInBlankReferenceCardRows.map((row, rowIndex) => (
+                          <div
+                            key={`fill-reference-row-${row.promptLabel || rowIndex}`}
+                            className="grid gap-3 lg:grid-cols-[minmax(0,14rem)_1fr] lg:items-start"
                           >
-                            {fillInBlankReferencePromptLabel ? (
-                              <p className="text-sm font-medium uppercase tracking-[0.14em] text-slate-500">
-                                {fillInBlankReferencePromptLabel}
-                              </p>
-                            ) : null}
-                            <p className="text-base leading-6 text-slate-900">
-                              {card.text}
+                            <p className="text-sm font-medium uppercase tracking-[0.14em] text-slate-300 lg:pt-3">
+                              {row.promptLabel}
                             </p>
-                          </article>
+                            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                              {row.cards.map((card, cardIndex) => (
+                                <article
+                                  key={`fill-reference-card-${card.id || 'card'}-${rowIndex}-${cardIndex}`}
+                                  className="min-h-24 rounded-[1rem] border border-slate-200 bg-white p-3 text-slate-900 shadow-[var(--theme-shadow-soft)]"
+                                >
+                                  <p className="text-base leading-6 text-slate-900">
+                                    {card.text}
+                                  </p>
+                                </article>
+                              ))}
+                            </div>
+                          </div>
                         ))}
                       </div>
                     </div>
@@ -6298,6 +7639,7 @@ function RoomPage({ roomId }) {
 
           </div>
         </section>
+        ) : null}
       </div>
     </main>
   )
@@ -6321,60 +7663,82 @@ function NotFoundPage() {
 }
 
 function App() {
-  const [authReady, setAuthReady] = useState(!isSignInWithEmailLink(auth, window.location.href))
+  const isEmailLinkFlow = isSignInWithEmailLink(auth, window.location.href)
+  const [authReady, setAuthReady] = useState(!isEmailLinkFlow)
+  const [emailLinkEmail, setEmailLinkEmail] = useState(() => auth.currentUser?.email?.trim().toLowerCase() || '')
+  const [emailLinkError, setEmailLinkError] = useState('')
+  const [needsEmailLinkEmail, setNeedsEmailLinkEmail] = useState(false)
+  const [isCompletingEmailLink, setIsCompletingEmailLink] = useState(false)
   const { pathname } = window.location
   const roomMatch = pathname.match(/^\/room\/([^/]+)\/?$/)
+  const workflowAdminListMatch = pathname.match(/^\/admin\/workflows\/?$/)
   const workflowAdminMatch = pathname.match(/^\/admin\/workflows\/([^/]+)\/?$/)
+
+  const finishEmailLinkSignIn = async (rawEmail) => {
+    const normalizedEmail = rawEmail.trim().toLowerCase()
+
+    if (!normalizedEmail) {
+      throw new Error('missing-email')
+    }
+
+    if (auth.currentUser?.isAnonymous) {
+      const credential = EmailAuthProvider.credentialWithLink(normalizedEmail, window.location.href)
+      await linkWithCredential(auth.currentUser, credential)
+    } else {
+      await signInWithEmailLink(auth, normalizedEmail, window.location.href)
+    }
+
+    if (roomMatch && auth.currentUser) {
+      const roomId = decodeURIComponent(roomMatch[1])
+      const knownIdentity = await resolveKnownMemberIdentity(auth.currentUser, {
+        email: normalizedEmail,
+      })
+
+      if (knownIdentity?.name && knownIdentity?.email) {
+        await upsertRoomMembership({
+          roomId,
+          workflowId: null,
+          name: knownIdentity.name,
+          email: knownIdentity.email,
+          authUser: auth.currentUser,
+          created: false,
+        })
+      }
+
+      window.history.replaceState({}, '', `/room/${encodeURIComponent(roomId)}`)
+      return
+    }
+
+    window.history.replaceState({}, '', '/')
+  }
 
   useEffect(() => {
     let cancelled = false
 
     async function resolveEmailLink() {
-      if (!isSignInWithEmailLink(auth, window.location.href)) {
+      if (!isEmailLinkFlow) {
         if (!cancelled) {
           setAuthReady(true)
         }
         return
       }
 
-      const pendingContext = readPendingAuthContext()
-      const storedEmail = window.localStorage.getItem(EMAIL_STORAGE_KEY)
-      const email = storedEmail || pendingContext?.email
+      const email = auth.currentUser?.email?.trim().toLowerCase() || ''
 
       if (!email) {
         if (!cancelled) {
+          setNeedsEmailLinkEmail(true)
           setAuthReady(true)
         }
         return
       }
 
       try {
-        if (auth.currentUser?.isAnonymous) {
-          const credential = EmailAuthProvider.credentialWithLink(email, window.location.href)
-          await linkWithCredential(auth.currentUser, credential)
-        } else {
-          await signInWithEmailLink(auth, email, window.location.href)
-        }
-
-        if (pendingContext && auth.currentUser) {
-          await upsertRoomMembership({
-            roomId: pendingContext.roomId,
-            workflowId: pendingContext.workflowId,
-            name: pendingContext.name,
-            email: pendingContext.email,
-            authUser: auth.currentUser,
-            created: false,
-          })
-        }
-
-        clearPendingAuthContext()
-
-        if (pendingContext?.roomId) {
-          window.history.replaceState({}, '', `/room/${encodeURIComponent(pendingContext.roomId)}`)
-        } else {
-          window.history.replaceState({}, '', '/')
-        }
+        await finishEmailLinkSignIn(email)
       } catch {
+        if (!cancelled) {
+          setNeedsEmailLinkEmail(true)
+        }
       } finally {
         if (!cancelled) {
           setAuthReady(true)
@@ -6387,7 +7751,68 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [isEmailLinkFlow, roomMatch])
+
+  const handleEmailLinkSubmit = async (event) => {
+    event.preventDefault()
+    setEmailLinkError('')
+
+    const normalizedEmail = emailLinkEmail.trim().toLowerCase()
+
+    if (!normalizedEmail) {
+      setEmailLinkError('Enter your email to finish signing in.')
+      return
+    }
+
+    setIsCompletingEmailLink(true)
+
+    try {
+      await finishEmailLinkSignIn(normalizedEmail)
+      setNeedsEmailLinkEmail(false)
+      setAuthReady(true)
+    } catch {
+      setEmailLinkError('Unable to verify this sign-in link with that email. Try the email that received the link.')
+    } finally {
+      setIsCompletingEmailLink(false)
+    }
+  }
+
+  if (needsEmailLinkEmail) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[image:var(--theme-bg-auth)] px-5 py-6 text-slate-800">
+        <div className="w-full max-w-lg rounded-[2rem] border border-slate-900/10 bg-white/85 px-8 py-10 shadow-[var(--theme-shadow-soft)] backdrop-blur">
+          <p className="text-sm uppercase tracking-[0.24em] text-slate-700">Complete sign-in</p>
+          <h1 className="mt-4 font-serif text-4xl text-slate-900">Confirm your email</h1>
+          <p className="mt-3 text-base leading-7 text-slate-600">
+            Enter the email address that received this sign-in link to finish Firebase authentication.
+          </p>
+
+          <form onSubmit={handleEmailLinkSubmit} className="mt-8 space-y-4">
+            <label className="grid gap-2 text-sm font-medium text-slate-700">
+              Email
+              <input
+                type="email"
+                value={emailLinkEmail}
+                onChange={(event) => setEmailLinkEmail(event.target.value)}
+                placeholder="you@example.com"
+                className="min-h-14 rounded-2xl border border-slate-300 bg-white px-4 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-slate-500 focus:ring-2 focus:ring-slate-200"
+              />
+            </label>
+            {emailLinkError ? (
+              <p className="text-sm font-medium text-rose-600">{emailLinkError}</p>
+            ) : null}
+            <button
+              type="submit"
+              disabled={isCompletingEmailLink}
+              className={`${gradientButtonBaseClass} min-h-14 w-full justify-center px-6 text-base font-semibold`}
+            >
+              {isCompletingEmailLink ? 'Verifying...' : 'Finish sign-in'}
+            </button>
+          </form>
+        </div>
+      </main>
+    )
+  }
 
   if (!authReady) {
     return (
@@ -6407,6 +7832,10 @@ function App() {
 
   if (pathname === '/admin') {
     return <AdminPage />
+  }
+
+  if (workflowAdminListMatch) {
+    return <WorkflowLibraryAdminPage />
   }
 
   if (workflowAdminMatch) {
